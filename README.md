@@ -207,12 +207,27 @@ iscsi-reset-service admin-token generate \
 
 Raw token показывается один раз. В YAML помещается только `token_digest`.
 
-В `truenas/custom-app.yaml` заменить:
+Универсальный шаблон `truenas/custom-app.yaml` требует заменить:
 
-- приватный GHCR image и immutable digest;
+- GHCR image и immutable digest;
 - `/mnt/tank/...` paths;
 - `REPLACE_WITH_TRUENAS_MANAGEMENT_IP`;
 - TLS/secrets filenames.
+
+Для опубликованной версии удобнее скачать готовый release bundle: в нём обе службы уже
+ссылаются на один публичный образ по immutable digest, поэтому GHCR credentials не нужны.
+
+```bash
+gh release download v0.2.0 \
+  --pattern 'iscsi-reset-service-v0.2.0-truenas.yaml' \
+  --pattern 'image-digest.txt' \
+  --pattern 'SHA256SUMS'
+sha256sum --check SHA256SUMS
+```
+
+В release YAML остаётся заменить только настройки конкретного TrueNAS: management IP,
+`/mnt/tank/...` paths и при необходимости имена TLS/secrets файлов. Image tag менять нельзя:
+обе службы намеренно закреплены на одном `sha256` digest.
 
 Установить через **Apps → Discover Apps → Custom App → Install via YAML**. После запуска:
 
@@ -335,6 +350,18 @@ Invoke-Pester .\powershell\tests -Output Detailed -CI
 
 Результат локальной проверки записан в `VERIFICATION.md`. Реальные destructive проверки
 сначала выполнять только по `TEST-PLAN.md` на отдельных тестовых zvol.
+
+## Выпуск версии
+
+Обычный CI и release workflow используют один полный gate: Python/Ruff, Pester на Windows
+PowerShell 5.1 и Compose interaction suite. Публикация запускается тегом, который обязан точно
+соответствовать версии в `pyproject.toml`, например `v0.2.0`.
+
+После успешных проверок workflow публикует только точный version tag
+`ghcr.io/xerz/iscsi-reset-service:v0.2.0`, фиксирует фактический digest, добавляет SBOM и
+provenance attestation и создаёт GitHub Release. Mutable tag `latest` не создаётся. В release
+прикладываются TrueNAS YAML, полная digest-ссылка и `SHA256SUMS`; реальный TrueNAS автоматически
+не изменяется.
 
 Backend соответствует TrueNAS 25.10 API: [sessions](https://api.truenas.com/v25.10/api_methods_iscsi.global.sessions.html),
 [snapshot create](https://api.truenas.com/v25.10/api_methods_pool.snapshot.create.html),
