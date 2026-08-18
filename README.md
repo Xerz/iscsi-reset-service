@@ -17,7 +17,7 @@ Fail-closed комплект для TrueNAS SCALE 25.10 и Windows 11:
 ```mermaid
 flowchart LR
     clients["Игровые ПК<br/>Windows 11"]
-    publisher["Threadripper<br/>publisher"]
+    publisher["Publisher PC<br/>Windows"]
     reset["Reset API<br/>SAN :8443"]
     admin["Admin API<br/>management :8444"]
     database[("SQLite<br/>releases.sqlite3")]
@@ -50,15 +50,17 @@ flowchart TD
     verify["Проверить полный snapshot set"]
     enable["Включить и сверить<br/>master extents"]
     staged["Release staged"]
+    reconnect["Подключить master target<br/>и вернуть disks online"]
     confirm{"Получено точное<br/>ACTIVATE release?"}
     pending["Оставить staged;<br/>active не менять"]
     active["Атомарно переключить<br/>active release"]
     fail["FAIL CLOSED<br/>master extents disabled<br/>release не staged, active не изменён"]
+    reconnectFail["Остановиться до activation<br/>release staged, active не изменён"]
 
     start --> preflight
     preflight -->|"Нет"| reject
     preflight -->|"Да"| disable
-    disable --> reserve --> snapshots --> verify --> enable --> staged --> confirm
+    disable --> reserve --> snapshots --> verify --> enable --> staged --> reconnect --> confirm
     confirm -->|"Нет"| pending
     confirm -->|"Да"| active
     disable -. "ошибка" .-> fail
@@ -66,10 +68,11 @@ flowchart TD
     snapshots -. "ошибка" .-> fail
     verify -. "ошибка" .-> fail
     enable -. "ошибка" .-> fail
+    reconnect -. "ошибка" .-> reconnectFail
 
     classDef failure fill:#ffe3e3,stroke:#d33,color:#111;
     classDef success fill:#e4f7e7,stroke:#27823b,color:#111;
-    class fail failure;
+    class fail,reconnectFail failure;
     class staged,active success;
 ```
 
@@ -121,7 +124,7 @@ Custom App запускает два одинаково ограниченных
 
 - сертификат клиента, выданный отдельным local CA;
 - отдельный Bearer admin token;
-- точный management/Wi-Fi IP Threadripper из YAML.
+- точный management IP Publisher PC из YAML.
 
 Оба контейнера работают как `10001:10001`, с read-only root filesystem, `cap_drop: ALL`, без
 privileged, Docker socket и `/dev/zvol`.
@@ -172,7 +175,7 @@ iscsi-reset-service config validate --path /config/config.yaml
 
 1. Создать master zvol для каждого `publisher.volumes.<name>.dataset`.
 2. Создать один publisher target с отдельными постоянными extent records и LUN associations.
-3. Ограничить publisher initiator group SAN IP и IQN Threadripper.
+3. Ограничить publisher initiator group SAN IP и IQN Publisher PC.
 4. Создать отдельный target и initiator group для каждого игрового ПК.
 5. Создать постоянный extent для каждого клиентского LUN. Сервис меняет только `disk` и
    `enabled`, сохраняя extent NAA и serial.
@@ -217,13 +220,13 @@ Raw token показывается один раз. В YAML помещается
 curl --cacert reset-ca.crt https://10.20.40.10:8443/healthz
 
 curl --cacert admin-ca.crt \
-  --cert threadripper-client.crt --key threadripper-client.key \
+  --cert publisher-client.crt --key publisher-client.key \
   https://<TRUENAS_MANAGEMENT_IP>:8444/healthz
 ```
 
 Admin `/readyz` должен вернуть `ready`. Reset `/readyz` станет ready после первого activate.
 
-## Установка publisher на Threadripper
+## Установка на Publisher PC
 
 Запустить elevated Windows PowerShell 5.1:
 
@@ -233,23 +236,25 @@ $pfxPassword = Read-Host -AsSecureString "Client PFX password"
   -ApiBaseUrl "https://<TRUENAS_MANAGEMENT_IP>:8444" `
   -AdminToken "<RAW_ADMIN_TOKEN>" `
   -CaCertificatePath ".\admin-ca.crt" `
-  -ClientCertificatePfxPath ".\threadripper-client.pfx" `
+  -ClientCertificatePfxPath ".\publisher-client.pfx" `
   -ClientCertificatePassword $pfxPassword
 ```
 
 Installer импортирует CA и client certificate, а token/config сохраняет под
 `C:\ProgramData\IscsiResetPublisher` с ACL только Administrators и SYSTEM.
 
-Для публикации master target должен быть подключён к Threadripper:
+Для публикации master target должен быть подключён к Publisher PC:
 
 ```powershell
 C:\ProgramData\IscsiResetPublisher\Publish-IscsiRelease.ps1
 ```
 
 Скрипт сначала сопоставляет полный набор master-дисков по NAA, переводит только их offline,
-отключает target, сохраняет idempotency request ID, вызывает `stage`, затем просит напечатать
+отключает target, сохраняет idempotency request ID и вызывает `stage`. После успешного `stage`
+он сразу подключает master target и возвращает диски online, а уже затем просит напечатать
 точную строку `ACTIVATE <release>`. При отказе release остаётся staged, active pointer не
-меняется, master target подключается обратно. При ошибке stage target остаётся отключённым.
+меняется, а master-диски продолжают работать. При ошибке `stage` target остаётся отключённым;
+при ошибке reconnect activation не выполняется, и следующий запуск сначала повторяет reconnect.
 
 Сценарий никогда не вызывает `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, `New-Partition`
 или изменение разделов.

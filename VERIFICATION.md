@@ -7,7 +7,7 @@
 - `ruff check src tests` — passed.
 - `pytest -q` — **70 passed**.
 - PowerShell parser — все `.ps1` разобраны без syntax errors.
-- Pester 5.7.1 в закреплённом PowerShell-контейнере — **19 passed**.
+- Pester 5.7.1 в закреплённом PowerShell-контейнере — **23 passed**.
 - `docker compose config --quiet` — passed.
 - Container build Python 3.12 — passed.
 - Compose interaction suite — passed.
@@ -28,7 +28,8 @@ Pester покрывает:
 - reset retry с тем же request ID;
 - exact target/NAA/disk/letter mapping и disconnect при ошибке;
 - publisher exact NAA preflight до offline/disconnect;
-- stage/activate/decline flow, pending request и отсутствие reconnect после stage failure;
+- stage → reconnect → activate/decline flow, восстановление staged pending release,
+  остановку activation при reconnect failure и отсутствие reconnect после stage failure;
 - отсутствие `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, `New-Partition`.
 
 Compose запускает два API с общей SQLite и общий persistent mock TrueNAS. Сценарий выполняет:

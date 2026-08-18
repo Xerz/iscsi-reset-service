@@ -10,7 +10,7 @@
    ```yaml
    publisher:
      source_ip: 10.20.40.100
-     initiator_iqn: iqn.1991-05.com.microsoft:threadripper
+     initiator_iqn: iqn.1991-05.com.microsoft:publisher
      target_iqn: iqn.2026-08.lab.games:master
      volumes:
        ssd: {dataset: nvme/masters/games-ssd, extent_id: 10, lun: 0}
@@ -19,7 +19,7 @@
 
 4. Добавить `admin_api` и `release_management`, установить `schema_version: 2`.
 5. Выполнить `config validate` и развернуть оба контейнера. Reset `/readyz` пока ожидаемо `503`.
-6. Подключить master target к Threadripper и выполнить первую публикацию новым PowerShell
+6. Подключить master target к Publisher PC и выполнить первую публикацию новым PowerShell
    script. Она создаст новый согласованный snapshot set; существующие v1 snapshots не изменятся.
 7. После activate проверить `releases list`, затем перезагрузить один тестовый игровой ПК.
 8. После успешной миграции `releases audit` покажет старые unattached managed clones. Удалять их

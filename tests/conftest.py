@@ -32,7 +32,7 @@ def config_dict() -> dict:
         },
         "publisher": {
             "source_ip": "10.20.40.100",
-            "initiator_iqn": "iqn.1991-05.com.microsoft:threadripper",
+            "initiator_iqn": "iqn.1991-05.com.microsoft:publisher",
             "target_iqn": "iqn.2026-08.lab.games:master",
             "volumes": {
                 "ssd": {"dataset": "nvme/masters/games-ssd", "extent_id": 10, "lun": 0},

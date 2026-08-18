@@ -153,13 +153,18 @@ function Connect-PublisherTarget {
     )
     Ensure-PublisherPortal -Portal $Publisher.portal
     Update-IscsiTarget -NodeAddress ([string]$Publisher.target_iqn) -ErrorAction SilentlyContinue | Out-Null
-    Connect-IscsiTarget `
-        -NodeAddress ([string]$Publisher.target_iqn) `
-        -TargetPortalAddress ([string]$Publisher.portal.address) `
-        -TargetPortalPortNumber ([int]$Publisher.portal.port) `
-        -IsPersistent $false `
-        -IsMultipathEnabled $false `
-        -AuthenticationType NONE | Out-Null
+    $existingSessions = @(Get-PublisherSession -TargetIqn ([string]$Publisher.target_iqn))
+    if ($existingSessions.Count -eq 0) {
+        Connect-IscsiTarget `
+            -NodeAddress ([string]$Publisher.target_iqn) `
+            -TargetPortalAddress ([string]$Publisher.portal.address) `
+            -TargetPortalPortNumber ([int]$Publisher.portal.port) `
+            -IsPersistent $false `
+            -IsMultipathEnabled $false `
+            -AuthenticationType NONE | Out-Null
+    } elseif ($existingSessions.Count -ne 1) {
+        throw "Publisher target has $($existingSessions.Count) sessions; expected at most one"
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     do {
         $sessions = @(Get-PublisherSession -TargetIqn ([string]$Publisher.target_iqn))
@@ -188,7 +193,6 @@ function Save-PendingPublication {
 
 function Invoke-PublisherMain {
     param([string]$PublisherConfigPath, [string]$AdminTokenPath, [string]$StatePath)
-    $stageSucceeded = $false
     $publisher = $null
     $token = ""
     $config = $null
@@ -245,7 +249,8 @@ function Invoke-PublisherMain {
             $releaseName = [string]$staged.release
             Save-PendingPublication -Path $StatePath -RequestId $requestId -Release $releaseName
         }
-        $stageSucceeded = $true
+
+        Connect-PublisherTarget -Publisher $publisher -ExpectedVolumes @($publisher.volumes)
 
         $answer = $script:Confirmation
         if ([string]::IsNullOrWhiteSpace($answer)) {
@@ -253,7 +258,6 @@ function Invoke-PublisherMain {
         }
         if ($answer -ne "ACTIVATE $releaseName") {
             Write-Warning "Release $releaseName remains staged and inactive"
-            Connect-PublisherTarget -Publisher $publisher -ExpectedVolumes @($publisher.volumes)
             return 2
         }
 
@@ -266,17 +270,9 @@ function Invoke-PublisherMain {
             -CertificateThumbprint ([string]$config.certificate_thumbprint) `
             -Body @{ confirmation = "ACTIVATE $releaseName" } | Out-Null
         Remove-Item -LiteralPath $StatePath -Force
-        Connect-PublisherTarget -Publisher $publisher -ExpectedVolumes @($publisher.volumes)
         Write-Host "Release activated: $releaseName"
         return 0
     } catch {
-        if ($stageSucceeded -and $null -ne $publisher) {
-            try {
-                Connect-PublisherTarget -Publisher $publisher -ExpectedVolumes @($publisher.volumes)
-            } catch {
-                Write-Warning "Staged release exists, but master target could not be reconnected"
-            }
-        }
         Write-Warning $_.Exception.Message
         return 1
     }

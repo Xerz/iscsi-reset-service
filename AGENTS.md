@@ -68,7 +68,7 @@ README и примеры должны меняться в том же набор
 - iSCSI portal: `10.20.40.10:3260`.
 - Reset API: SAN IP `10.20.40.10:8443`, client Bearer token + точный SAN source IP.
 - Admin API: только выделенный management IP `:8444`, одновременно mTLS + отдельный admin
-  Bearer token + точный management IP Threadripper.
+  Bearer token + точный management IP Publisher PC.
 - Не доверяйте `X-Forwarded-For`: сервер запускается с `proxy_headers=False`.
 - `ALLOW_TEST_SOURCE_HEADER` допустим только с mock backend и никогда с TrueNAS backend.
 - Отключение TLS-проверки App → TrueNAS допустимо только при точном подтверждении
@@ -122,6 +122,8 @@ reconciliation. Activation требует точную строку `ACTIVATE <r
 - Client login всегда `IsPersistent=false`.
 - Если ошибка произошла после нового login, отключите только созданную этим запуском session.
 - Publisher при ошибке `stage` не переподключает master target.
+- После успешного `stage` Publisher PC обязан переподключить master target до запроса
+  activation; ошибка reconnect не должна активировать release.
 - Секреты не должны попадать в JSONL, exceptions, stdout или audit.
 - На конкретной машине различаются только защищённые token/certificate/config файлы под
   `C:\ProgramData`; сами `.ps1` общие.

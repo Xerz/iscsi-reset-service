@@ -20,23 +20,28 @@
 
 1. На тестовых master-дисках создать `baseline.txt`; перевести диски offline и снова online,
    чтобы проверить штатность процедуры.
-2. Запустить `Publish-IscsiRelease.ps1` и подтвердить `ACTIVATE <release>`.
-3. Проверить `GET /v1/admin/releases`: созданный release имеет `staged=true` и `active=true`.
-4. Загрузить тестовый игровой ПК, проверить наличие `baseline.txt`.
-5. Создать на клиентском клоне `delete-me.txt`, перезагрузить ПК.
-6. После загрузки проверить: `baseline.txt` существует, `delete-me.txt` отсутствует.
+2. Запустить `Publish-IscsiRelease.ps1` и дождаться запроса `ACTIVATE <release>`.
+3. До ввода confirmation проверить, что master target уже подключён, а точный набор master
+   disks снова online.
+4. Подтвердить `ACTIVATE <release>`.
+5. Проверить `GET /v1/admin/releases`: созданный release имеет `staged=true` и `active=true`.
+6. Загрузить тестовый игровой ПК, проверить наличие `baseline.txt`.
+7. Создать на клиентском клоне `delete-me.txt`, перезагрузить ПК.
+8. После загрузки проверить: `baseline.txt` существует, `delete-me.txt` отсутствует.
 
 Ожидание: master disks переподключены, клиент видит только полностью reset-набор LUN.
 
 ## 2. Stage без activation
 
 1. Добавить в master `STAGED_ONLY.txt`.
-2. Запустить publisher и отказаться вводить точную строку activation.
-3. Проверить, что master target подключился обратно.
-4. Проверить release list: новый release staged, предыдущий остаётся active.
-5. Перезагрузить игровой ПК — `STAGED_ONLY.txt` отсутствует.
-6. Повторно запустить publisher: он должен использовать pending release, не создавать новый.
-7. Ввести точное подтверждение, затем перезагрузить игровой ПК.
+2. Запустить publisher и дождаться запроса activation.
+3. До ответа проверить, что master target уже подключён и диски online.
+4. Отказаться вводить точную строку activation.
+5. Проверить release list: новый release staged, предыдущий остаётся active.
+6. Перезагрузить игровой ПК — `STAGED_ONLY.txt` отсутствует.
+7. Повторно запустить publisher: он должен использовать pending release, проверить master
+   connection и не создавать новый release.
+8. Ввести точное подтверждение, затем перезагрузить игровой ПК.
 
 Ожидание: после activation файл появляется; Windows reset script и token не менялись.
 
@@ -61,7 +66,7 @@
 
 Ожидание: первый snapshot не пересоздаётся и ничего автоматически не удаляется.
 
-## 5. Неверный NAA на Threadripper
+## 5. Неверный NAA на Publisher PC
 
 1. В test config/override временно подменить один NAA из ответа publisher API.
 2. Запустить publisher при подключённом master target.
