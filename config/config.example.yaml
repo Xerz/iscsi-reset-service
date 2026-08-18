@@ -1,0 +1,68 @@
+schema_version: 2
+allowed_source_cidr: 10.20.40.0/24
+
+portal:
+  address: 10.20.40.10
+  port: 3260
+
+admin_api:
+  # Management/Wi-Fi address of the one PC allowed to publish releases.
+  allowed_source_ip: 192.168.1.101
+  token_digest: hmac-sha256:2222222222222222222222222222222222222222222222222222222222222222
+
+release_management:
+  prefix: games
+  timezone: Asia/Yekaterinburg
+
+publisher:
+  source_ip: 10.20.40.100
+  initiator_iqn: iqn.1991-05.com.microsoft:threadripper
+  target_iqn: iqn.2026-08.lab.games:master
+  volumes:
+    ssd:
+      dataset: nvme/masters/games-ssd
+      extent_id: 10
+      lun: 0
+    hdd:
+      dataset: hdd/masters/games-hdd
+      extent_id: 11
+      lun: 1
+
+clients:
+  chimera:
+    source_ip: 10.20.40.101
+    initiator_iqn: iqn.1991-05.com.microsoft:chimera
+    target_iqn: iqn.2026-08.lab.games:chimera
+    token_digest: hmac-sha256:0000000000000000000000000000000000000000000000000000000000000000
+    volumes:
+      ssd:
+        extent_id: 1
+        lun: 0
+        drive_letter: S
+        label: GAMES_SSD
+        clone_parent: nvme/clients/chimera
+      hdd:
+        extent_id: 2
+        lun: 1
+        drive_letter: H
+        label: GAMES_HDD
+        clone_parent: hdd/clients/chimera
+
+  beast:
+    source_ip: 10.20.40.102
+    initiator_iqn: iqn.1991-05.com.microsoft:beast
+    target_iqn: iqn.2026-08.lab.games:beast
+    token_digest: hmac-sha256:1111111111111111111111111111111111111111111111111111111111111111
+    volumes:
+      ssd:
+        extent_id: 3
+        lun: 0
+        drive_letter: S
+        label: GAMES_SSD
+        clone_parent: nvme/clients/beast
+      hdd:
+        extent_id: 4
+        lun: 1
+        drive_letter: H
+        label: GAMES_HDD
+        clone_parent: hdd/clients/beast

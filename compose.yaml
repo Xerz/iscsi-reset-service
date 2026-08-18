@@ -1,0 +1,120 @@
+services:
+  state-init:
+    image: python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+    command:
+      - python
+      - -c
+      - "import os,time; from pathlib import Path; Path('/mock/state.json').write_bytes(Path('/seed/mock-state.json').read_bytes()); os.chown('/mock',10001,10001); os.chown('/mock/state.json',10001,10001); os.chown('/state',10001,10001); time.sleep(3600)"
+    volumes:
+      - ./tests/interaction:/seed:ro
+      - mock-state:/mock
+      - release-state:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; assert Path('/mock/state.json').is_file()"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  admin:
+    build: .
+    command: ["serve-admin"]
+    depends_on:
+      state-init:
+        condition: service_healthy
+    environment:
+      SERVICE_ROLE: admin
+      BACKEND: mock
+      CONFIG_PATH: /test/config.yaml
+      MOCK_STATE_PATH: /mock/state.json
+      RELEASE_DB_PATH: /state/releases.sqlite3
+      TOKEN_PEPPER_FILE: /test/token-pepper
+      ADMIN_TOKEN_PEPPER_FILE: /test/admin-token-pepper
+      ALLOW_TEST_SOURCE_HEADER: "true"
+      ADMIN_BIND_HOST: 0.0.0.0
+      ADMIN_BIND_PORT: "8081"
+      LOG_LEVEL: INFO
+    ports:
+      - "18081:8081"
+    volumes:
+      - ./tests/interaction/config.yaml:/test/config.yaml:ro
+      - ./tests/interaction/token-pepper:/test/token-pepper:ro
+      - ./tests/interaction/admin-token-pepper:/test/admin-token-pepper:ro
+      - mock-state:/mock
+      - release-state:/state
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/readyz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    command: ["serve-reset"]
+    depends_on:
+      admin:
+        condition: service_healthy
+    environment:
+      SERVICE_ROLE: reset
+      BACKEND: mock
+      CONFIG_PATH: /test/config.yaml
+      MOCK_STATE_PATH: /mock/state.json
+      RELEASE_DB_PATH: /state/releases.sqlite3
+      TOKEN_PEPPER_FILE: /test/token-pepper
+      ALLOW_TEST_SOURCE_HEADER: "true"
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: "8080"
+      LOG_LEVEL: INFO
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./tests/interaction/config.yaml:/test/config.yaml:ro
+      - ./tests/interaction/token-pepper:/test/token-pepper:ro
+      - mock-state:/mock
+      - release-state:/state:ro
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  windows-simulation:
+    image: mcr.microsoft.com/powershell@sha256:042240d57ec9e47e511033b92625a8d95875ee5860af3015992c248b58a8be81
+    depends_on:
+      admin:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    working_dir: /suite
+    entrypoint: ["pwsh", "-NoLogo", "-NoProfile", "-File", "/suite/tests/interaction/run.ps1"]
+    volumes:
+      - ./powershell:/suite/powershell:ro
+      - ./tests/interaction:/suite/tests/interaction:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+volumes:
+  mock-state:
+  release-state:

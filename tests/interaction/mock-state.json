@@ -1,0 +1,47 @@
+{
+  "snapshots": [],
+  "datasets": {
+    "nvme/masters/games-ssd": { "origin": null },
+    "hdd/masters/games-hdd": { "origin": null }
+  },
+  "extents": {
+    "1": {
+      "disk": "nvme/clients/chimera/ssd__legacy",
+      "naa": "0x6589cfc000000001",
+      "serial": "CHIMERA-SSD",
+      "enabled": true
+    },
+    "2": {
+      "disk": "hdd/clients/chimera/hdd__legacy",
+      "naa": "0x6589cfc000000002",
+      "serial": "CHIMERA-HDD",
+      "enabled": true
+    },
+    "10": {
+      "disk": "nvme/masters/games-ssd",
+      "naa": "0x6589cfc000000010",
+      "serial": "MASTER-SSD",
+      "enabled": true
+    },
+    "11": {
+      "disk": "hdd/masters/games-hdd",
+      "naa": "0x6589cfc000000011",
+      "serial": "MASTER-HDD",
+      "enabled": true
+    }
+  },
+  "target_luns": {
+    "iqn.2026-08.lab.games:chimera": [
+      { "extent_id": 1, "lun": 0 },
+      { "extent_id": 2, "lun": 1 }
+    ],
+    "iqn.2026-08.lab.games:master": [
+      { "extent_id": 10, "lun": 0 },
+      { "extent_id": 11, "lun": 1 }
+    ]
+  },
+  "sessions": [],
+  "failpoints": {
+    "update_extent_disk:2": 1
+  }
+}

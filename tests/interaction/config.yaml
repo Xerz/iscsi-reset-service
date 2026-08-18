@@ -1,0 +1,35 @@
+schema_version: 2
+allowed_source_cidr: 10.20.40.0/24
+portal: { address: 10.20.40.10, port: 3260 }
+admin_api:
+  allowed_source_ip: 192.168.1.101
+  token_digest: hmac-sha256:1e10fc6038b9541fce978670e80928f93d27f34170cfd2e92ea8ea70ed84219a
+release_management:
+  prefix: games
+  timezone: Asia/Yekaterinburg
+publisher:
+  source_ip: 10.20.40.100
+  initiator_iqn: iqn.1991-05.com.microsoft:threadripper
+  target_iqn: iqn.2026-08.lab.games:master
+  volumes:
+    ssd: { dataset: nvme/masters/games-ssd, extent_id: 10, lun: 0 }
+    hdd: { dataset: hdd/masters/games-hdd, extent_id: 11, lun: 1 }
+clients:
+  chimera:
+    source_ip: 10.20.40.101
+    initiator_iqn: iqn.1991-05.com.microsoft:chimera
+    target_iqn: iqn.2026-08.lab.games:chimera
+    token_digest: hmac-sha256:78b07b07709318aa13cf67ca02b74fd8e11f9fd75209fd5d377703dea18edd63
+    volumes:
+      ssd:
+        extent_id: 1
+        lun: 0
+        drive_letter: S
+        label: GAMES_SSD
+        clone_parent: nvme/clients/chimera
+      hdd:
+        extent_id: 2
+        lun: 1
+        drive_letter: H
+        label: GAMES_HDD
+        clone_parent: hdd/clients/chimera
