@@ -131,3 +131,4 @@ jobs:
               --verify-tag \
               --title "iSCSI Reset Service ${GITHUB_REF_NAME}" \
               --notes-file dist/release-notes.md
+          fi

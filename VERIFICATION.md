@@ -13,6 +13,17 @@
 - Compose interaction suite — passed.
 - Renderer release bundle с тестовым `sha256` digest и последующий
   `docker compose -f <bundle> config --quiet` — passed.
+- GitHub Actions CI run `32135742007`: Python/Ruff, Windows PowerShell 5.1 Pester и Compose
+  interaction jobs — passed.
+- Release gate run `32136015989`: tag/version validation, Python/Ruff, Windows PowerShell 5.1
+  Pester и Compose interaction jobs — passed.
+- Образ `ghcr.io/xerz/iscsi-reset-service:v0.2.0` опубликован с SBOM и provenance;
+  release bundle создан с digest
+  `sha256:15808835c03e129241c69d32ed264e58fc7309e9b5d164450ed511bef2b3b7c8`.
+- Скачанный workflow artifact: `SHA256SUMS` — passed, обе службы используют один digest,
+  `docker compose config --quiet` — passed; из этих файлов создан GitHub Release `v0.2.0`.
+- Анонимный GHCR pull-token и manifest request — HTTP 200, manifest digest совпал с release
+  bundle; пользовательские registry credentials не использовались.
 
 Pytest покрывает:
 
@@ -51,8 +62,6 @@ Compose запускает два API с общей SQLite и общий persist
 - Реальный mTLS handshake на management NIC TrueNAS; unit/deployment проверки подтверждают
   обязательный `ssl.CERT_REQUIRED`, но сертификаты конкретной сети ещё не выпущены.
 - Подбор минимальных ролей TrueNAS API-пользователя на конкретной patch release.
-- Pester на настоящем Windows PowerShell 5.1 runner; локально использован PowerShell 7.5,
-  а CI содержит обязательный Windows PowerShell 5.1 job.
 - Реальное соответствие extent NAA полю Windows `Get-Disk.UniqueId`.
 - Offline/disconnect/reconnect физических master LUN.
 - Destructive rollback тестового 1 GiB zvol и параллельная загрузка Chimera/Beast.
@@ -60,3 +69,11 @@ Compose запускает два API с общей SQLite и общий persist
 
 До прохождения `TEST-PLAN.md` программная часть считается проверенной, а deployment и
 физические storage-сценарии — ожидающими стенда.
+
+## Инцидент первого release run
+
+Первый `v0.2.0` run успешно опубликовал image, attestation и workflow artifact, но финальный
+shell step создания GitHub Release завершился syntax error из-за пропущенного `fi`. Release
+создан из checksum-проверенного artifact без повторной публикации image; `fi` добавлен в `main`
+и shell block проверен через `bash -n`. Полный corrected tag run будет подтверждён следующим
+version tag; результат первого run не переименован в success.
