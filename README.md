@@ -10,6 +10,104 @@ Fail-closed комплект для TrueNAS SCALE 25.10 и Windows 11:
 Инструкции для следующих coding-агентов, включая обязательные safety-инварианты и матрицу
 проверок, находятся в [AGENTS.md](AGENTS.md).
 
+## Как это работает
+
+### Компоненты
+
+```mermaid
+flowchart LR
+    clients["Игровые ПК<br/>Windows 11"]
+    publisher["Threadripper<br/>publisher"]
+    reset["Reset API<br/>SAN :8443"]
+    admin["Admin API<br/>management :8444"]
+    database[("SQLite<br/>releases.sqlite3")]
+    truenas["TrueNAS JSON-RPC"]
+    zfs["ZFS snapshots<br/>и clones"]
+    iscsi["iSCSI targets<br/>и extents"]
+
+    clients -->|"Bearer token + source IP"| reset
+    publisher -->|"mTLS + admin token + source IP"| admin
+    reset -->|"read-only"| database
+    admin -->|"read-write"| database
+    reset --> truenas
+    admin --> truenas
+    truenas --> zfs
+    truenas --> iscsi
+    clients <-->|"iSCSI :3260"| iscsi
+    publisher <-->|"iSCSI :3260"| iscsi
+```
+
+### Публикация release
+
+```mermaid
+flowchart TD
+    start["Preflight: credentials, sessions,<br/>target, LUN, paths, NAA и serial"]
+    preflight{"Preflight пройден?"}
+    reject["Отказ до mutations"]
+    disable["Отключить все master extents<br/>и повторно проверить sessions"]
+    reserve["Зарезервировать release<br/>и request ID в SQLite"]
+    snapshots["Создать snapshots<br/>и фиксировать прогресс"]
+    verify["Проверить полный snapshot set"]
+    enable["Включить и сверить<br/>master extents"]
+    staged["Release staged"]
+    confirm{"Получено точное<br/>ACTIVATE release?"}
+    pending["Оставить staged;<br/>active не менять"]
+    active["Атомарно переключить<br/>active release"]
+    fail["FAIL CLOSED<br/>master extents disabled<br/>release не staged, active не изменён"]
+
+    start --> preflight
+    preflight -->|"Нет"| reject
+    preflight -->|"Да"| disable
+    disable --> reserve --> snapshots --> verify --> enable --> staged --> confirm
+    confirm -->|"Нет"| pending
+    confirm -->|"Да"| active
+    disable -. "ошибка" .-> fail
+    reserve -. "ошибка" .-> fail
+    snapshots -. "ошибка" .-> fail
+    verify -. "ошибка" .-> fail
+    enable -. "ошибка" .-> fail
+
+    classDef failure fill:#ffe3e3,stroke:#d33,color:#111;
+    classDef success fill:#e4f7e7,stroke:#27823b,color:#111;
+    class fail failure;
+    class staged,active success;
+```
+
+### Сброс клиента
+
+```mermaid
+flowchart TD
+    boot["Windows boot task<br/>POST /v1/prepare"]
+    preflight{"Token, source IP, target/LUN<br/>и отсутствие session корректны?"}
+    reject["Отказ до mutations;<br/>диски не подключать"]
+    disable["Отключить все client extents<br/>и повторно проверить sessions"]
+    release["Прочитать active release<br/>только из SQLite"]
+    clones["Создать или проверить clones,<br/>origin, properties и @clean"]
+    paths["Переключить extent paths,<br/>сохранив NAA и serial"]
+    rollback["Rollback каждого clone<br/>к @clean"]
+    enable["Проверить target/LUN<br/>и включить все extents"]
+    final["Сверить paths, NAA, serial,<br/>enabled state и sessions"]
+    ready["Вернуть ready;<br/>подключить iSCSI без persistence"]
+    fail["FAIL CLOSED<br/>client extents disabled<br/>ready не возвращается"]
+
+    boot --> preflight
+    preflight -->|"Нет"| reject
+    preflight -->|"Да"| disable
+    disable --> release --> clones --> paths --> rollback --> enable --> final --> ready
+    disable -. "ошибка" .-> fail
+    release -. "ошибка" .-> fail
+    clones -. "ошибка" .-> fail
+    paths -. "ошибка" .-> fail
+    rollback -. "ошибка" .-> fail
+    enable -. "ошибка" .-> fail
+    final -. "ошибка" .-> fail
+
+    classDef failure fill:#ffe3e3,stroke:#d33,color:#111;
+    classDef success fill:#e4f7e7,stroke:#27823b,color:#111;
+    class fail failure;
+    class ready success;
+```
+
 ## Сеть и компоненты
 
 | Назначение | Адрес |
