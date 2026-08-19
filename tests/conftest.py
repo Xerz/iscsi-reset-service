@@ -95,8 +95,12 @@ def mock_state() -> dict:
             f"hdd/masters/games-hdd@{ACTIVE_RELEASE}",
         ],
         "datasets": {
-            "nvme/masters/games-ssd": {"origin": None},
-            "hdd/masters/games-hdd": {"origin": None},
+            "nvme/masters/games-ssd": {"origin": None, "type": "VOLUME"},
+            "hdd/masters/games-hdd": {"origin": None, "type": "VOLUME"},
+            "nvme/clients/chimera": {"origin": None, "type": "FILESYSTEM"},
+            "hdd/clients/chimera": {"origin": None, "type": "FILESYSTEM"},
+            "nvme/clients/beast": {"origin": None, "type": "FILESYSTEM"},
+            "hdd/clients/beast": {"origin": None, "type": "FILESYSTEM"},
         },
         "extents": {
             "1": {
@@ -151,6 +155,69 @@ def mock_state() -> dict:
             ],
         },
         "sessions": [],
+        "discovery": {
+            "basename": "iqn.2026-08.lab.games",
+            "listen_port": 3260,
+            "portals": [
+                {
+                    "id": 1,
+                    "comment": "SAN",
+                    "listen": [{"address": "10.20.40.10", "port": 3260}],
+                }
+            ],
+            "initiator_groups": [
+                {
+                    "id": 1,
+                    "comment": "publisher",
+                    "initiators": [
+                        "iqn.1991-05.com.microsoft:publisher",
+                        "10.20.40.100/32",
+                    ],
+                },
+                {
+                    "id": 2,
+                    "comment": "chimera",
+                    "initiators": [
+                        "iqn.1991-05.com.microsoft:chimera",
+                        "10.20.40.101/32",
+                    ],
+                },
+                {
+                    "id": 3,
+                    "comment": "beast",
+                    "initiators": [
+                        "iqn.1991-05.com.microsoft:beast",
+                        "10.20.40.102/32",
+                    ],
+                },
+            ],
+            "targets": [
+                {
+                    "id": 1,
+                    "iqn": "iqn.2026-08.lab.games:master",
+                    "alias": "master",
+                    "portal_ids": [1],
+                    "initiator_ids": [1],
+                    "auth_networks": [],
+                },
+                {
+                    "id": 2,
+                    "iqn": "iqn.2026-08.lab.games:chimera",
+                    "alias": "chimera",
+                    "portal_ids": [1],
+                    "initiator_ids": [2],
+                    "auth_networks": [],
+                },
+                {
+                    "id": 3,
+                    "iqn": "iqn.2026-08.lab.games:beast",
+                    "alias": "beast",
+                    "portal_ids": [1],
+                    "initiator_ids": [3],
+                    "auth_networks": [],
+                },
+            ],
+        },
     }
 
 

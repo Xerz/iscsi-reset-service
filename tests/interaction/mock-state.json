@@ -1,8 +1,10 @@
 {
   "snapshots": [],
   "datasets": {
-    "nvme/masters/games-ssd": { "origin": null },
-    "hdd/masters/games-hdd": { "origin": null }
+    "nvme/masters/games-ssd": { "origin": null, "type": "VOLUME" },
+    "hdd/masters/games-hdd": { "origin": null, "type": "VOLUME" },
+    "nvme/clients/chimera": { "origin": null, "type": "FILESYSTEM" },
+    "hdd/clients/chimera": { "origin": null, "type": "FILESYSTEM" }
   },
   "extents": {
     "1": {

@@ -26,7 +26,7 @@ services:
       SERVER_KEY_FILE: /run/tls/server.key
       LOG_LEVEL: INFO
     volumes:
-      - /mnt/tank/iscsi-reset/config.yaml:/config/config.yaml:ro
+      - /mnt/tank/iscsi-reset/config:/config:ro
       - /mnt/tank/iscsi-reset/state:/state:ro
       - /mnt/tank/iscsi-reset/secrets/token_pepper:/run/secrets/token_pepper:ro
       - /mnt/tank/iscsi-reset/secrets/truenas_api_key:/run/secrets/truenas_api_key:ro
@@ -63,7 +63,7 @@ services:
       ADMIN_CLIENT_CA_FILE: /run/tls/client-ca.crt
       LOG_LEVEL: INFO
     volumes:
-      - /mnt/tank/iscsi-reset/config.yaml:/config/config.yaml:ro
+      - /mnt/tank/iscsi-reset/config:/config:ro
       - /mnt/tank/iscsi-reset/state:/state:rw
       - /mnt/tank/iscsi-reset/secrets/token_pepper:/run/secrets/token_pepper:ro
       - /mnt/tank/iscsi-reset/secrets/admin_token_pepper:/run/secrets/admin_token_pepper:ro
@@ -71,5 +71,39 @@ services:
       - /mnt/tank/iscsi-reset/tls/admin-server.crt:/run/tls/server.crt:ro
       - /mnt/tank/iscsi-reset/tls/admin-server.key:/run/tls/server.key:ro
       - /mnt/tank/iscsi-reset/tls/admin-client-ca.crt:/run/tls/client-ca.crt:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+  iscsi-configurator:
+    image: ghcr.io/REPLACE_OWNER/iscsi-reset-service@sha256:REPLACE_WITH_IMMUTABLE_DIGEST
+    command: ["serve-configurator"]
+    network_mode: host
+    user: "10001:10001"
+    read_only: true
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      CONFIGURATOR_BACKEND: truenas
+      CONFIG_PATH: /config/config.yaml
+      RELEASE_DB_PATH: /state/releases.sqlite3
+      TOKEN_PEPPER_FILE: /run/secrets/token_pepper
+      ADMIN_TOKEN_PEPPER_FILE: /run/secrets/admin_token_pepper
+      CONFIGURATOR_TOKEN_DIGEST_FILE: /run/secrets/configurator_token_digest
+      TRUENAS_API_URL: wss://127.0.0.1/api/current
+      TRUENAS_DISCOVERY_API_USERNAME: iscsi-reset-configurator
+      TRUENAS_DISCOVERY_API_KEY_FILE: /run/secrets/truenas_discovery_api_key
+      TRUENAS_TLS_VERIFY: "false"
+      TRUENAS_TLS_INSECURE_ACK: I_ACCEPT_MITM_RISK
+      CONFIGURATOR_BIND_HOST: 127.0.0.1
+      CONFIGURATOR_BIND_PORT: "8445"
+      LOG_LEVEL: INFO
+    volumes:
+      - /mnt/tank/iscsi-reset/config:/config:rw
+      - /mnt/tank/iscsi-reset/state:/state:ro
+      - /mnt/tank/iscsi-reset/secrets/token_pepper:/run/secrets/token_pepper:ro
+      - /mnt/tank/iscsi-reset/secrets/admin_token_pepper:/run/secrets/admin_token_pepper:ro
+      - /mnt/tank/iscsi-reset/secrets/configurator_token_digest:/run/secrets/configurator_token_digest:ro
+      - /mnt/tank/iscsi-reset/secrets/truenas_discovery_api_key:/run/secrets/truenas_discovery_api_key:ro
     tmpfs:
       - /tmp:size=16m,mode=1777

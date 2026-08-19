@@ -5,7 +5,7 @@ import ipaddress
 import json
 import re
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -16,6 +16,43 @@ IQN_RE = re.compile(r"^iqn\.[0-9]{4}-[0-9]{2}\.[^\s:]+:.+$", re.IGNORECASE)
 TOKEN_DIGEST_RE = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
 DATASET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key: {key}",
+                key_node.start_mark,
+            )
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 class StrictModel(BaseModel):
@@ -266,14 +303,31 @@ def normalize_disk_id(value: str) -> str:
     return normalized[2:] if normalized.startswith("0x") else normalized
 
 
-def load_config(path: str | Path) -> ServiceConfig:
-    source = Path(path)
-    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+def parse_config_yaml(source: str) -> ServiceConfig:
+    try:
+        raw = yaml.load(source, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        problem = getattr(exc, "problem", None) or "invalid YAML"
+        raise ValueError(str(problem)) from exc
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
     if raw.get("schema_version") == 1:
         raise ValueError(
-            "schema_version 1 is not supported by v0.2.0; move releases/active_release "
+            "schema_version 1 is not supported since v0.2.0; move releases/active_release "
             "to the release database and add admin_api, release_management and publisher"
         )
     return ServiceConfig.model_validate(raw)
+
+
+def dump_config(config: ServiceConfig) -> str:
+    return yaml.safe_dump(
+        config.model_dump(mode="json"),
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+
+
+def load_config(path: str | Path) -> ServiceConfig:
+    source = Path(path)
+    return parse_config_yaml(source.read_text(encoding="utf-8"))

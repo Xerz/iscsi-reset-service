@@ -19,6 +19,20 @@ def test_valid_config_supports_separate_clone_pools() -> None:
     assert len(config.revision) == 16
 
 
+def test_iqns_are_normalized_to_lowercase() -> None:
+    raw = config_dict()
+    raw["publisher"]["initiator_iqn"] = raw["publisher"]["initiator_iqn"].upper()
+    raw["publisher"]["target_iqn"] = raw["publisher"]["target_iqn"].upper()
+    raw["clients"]["chimera"]["initiator_iqn"] = (
+        raw["clients"]["chimera"]["initiator_iqn"].upper()
+    )
+    config = ServiceConfig.model_validate(raw)
+
+    assert config.publisher.initiator_iqn == "iqn.1991-05.com.microsoft:publisher"
+    assert config.publisher.target_iqn == "iqn.2026-08.lab.games:master"
+    assert config.clients["chimera"].initiator_iqn == "iqn.1991-05.com.microsoft:chimera"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

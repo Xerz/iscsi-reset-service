@@ -5,6 +5,58 @@ $tokenPath = Join-Path $root "client.token"
 $statePath = Join-Path $root "windows-state.json"
 Set-Content -LiteralPath $tokenPath -Value "chimera-interaction-token" -NoNewline
 
+# The simulation shares configurator's network namespace, matching an SSH tunnel endpoint.
+$configuratorOrigin = "http://127.0.0.1:8445"
+$loginBody = @{ token = "configurator-test-token" } | ConvertTo-Json
+$login = Invoke-RestMethod `
+    -Method Post `
+    -Uri "$configuratorOrigin/v1/configurator/session" `
+    -Headers @{ Origin = $configuratorOrigin } `
+    -ContentType "application/json" `
+    -Body $loginBody `
+    -SessionVariable configuratorSession
+$configuratorHeaders = @{
+    Origin = $configuratorOrigin
+    "X-CSRF-Token" = [string]$login.csrf_token
+}
+$document = Invoke-RestMethod `
+    -Method Get `
+    -Uri "$configuratorOrigin/v1/configurator/config" `
+    -WebSession $configuratorSession
+$document.config.clients.chimera.volumes.ssd.label = "COMPOSE_CONFIG"
+$validateBody = @{
+    base_revision = [string]$document.source_revision
+    config = $document.config
+} | ConvertTo-Json -Depth 20
+$validated = Invoke-RestMethod `
+    -Method Post `
+    -Uri "$configuratorOrigin/v1/configurator/config/validate" `
+    -Headers $configuratorHeaders `
+    -ContentType "application/json" `
+    -Body $validateBody `
+    -WebSession $configuratorSession
+$saveBody = @{
+    base_revision = [string]$document.source_revision
+    yaml = [string]$validated.yaml
+} | ConvertTo-Json -Depth 5
+$saved = Invoke-RestMethod `
+    -Method Put `
+    -Uri "$configuratorOrigin/v1/configurator/config" `
+    -Headers $configuratorHeaders `
+    -ContentType "application/json" `
+    -Body $saveBody `
+    -WebSession $configuratorSession
+if (-not [bool]$saved.restart_required) {
+    throw "Configurator save did not require a Custom App restart"
+}
+$configuratorStatus = Invoke-RestMethod `
+    -Method Get `
+    -Uri "$configuratorOrigin/v1/configurator/status" `
+    -WebSession $configuratorSession
+if ([string]$configuratorStatus.saved_revision -eq [string]$configuratorStatus.startup_revision) {
+    throw "Configurator revisions did not diverge after save"
+}
+
 $adminHeaders = @{
     Authorization = "Bearer publisher-interaction-token"
     "X-Test-Source-IP" = "192.168.1.101"

@@ -1,4 +1,78 @@
-# Verification record — v0.2.0
+# Verification record
+
+## Configurator worktree v0.3.0 — 2026-08-19
+
+### Автоматически и локально пройдено
+
+- `ruff check src tests` — passed.
+- `pytest -q` на Python 3.14 — **100 passed**. Предупреждения относятся к deprecated asyncio
+  policy API в тестовом окружении Python 3.14, падений нет.
+- `node --check src/iscsi_reset_service/static/app.js` — passed.
+- `docker compose config --quiet` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host; контейнер приложения собран с
+  Python 3.12, закреплённый PowerShell simulation image запущен через amd64 emulation.
+- Compose interaction подтвердил третий loopback-only configurator, login/CSRF, live
+  validation, запись нового revision в directory mount, отсутствие hot reload, а затем прежние
+  stage/activate и fault → retry reset сценарии. После прогона выполнен
+  `docker compose down --volumes`.
+- Renderer `python -m iscsi_reset_service.release_bundle` с тестовым digest и затем
+  `docker compose -f <rendered-bundle> config --quiet` — passed; bundle содержит ровно три
+  одинаковые digest-pinned image references.
+- `git diff --check` — passed.
+
+Unit/API tests дополнительно покрывают discovery-модели и точные TrueNAS JSON-RPC query
+payloads, canonical YAML и duplicate keys, IQN normalization, locked/file extent и dataset
+фильтры, session/Host/Origin/CSRF/expiry/request-size проверки, одноразовые token digests,
+optimistic revision conflict, active/incomplete release guards, отсутствующую/повреждённую
+SQLite и сбои atomic replace с сохранением предыдущего файла/history.
+
+### Browser E2E на локальном mock backend
+
+Через `@playwright/cli` фактически пройдены два сценария:
+
+1. Редактирование существующего config: восстановление session после reload, form → YAML и
+   YAML → form, token generation, очистка raw token и отсутствие local/session storage,
+   duplicate-key validation, atomic save, history mode `0600` и restart banner.
+2. Первичная установка без `config.yaml` и SQLite: выбор publisher/client topology из
+   discovery, live validation, создание canonical `config.yaml` mode `0600`, различающиеся
+   `startup: нет`/saved revision и обязательный restart banner.
+
+Browser и временный mock server остановлены; тестовые raw tokens и browser artifacts не входят
+в repository.
+
+### Простой редизайн конфигуратора — 2026-08-19
+
+- В in-app browser на локальном mock backend проверены login и все пять разделов: простые
+  status-показатели, двухколоночная форма сети, таблица publisher volumes, последовательные
+  client cards с таблицами volumes и отдельный YAML editor.
+- Повторно пройдены form → YAML и YAML → form, генерация client token с одноразовым
+  dialog, duplicate-key validation, сохранение config и restart banner.
+- Визуально проверены обычный desktop viewport и mobile `390×844`: навигация остаётся
+  доступной, таблицы переходят в подписанные формы, нижняя save panel не перекрывает поля.
+- После UI-изменений повторно пройдены `ruff check src tests`, `pytest -q` (**100 passed**),
+  `node --check src/iscsi_reset_service/static/app.js`, `git diff --check`,
+  `docker compose config --quiet` и полный Compose interaction. После прогона выполнен
+  `docker compose down --volumes`.
+- Frontend API, schema v2, draft model и storage safety-логика не изменялись; новые frontend
+  dependencies, framework, внешние assets и шрифты не добавлялись.
+
+### Ожидает отдельной среды
+
+- Текущий Windows PowerShell 5.1 Pester job локально не запускался: Windows runner в этой
+  сессии недоступен. PowerShell interaction выполнен только закреплённым Linux pwsh container;
+  Pester на Windows 5.1 остаётся обязательным CI gate для v0.3.0.
+- Минимальный набор read-only ролей discovery user на реальном TrueNAS SCALE 25.10 patch
+  release.
+- Реальный SSH tunnel к TrueNAS и подтверждение, что configurator недоступен иначе.
+- Реальный Custom App directory mount, POSIX lock/history/fsync и restart/revision flow после
+  redeploy.
+- Реальные iSCSI/NTFS/NAA, mTLS и destructive ZFS проверки из `TEST-PLAN.md`.
+
+Mock/unit/Compose/browser результаты не считаются доказательством физического TrueNAS/Windows
+поведения.
+
+## Историческая проверка v0.2.0
 
 Дата локальной проверки: 2026-08-18.
 

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from iscsi_reset_service.models import DatasetState, ExtentState, SessionState, TargetLunState
+from iscsi_reset_service.models import (
+    ConfigurationDiscovery,
+    DatasetState,
+    ExtentState,
+    SessionState,
+    TargetLunState,
+)
 
 
 class BackendError(RuntimeError):
@@ -18,6 +24,9 @@ class StorageBackend(ABC):
 
     @abstractmethod
     async def list_sessions(self) -> list[SessionState]: ...
+
+    @abstractmethod
+    async def discover_configuration(self) -> ConfigurationDiscovery: ...
 
     @abstractmethod
     async def snapshot_exists(self, snapshot: str) -> bool: ...
@@ -49,4 +58,3 @@ class StorageBackend(ABC):
 
     @abstractmethod
     async def list_datasets(self, prefix: str) -> list[DatasetState]: ...
-

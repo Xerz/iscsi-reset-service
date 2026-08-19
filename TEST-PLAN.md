@@ -1,4 +1,4 @@
-# Механический тест-план v0.2.0
+# Механический тест-план v0.3.0
 
 Все destructive проверки выполнять сначала на отдельных master/client zvol размером 1 GiB.
 Перед началом сохранить конфиг TrueNAS и SQLite state dataset.
@@ -7,7 +7,7 @@
 
 1. Выполнить `config validate` и `releases validate`.
 2. Проверить, что admin API слушает только management IP:8444, reset API — только
-   `10.20.40.10:8443`.
+   `10.20.40.10:8443`, configurator — только `127.0.0.1:8445`.
 3. Проверить admin API четырьмя запросами:
    - без client certificate — TLS handshake отклонён;
    - с неверным client certificate — TLS handshake отклонён;
@@ -15,6 +15,32 @@
    - с правильными credentials с другого management IP — HTTP 403.
 4. В Windows сравнить publisher/client IQN с `Get-InitiatorPort`.
 5. Записать master/client extent ID, LUN, NAA, serial и disk paths.
+
+## 0a. Configurator и SSH tunnel
+
+1. Убедиться, что discovery user имеет только `DATASET_READ` и необходимые
+   `SHARING_ISCSI_*_READ` роли. Попытка любого write JSON-RPC этим key должна отклоняться.
+2. С удалённого компьютера проверить, что прямое соединение к `<TRUENAS_IP>:8445` невозможно.
+3. Открыть `ssh -N -L 8445:127.0.0.1:8445 <truenas>` и войти через
+   `http://127.0.0.1:8445` отдельным configurator token.
+4. Проверить отказ для неверного token, non-loopback Host, неверного Origin и отсутствующего
+   CSRF; cookie должна быть `HttpOnly`/`SameSite=Strict`, framing — запрещён.
+5. Сверить discovery UI с TrueNAS: portal/listen address, полный IQN targets, initiator groups,
+   extents/NAA/serial/dataset, targetextent/LUN и ZFS datasets. Locked/file extents и clone
+   parents другого pool не должны предлагаться.
+6. Изменить безопасное поле, проверить form↔YAML, duplicate-key error и однократную выдачу raw
+   token. Raw token не должен появиться в config, browser storage, application/audit logs.
+7. Имитировать параллельное редактирование: второй save со старым `base_revision` должен вернуть
+   `409`, не меняя файл/history.
+8. При active release изменить publisher volume dataset; при incomplete release изменить
+   publisher/portal. Оба save должны отклониться без записи. Повторить с недоступной и повреждённой
+   SQLite.
+9. Между validate и save удалить/изменить выбранный mock/staging TrueNAS object: повторное live
+   discovery должно заблокировать save.
+10. Выполнить разрешённый save. Проверить mode `0600`, immutable-копию в `/config/history`, новый
+    saved revision, прежний startup revision и обязательный restart banner.
+11. Перезапустить весь Custom App и проверить совпадение startup/saved revisions. Убедиться, что
+    Reset/Admin контракты и active release не изменились.
 
 ## 1. Первый release и безопасный reset
 
@@ -86,7 +112,7 @@
 ## 7. Сохранность SQLite
 
 1. Записать active release и checksum `/state/releases.sqlite3`.
-2. Перезапустить оба контейнера, затем выполнить App redeploy с тем же state mount.
+2. Перезапустить все три контейнера, затем выполнить App redeploy с тем же state mount.
 3. Проверить active release и загрузить один игровой ПК.
 4. На отдельной копии стенда убрать/повредить SQLite.
 
@@ -98,6 +124,10 @@
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
 | mTLS/token/IP | Все три защиты обязательны |  | ☐ |
+| Configurator tunnel | Только loopback через SSH |  | ☐ |
+| Discovery permissions | Read-only user не может выполнять mutations |  | ☐ |
+| Config save | 409/live recheck/SQLite guards/atomic history |  | ☐ |
+| Restart revisions | После restart startup = saved |  | ☐ |
 | Первый release | Stage + atomic activate |  | ☐ |
 | Rollback 1 GiB | baseline есть, mutation нет |  | ☐ |
 | Stage без activate | Старый release остаётся active |  | ☐ |

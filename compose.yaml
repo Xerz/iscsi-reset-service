@@ -4,11 +4,12 @@ services:
     command:
       - python
       - -c
-      - "import os,time; from pathlib import Path; Path('/mock/state.json').write_bytes(Path('/seed/mock-state.json').read_bytes()); os.chown('/mock',10001,10001); os.chown('/mock/state.json',10001,10001); os.chown('/state',10001,10001); time.sleep(3600)"
+      - "import os,time; from pathlib import Path; Path('/mock/state.json').write_bytes(Path('/seed/mock-state.json').read_bytes()); Path('/config/config.yaml').write_bytes(Path('/seed/config.yaml').read_bytes()); [os.chown(path,10001,10001) for path in ('/mock','/mock/state.json','/state','/config','/config/config.yaml')]; time.sleep(3600)"
     volumes:
       - ./tests/interaction:/seed:ro
       - mock-state:/mock
       - release-state:/state
+      - config-state:/config
     healthcheck:
       test: ["CMD", "python", "-c", "from pathlib import Path; assert Path('/mock/state.json').is_file()"]
       interval: 1s
@@ -24,7 +25,7 @@ services:
     environment:
       SERVICE_ROLE: admin
       BACKEND: mock
-      CONFIG_PATH: /test/config.yaml
+      CONFIG_PATH: /config/config.yaml
       MOCK_STATE_PATH: /mock/state.json
       RELEASE_DB_PATH: /state/releases.sqlite3
       TOKEN_PEPPER_FILE: /test/token-pepper
@@ -36,7 +37,7 @@ services:
     ports:
       - "18081:8081"
     volumes:
-      - ./tests/interaction/config.yaml:/test/config.yaml:ro
+      - config-state:/config:ro
       - ./tests/interaction/token-pepper:/test/token-pepper:ro
       - ./tests/interaction/admin-token-pepper:/test/admin-token-pepper:ro
       - mock-state:/mock
@@ -67,7 +68,7 @@ services:
     environment:
       SERVICE_ROLE: reset
       BACKEND: mock
-      CONFIG_PATH: /test/config.yaml
+      CONFIG_PATH: /config/config.yaml
       MOCK_STATE_PATH: /mock/state.json
       RELEASE_DB_PATH: /state/releases.sqlite3
       TOKEN_PEPPER_FILE: /test/token-pepper
@@ -78,7 +79,7 @@ services:
     ports:
       - "18080:8080"
     volumes:
-      - ./tests/interaction/config.yaml:/test/config.yaml:ro
+      - config-state:/config:ro
       - ./tests/interaction/token-pepper:/test/token-pepper:ro
       - mock-state:/mock
       - release-state:/state:ro
@@ -99,12 +100,56 @@ services:
       timeout: 3s
       retries: 20
 
+  configurator:
+    build: .
+    command: ["serve-configurator"]
+    depends_on:
+      state-init:
+        condition: service_healthy
+    environment:
+      CONFIGURATOR_BACKEND: mock
+      CONFIG_PATH: /config/config.yaml
+      MOCK_STATE_PATH: /mock/state.json
+      RELEASE_DB_PATH: /state/releases.sqlite3
+      TOKEN_PEPPER_FILE: /test/token-pepper
+      ADMIN_TOKEN_PEPPER_FILE: /test/admin-token-pepper
+      CONFIGURATOR_TOKEN_DIGEST_FILE: /test/configurator-token-digest
+      CONFIGURATOR_BIND_HOST: 127.0.0.1
+      CONFIGURATOR_BIND_PORT: "8445"
+      LOG_LEVEL: INFO
+    volumes:
+      - config-state:/config
+      - ./tests/interaction/token-pepper:/test/token-pepper:ro
+      - ./tests/interaction/admin-token-pepper:/test/admin-token-pepper:ro
+      - ./tests/interaction/configurator-token-digest:/test/configurator-token-digest:ro
+      - mock-state:/mock
+      - release-state:/state:ro
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8445/healthz', timeout=2)",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
   windows-simulation:
     image: mcr.microsoft.com/powershell@sha256:042240d57ec9e47e511033b92625a8d95875ee5860af3015992c248b58a8be81
+    network_mode: service:configurator
     depends_on:
       admin:
         condition: service_healthy
       api:
+        condition: service_healthy
+      configurator:
         condition: service_healthy
     working_dir: /suite
     entrypoint: ["pwsh", "-NoLogo", "-NoProfile", "-File", "/suite/tests/interaction/run.ps1"]
@@ -118,3 +163,4 @@ services:
 volumes:
   mock-state:
   release-state:
+  config-state:

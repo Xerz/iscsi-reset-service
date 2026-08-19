@@ -1,3 +1,5 @@
+# Static schema v2. Prefer the loopback configurator for discovery-backed editing.
+# The configurator rewrites this file canonically; comments and formatting are not preserved.
 schema_version: 2
 allowed_source_cidr: 10.20.40.0/24
 

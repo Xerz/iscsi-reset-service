@@ -9,7 +9,17 @@ from typing import Any
 from websockets.asyncio.client import ClientConnection, connect
 
 from iscsi_reset_service.backends.base import BackendError, StorageBackend
-from iscsi_reset_service.models import DatasetState, ExtentState, SessionState, TargetLunState
+from iscsi_reset_service.models import (
+    ConfigurationDiscovery,
+    DatasetState,
+    ExtentState,
+    InitiatorGroupState,
+    PortalState,
+    SessionState,
+    TargetExtentState,
+    TargetLunState,
+    TargetState,
+)
 
 
 class TrueNASRpcClient:
@@ -129,6 +139,115 @@ class TrueNASBackend(StorageBackend):
                 )
             )
         return sessions
+
+    async def discover_configuration(self) -> ConfigurationDiscovery:
+        global_config = await self.rpc.call("iscsi.global.config")
+        basename = str(global_config.get("basename", "")).lower().rstrip(":")
+        listen_port = int(global_config.get("listen_port", 3260))
+        portal_rows = await self.rpc.call("iscsi.portal.query", [[], {}])
+        target_rows = await self.rpc.call("iscsi.target.query", [[], {}])
+        extent_rows = await self.rpc.call(
+            "iscsi.extent.query",
+            [[], {"extra": {"retrieve_locked_info": True}}],
+        )
+        association_rows = await self.rpc.call("iscsi.targetextent.query", [[], {}])
+        initiator_rows = await self.rpc.call("iscsi.initiator.query", [[], {}])
+        dataset_rows = await self.rpc.call(
+            "pool.dataset.query",
+            [
+                [],
+                {
+                    "extra": {
+                        "flat": True,
+                        "retrieve_children": True,
+                        "properties": [],
+                        "retrieve_user_props": False,
+                    }
+                },
+            ],
+        )
+
+        portals = [
+            PortalState(
+                id=int(row["id"]),
+                comment=str(row.get("comment", "")),
+                listen=tuple(
+                    (
+                        str(item.get("ip", "")),
+                        int(item.get("port", listen_port)),
+                    )
+                    for item in row.get("listen", [])
+                    if item.get("ip")
+                ),
+            )
+            for row in portal_rows
+        ]
+        initiator_groups = [
+            InitiatorGroupState(
+                id=int(row["id"]),
+                comment=str(row.get("comment", "")),
+                initiators=tuple(str(item).lower() for item in row.get("initiators", [])),
+            )
+            for row in initiator_rows
+        ]
+        targets: list[TargetState] = []
+        target_iqns: dict[int, str] = {}
+        for row in target_rows:
+            target_id = int(row["id"])
+            iqn = _full_iqn(basename, str(row.get("name", "")))
+            target_iqns[target_id] = iqn
+            groups = row.get("groups", []) or []
+            targets.append(
+                TargetState(
+                    id=target_id,
+                    iqn=iqn,
+                    alias=str(row["alias"]) if row.get("alias") else None,
+                    mode=str(row.get("mode", "ISCSI")).upper(),
+                    portal_ids=tuple(
+                        sorted({int(group["portal"]) for group in groups})
+                    ),
+                    initiator_ids=tuple(
+                        sorted(
+                            {
+                                int(group["initiator"])
+                                for group in groups
+                                if group.get("initiator") is not None
+                            }
+                        )
+                    ),
+                    auth_networks=tuple(
+                        sorted(
+                            {
+                                str(network)
+                                for group in groups
+                                for network in group.get("auth_networks", [])
+                            }
+                        )
+                    ),
+                )
+            )
+        associations = [
+            TargetExtentState(
+                id=int(row["id"]),
+                target_id=int(row["target"]),
+                target_iqn=target_iqns.get(int(row["target"]), ""),
+                extent_id=int(row["extent"]),
+                lun=int(row["lunid"]),
+            )
+            for row in association_rows
+            if int(row["target"]) in target_iqns
+        ]
+        return ConfigurationDiscovery(
+            basename=basename,
+            listen_port=listen_port,
+            portals=portals,
+            targets=targets,
+            initiator_groups=initiator_groups,
+            extents=[_extent_state(row) for row in extent_rows],
+            associations=associations,
+            datasets=[_dataset_state(row) for row in dataset_rows],
+            sessions=await self.list_sessions(),
+        )
 
     async def snapshot_exists(self, snapshot: str) -> bool:
         rows = await self.rpc.call(
@@ -262,6 +381,9 @@ def _extent_state(row: dict[str, Any]) -> ExtentState:
         naa=str(row.get("naa", "")),
         serial=str(row["serial"]) if row.get("serial") is not None else None,
         enabled=bool(row.get("enabled", False)),
+        name=str(row.get("name", "")),
+        type=str(row.get("type", "DISK")).upper(),
+        locked=(bool(row["locked"]) if row.get("locked") is not None else None),
     )
 
 
@@ -304,4 +426,15 @@ def _dataset_state(row: dict[str, Any]) -> DatasetState:
             parsed = _property_value(item)
             if key is not None and parsed is not None:
                 user_properties[str(key)] = parsed
-    return DatasetState(id=str(row["id"]), origin=origin, user_properties=user_properties)
+    return DatasetState(
+        id=str(row["id"]),
+        origin=origin,
+        user_properties=user_properties,
+        type=str(row.get("type", "FILESYSTEM")).upper(),
+        locked=(bool(row["locked"]) if row.get("locked") is not None else None),
+    )
+
+
+def _full_iqn(basename: str, name: str) -> str:
+    normalized = name.lower().strip()
+    return normalized if normalized.startswith("iqn.") else f"{basename}:{normalized}"

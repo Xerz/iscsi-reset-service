@@ -15,7 +15,7 @@ VALID_DIGEST = f"sha256:{'a' * 64}"
 IMAGE_REPOSITORY = "ghcr.io/xerz/iscsi-reset-service"
 
 
-def test_render_bundle_pins_both_services_and_preserves_site_placeholders() -> None:
+def test_render_bundle_pins_all_services_and_preserves_site_placeholders() -> None:
     template = TEMPLATE_PATH.read_text(encoding="utf-8")
 
     rendered = render_truenas_bundle(
@@ -25,7 +25,7 @@ def test_render_bundle_pins_both_services_and_preserves_site_placeholders() -> N
     )
 
     pinned_image = f"{IMAGE_REPOSITORY}@{VALID_DIGEST}"
-    assert rendered.count(f"image: {pinned_image}") == 2
+    assert rendered.count(f"image: {pinned_image}") == 3
     assert IMAGE_PLACEHOLDER not in rendered
     assert "REPLACE_OWNER" not in rendered
     assert "REPLACE_WITH_IMMUTABLE_DIGEST" not in rendered
@@ -69,7 +69,7 @@ def test_render_bundle_rejects_uppercase_or_tagged_repository() -> None:
 def test_render_bundle_rejects_unexpected_placeholder_count() -> None:
     template = TEMPLATE_PATH.read_text(encoding="utf-8").replace(IMAGE_PLACEHOLDER, "", 1)
 
-    with pytest.raises(ValueError, match="expected 2 image placeholders, found 1"):
+    with pytest.raises(ValueError, match="expected 3 image placeholders, found 2"):
         render_truenas_bundle(
             template,
             image_repository=IMAGE_REPOSITORY,
