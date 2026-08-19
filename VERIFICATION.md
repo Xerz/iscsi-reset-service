@@ -57,11 +57,25 @@ Browser и временный mock server остановлены; тестовы
 - Frontend API, schema v2, draft model и storage safety-логика не изменялись; новые frontend
   dependencies, framework, внешние assets и шрифты не добавлялись.
 
+### Опубликованный release v0.3.0 — 2026-08-19
+
+- Commit `b18ab7131c896f53be62228c464075a65772f257` опубликован в `main` и помечен
+  аннотированным tag `v0.3.0`.
+- GitHub CI run `32272982346` — passed: Python/Ruff, Windows PowerShell 5.1 Pester и Compose
+  interaction.
+- Release run `32273248337` — passed: tag/version validation, тот же полный verification gate,
+  публикация GHCR image, SBOM/provenance attestation, renderer bundle и GitHub Release.
+- Опубликованный immutable image digest:
+  `sha256:7819da963b44e5673c0d9a446c5edbc7cdf47b0c6976ecd251178c20ae5329c7`.
+- С GitHub Release заново скачаны `iscsi-reset-service-v0.3.0-truenas.yaml`,
+  `image-digest.txt` и `SHA256SUMS`; `sha256sum --check SHA256SUMS` — passed,
+  `docker compose -f iscsi-reset-service-v0.3.0-truenas.yaml config --quiet` — passed, все три
+  service image references совпадают с опубликованным digest.
+- Анонимное получение GHCR pull token и manifest по tag и immutable digest — HTTP 200;
+  `docker-content-digest` точно совпал с release bundle.
+
 ### Ожидает отдельной среды
 
-- Текущий Windows PowerShell 5.1 Pester job локально не запускался: Windows runner в этой
-  сессии недоступен. PowerShell interaction выполнен только закреплённым Linux pwsh container;
-  Pester на Windows 5.1 остаётся обязательным CI gate для v0.3.0.
 - Минимальный набор read-only ролей discovery user на реальном TrueNAS SCALE 25.10 patch
   release.
 - Реальный SSH tunnel к TrueNAS и подтверждение, что configurator недоступен иначе.
