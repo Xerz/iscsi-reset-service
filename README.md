@@ -191,39 +191,275 @@ immutable copy в `/config/history`, `fsync`, mode `0600` и атомарный 
 Формат v1 намеренно не импортируется автоматически. Пошаговое преобразование описано в
 `MIGRATION-v1-v2.md`.
 
-## Подготовка TrueNAS
+## Первичная подготовка TrueNAS до установки Custom App
 
-1. Создать master zvol для каждого `publisher.volumes.<name>.dataset`.
-2. Создать один publisher target с отдельными постоянными extent records и LUN associations.
-3. Ограничить publisher initiator group SAN IP и IQN Publisher PC.
-4. Создать отдельный target и initiator group для каждого игрового ПК.
-5. Создать постоянный extent для каждого клиентского LUN. Сервис меняет только `disk` и
-   `enabled`, сохраняя extent NAA и serial.
-6. Исключить `*/clients/*` из periodic snapshot tasks.
-7. Создать runtime API-пользователя без root. Нужны чтение iSCSI sessions/targets/extents,
-   `SHARING_ISCSI_EXTENT_WRITE`, чтение datasets/snapshots, `SNAPSHOT_WRITE`, clone и rollback.
-8. Создать отдельного discovery API-пользователя для configurator. Ему нужны только
-   `DATASET_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`,
-   `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`,
-   `SHARING_ISCSI_TARGETEXTENT_READ` и `SHARING_ISCSI_INITIATOR_READ`; write-роли не выдавать.
-9. Создать dataset `/mnt/tank/iscsi-reset/state`, выдать `10001:10001` write-доступ. Его следует
-   резервно копировать; клиентские clone datasets в этот backup не включать.
-10. Создать каталог `/mnt/tank/iscsi-reset/config`, положить в него `config.yaml`, выдать каталог
-    `10001:10001`, а файлу mode `0600`. Reset/admin монтируют каталог read-only, configurator —
-    read-write. Старый mount одного файла нужно преобразовать по `MIGRATION-v1-v2.md`.
-11. Создать отдельные high-entropy файлы `token_pepper`, `admin_token_pepper`, configurator
-    token digest, runtime API key и read-only discovery API key.
-12. Выпустить reset server certificate, admin server certificate и отдельный admin client PFX.
-    Admin server certificate должен содержать management IP TrueNAS, а client certificate —
-    Extended Key Usage `Client Authentication`.
+Это одноразовый bootstrap. App намеренно **не создаёт** pools, datasets, zvol, iSCSI objects,
+пользователей, API keys или сертификаты. Сначала подготовьте их в TrueNAS, и только потом
+устанавливайте release YAML. Storage objects создавайте через TrueNAS UI или документированный
+middleware API, а не прямыми `zfs`-командами: middleware должен видеть всю topology.
+
+Ниже `tank`, `nvme`, IP, IQN, размеры и имена клиентов — примеры. Замените их своими значениями
+согласованно в TrueNAS, release YAML и `config.yaml`.
+
+### 1. Составьте topology worksheet
+
+Для каждого logical volume и клиента заранее заполните таблицу. Ключи `ssd`/`hdd` произвольны;
+количество volumes также произвольно.
+
+| Поле | Пример |
+|---|---|
+| Logical volume | `ssd` |
+| Master zvol | `nvme/masters/games-ssd` |
+| Publisher extent ID / LUN | `10 / 0` |
+| Publisher SAN IP / IQN | `10.20.40.100` / `iqn....:publisher` |
+| Client | `chimera` |
+| Client clone parent | `nvme/clients/chimera` |
+| Client extent ID / LUN | `1 / 0` |
+| Client SAN IP / IQN | `10.20.40.101` / `iqn....:chimera` |
+| Windows letter / label | `S` / `GAMES_SSD` |
+
+IP, IQN, target и extent ID должны быть глобально уникальны. Один client target принадлежит
+ровно одному ПК. Clone parent каждого volume обязан находиться в том же ZFS pool, что и его
+master zvol.
+
+### 2. Создайте ZFS topology через Storage → Datasets
+
+1. Для каждого publisher volume создайте master **zvol** нужного размера, например
+   `nvme/masters/games-ssd`. Если промежуточного Filesystem dataset `nvme/masters` ещё нет,
+   сначала создайте его. Размер и block size после подключения Windows менять не следует.
+2. Для каждого клиента и каждого используемого pool создайте пустой **Filesystem dataset** —
+   clone parent, например `nvme/clients/chimera`; промежуточный `nvme/clients` также является
+   Filesystem dataset. Не создавайте release clones вручную: их создаёт сервис после activation.
+3. Для первоначального client extent создайте внутри clone parent отдельный bootstrap zvol
+   того же размера, например `nvme/clients/chimera/ssd__bootstrap`. Он нужен только для создания
+   постоянного TrueNAS extent record. Не подключайте и не форматируйте его на игровом ПК.
+4. Исключите все `*/clients/*` из periodic snapshot tasks. App сам создаёт только точечные
+   `@clean` snapshots и никогда автоматически не удаляет старые clones или snapshots.
+
+Отдельно создайте parent `tank/iscsi-reset`, а под ним четыре служебных **Filesystem datasets**
+без SMB/NFS shares:
+
+```text
+tank/iscsi-reset/config   → /mnt/tank/iscsi-reset/config
+tank/iscsi-reset/state    → /mnt/tank/iscsi-reset/state
+tank/iscsi-reset/secrets  → /mnt/tank/iscsi-reset/secrets
+tank/iscsi-reset/tls      → /mnt/tank/iscsi-reset/tls
+```
+
+Используйте Generic preset и POSIX permissions. Если datasets зашифрованы, они должны быть
+разблокированы до запуска App. `config` и `state` включите в backup; client clones туда не
+включайте.
+
+После создания datasets откройте **System → Shell** и задайте числового владельца контейнеров.
+Создавать пользователя `10001` на TrueNAS не требуется:
+
+```bash
+sudo -i
+install -d -o 10001 -g 10001 -m 0700 \
+  /mnt/tank/iscsi-reset/config \
+  /mnt/tank/iscsi-reset/state \
+  /mnt/tank/iscsi-reset/secrets \
+  /mnt/tank/iscsi-reset/tls
+```
+
+Не создавайте вручную пустой `/state/releases.sqlite3`: admin service создаст и инициализирует
+его только после появления валидного config. Не создавайте пустой `config.yaml` — это невалидный
+config, а не признак первого запуска.
+
+### 3. Создайте iSCSI objects через Shares → Block (iSCSI)
+
+1. Создайте portal на SAN address, например `10.20.40.10:3260`.
+2. Создайте один publisher target. Ограничьте его точным initiator IQN Publisher PC и SAN
+   network `10.20.40.100/32`.
+3. Для каждого master zvol создайте отдельный **Device/DISK extent**, затем target–extent
+   association с выбранным LUN. Сохраните extent ID, NAA и serial.
+4. Для каждого игрового ПК создайте отдельные target и initiator group с точными IQN и `/32`
+   SAN address этого ПК.
+5. Для каждого client volume создайте отдельный постоянный Device/DISK extent, первоначально
+   направленный на его `__bootstrap` zvol, и association с нужным LUN. Сохраните extent ID, NAA
+   и serial, затем **выключите client extent**. File extents не поддерживаются.
+6. Не переиспользуйте publisher/client extent records между targets. App меняет у существующего
+   client extent только `disk` и `enabled`; ID, NAA и serial должны остаться постоянными.
+7. Теперь master zvol можно один раз подключить, инициализировать и наполнить на Publisher PC.
+   Делайте это только на заведомо пустых master LUN после сверки target и NAA. Клиентские
+   bootstrap zvol не подключайте и не инициализируйте. Service/PowerShell provisioning-команд
+   не выполняют.
+
+Перед продолжением в TrueNAS UI ещё раз сверяйте worksheet: portal, полный target IQN, extent
+ID, dataset path, LUN, NAA, serial, initiator IQN и authorized network.
+
+### 4. Создайте два API credentials с разными privileges
+
+В TrueNAS 25.10 роли назначаются privilege-объекту, связанному с local group; API key создаётся
+для пользователя этой группы. Создайте две local groups, двух непривилегированных пользователей
+без password login, SSH, sudo и web shell, затем два custom privileges и два API keys. Не
+используйте `root` или `truenas_admin`. Поскольку [TrueNAS 25.10 UI reference](https://www.truenas.com/docs/scale/25.10/scaleuireference/credentials/localgroupsscreens/#add-and-edit-privilege-screens)
+для web UI считает поддерживаемыми только три aggregate admin roles, точный least-privilege
+набор ниже создаётся через штатный `privilege.create` с помощью `midclt`.
+
+| Credential | Пользователь | Roles |
+|---|---|---|
+| Runtime reset/admin | `iscsi-reset-service` | `DATASET_READ`, `DATASET_WRITE`, `SNAPSHOT_READ`, `SNAPSHOT_WRITE`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_EXTENT_WRITE`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_TARGETEXTENT_READ` |
+| Configurator discovery | `iscsi-reset-configurator` | `DATASET_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_TARGETEXTENT_READ`, `SHARING_ISCSI_INITIATOR_READ` |
+
+Практический порядок:
+
+1. В **Credentials → Groups** создайте группы `iscsi-reset-service` и
+   `iscsi-reset-configurator`, не выдавая им sudo или SMB access.
+2. Узнайте внутренние `id` групп (не путать с Unix GID):
+
+   ```bash
+   midclt call group.query '[["group","in",["iscsi-reset-service","iscsi-reset-configurator"]]]' \
+     '{"select":["id","gid","group"]}'
+   ```
+
+3. Создайте privileges штатным middleware API, заменив два placeholder ID. Эти payloads не
+   дают web shell:
+
+   ```bash
+   midclt call privilege.create '{
+     "name": "iSCSI Reset runtime",
+     "local_groups": [REPLACE_RUNTIME_GROUP_ID],
+     "ds_groups": [],
+     "roles": [
+       "DATASET_READ", "DATASET_WRITE", "SNAPSHOT_READ", "SNAPSHOT_WRITE",
+       "SHARING_ISCSI_GLOBAL_READ", "SHARING_ISCSI_EXTENT_READ",
+       "SHARING_ISCSI_EXTENT_WRITE", "SHARING_ISCSI_TARGET_READ",
+       "SHARING_ISCSI_TARGETEXTENT_READ"
+     ],
+     "web_shell": false
+   }'
+
+   midclt call privilege.create '{
+     "name": "iSCSI Reset discovery",
+     "local_groups": [REPLACE_DISCOVERY_GROUP_ID],
+     "ds_groups": [],
+     "roles": [
+       "DATASET_READ", "SHARING_ISCSI_GLOBAL_READ", "SHARING_ISCSI_PORTAL_READ",
+       "SHARING_ISCSI_TARGET_READ", "SHARING_ISCSI_EXTENT_READ",
+       "SHARING_ISCSI_TARGETEXTENT_READ", "SHARING_ISCSI_INITIATOR_READ"
+     ],
+     "web_shell": false
+   }'
+   ```
+
+4. В **Credentials → Users** создайте одноимённых пользователей с disabled password,
+   shell `nologin`, без sudo и с соответствующей primary group.
+5. Разверните строку каждого пользователя, нажмите **Add API Key**, задайте срок действия по
+   вашей policy и сразу сохраните однажды показанный key. Старые user-linked keys при ротации
+   отзывайте.
+
+В документации [`pool.snapshot.rollback`](https://api.truenas.com/v25.10/api_methods_pool.snapshot.rollback.html)
+указаны альтернативные роли `POOL_WRITE | SNAPSHOT_WRITE`. Runtime уже получает более узкую
+`SNAPSHOT_WRITE`, необходимую также для create/clone, поэтому `POOL_WRITE` ему не выдаётся.
+Discovery credential не должен иметь ни одной `*_WRITE` роли. Актуальную модель назначения и
+список ролей проверяйте по
+[TrueNAS 25.10 RBAC](https://api.truenas.com/v25.10/rbac.html) и
+[`privilege.roles`](https://api.truenas.com/v25.10/api_methods_privilege.roles.html). Точный
+least-privilege набор всё равно нужно подтвердить на своей patch release тестовыми read/write
+вызовами из `TEST-PLAN.md`.
+
+Сохраните только значения API keys в файлы без завершающих комментариев:
+
+```text
+/mnt/tank/iscsi-reset/secrets/truenas_api_key
+/mnt/tank/iscsi-reset/secrets/truenas_discovery_api_key
+```
+
+Не передавайте key в аргументе shell-команды и не оставляйте его в history. Запишите файлы через
+защищённый editor или stdin, затем сразу задайте владельца `10001:10001` и mode `0400`.
+
+### 5. Подготовьте peppers и configurator login
+
+Создайте два независимых текстовых peppers. Команда ниже пишет 32 random bytes в hex form и не
+выводит секреты в терминал:
+
+```bash
+umask 077
+openssl rand -hex 32 > /mnt/tank/iscsi-reset/secrets/token_pepper
+openssl rand -hex 32 > /mnt/tank/iscsi-reset/secrets/admin_token_pepper
+chown 10001:10001 /mnt/tank/iscsi-reset/secrets/*
+chmod 0400 /mnt/tank/iscsi-reset/secrets/*
+```
+
+До установки App нужен только отдельный configurator login token. Сгенерируйте его в доверенном
+терминале TrueNAS без session recording; команда не требует network access внутри контейнера:
+
+```bash
+docker run --rm --network none --read-only --user 10001:10001 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -v /mnt/tank/iscsi-reset/secrets/admin_token_pepper:/run/secrets/admin_token_pepper:ro \
+  ghcr.io/xerz/iscsi-reset-service@sha256:7819da963b44e5673c0d9a446c5edbc7cdf47b0c6976ecd251178c20ae5329c7 \
+  configurator-token generate --pepper-file /run/secrets/admin_token_pepper
+```
+
+Сразу сохраните показанный raw token в password manager. В файл
+`/mnt/tank/iscsi-reset/secrets/configurator_token_digest` поместите **только** выведенную строку
+`hmac-sha256:...`; весь JSON перенаправлять в файл нельзя, потому что в нём есть raw token.
+Затем снова выполните `chown 10001:10001` и `chmod 0400` для digest-файла.
+
+Client/admin tokens на этом этапе не нужны: предпочтительно сгенерировать их позже в GUI. Raw
+tokens показываются один раз и не должны попадать в shell history, config, логи или audit.
+
+### 6. Положите TLS-файлы
+
+Подготовьте следующие host files до установки App — иначе соответствующие bind mounts не
+создадутся корректно:
+
+| Host file | Требование |
+|---|---|
+| `tls/reset-server.crt` / `tls/reset-server.key` | Server certificate с SAN `IP:10.20.40.10` |
+| `tls/admin-server.crt` / `tls/admin-server.key` | Server certificate с SAN management IP TrueNAS |
+| `tls/admin-client-ca.crt` | CA, которой подписан Publisher client certificate |
+
+Publisher PC отдельно получает admin server CA, client certificate с EKU `Client
+Authentication` и PFX/private key. Игровые ПК получают только CA reset server. PFX и client
+private key в TrueNAS App не монтируются.
+
+```bash
+chown 10001:10001 /mnt/tank/iscsi-reset/tls/*
+chmod 0400 /mnt/tank/iscsi-reset/tls/*
+```
+
+### 7. Выберите способ создания первого config
+
+Предпочтительный GUI bootstrap:
+
+1. Оставьте `/mnt/tank/iscsi-reset/config` и `/mnt/tank/iscsi-reset/state` пустыми.
+2. Установите Custom App из release YAML. Reset/admin временно будут перезапускаться из-за
+   отсутствующего config; configurator на `127.0.0.1:8445` должен запуститься.
+3. Откройте SSH tunnel, войдите configurator token, выберите только найденные TrueNAS objects,
+   сгенерируйте client/admin tokens и сохраните config.
+4. Убедитесь, что появился `/config/config.yaml` mode `0600`, затем перезапустите **весь**
+   Custom App. Admin service создаст `/state/releases.sqlite3`; configurator должен показать
+   одинаковые saved/startup revisions.
+
+Для ручного bootstrap сначала подготовьте schema v2 из `config/config.example.yaml`, замените
+все example IP/IQN/extent/LUN/dataset и token digests, а затем установите файл:
+
+```bash
+install -o 10001 -g 10001 -m 0600 /tmp/config.yaml \
+  /mnt/tank/iscsi-reset/config/config.yaml
+```
+
+До установки можно проверить его тем же release image:
+
+```bash
+docker run --rm --network none --read-only --user 10001:10001 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -v /mnt/tank/iscsi-reset/config:/config:ro \
+  ghcr.io/xerz/iscsi-reset-service@sha256:7819da963b44e5673c0d9a446c5edbc7cdf47b0c6976ecd251178c20ae5329c7 \
+  config validate --path /config/config.yaml
+```
 
 TrueNAS API соединение внутри host networking использует `wss://127.0.0.1/api/current`.
 Отключение его TLS-проверки разрешено только вместе с
 `TRUENAS_TLS_INSECURE_ACK=I_ACCEPT_MITM_RISK`.
 
-## Токены и Custom App
+## Установка Custom App и последующие токены
 
-Сгенерировать client/admin tokens можно до установки:
+При GUI bootstrap client/admin tokens генерируются прямо в configurator после discovery. Если
+config уже подготовлен вручную, эквивалентные CLI-команды выглядят так:
 
 ```bash
 iscsi-reset-service token generate chimera \
@@ -231,20 +467,17 @@ iscsi-reset-service token generate chimera \
 
 iscsi-reset-service admin-token generate \
   --pepper-file /run/secrets/admin_token_pepper
-
-iscsi-reset-service configurator-token generate \
-  --pepper-file /run/secrets/admin_token_pepper
 ```
 
-Raw token показывается один раз. В YAML помещается только `token_digest`; configurator login
-digest хранится отдельным secret-файлом. GUI также умеет генерировать client/admin token:
-raw-значение показывается один раз, не пишется в config, логи, audit или browser storage.
+Raw token показывается один раз. В YAML помещается только `token_digest`; raw-значение не
+пишется в config, логи, audit или browser storage.
 
 Универсальный шаблон `truenas/custom-app.yaml` требует заменить:
 
 - GHCR image и immutable digest;
 - `/mnt/tank/...` paths;
 - `REPLACE_WITH_TRUENAS_MANAGEMENT_IP`;
+- example SAN address `10.20.40.10`, если у вас другой portal/reset IP;
 - TLS/secrets filenames.
 
 Для опубликованной версии удобнее скачать готовый release bundle: в нём все три службы уже
@@ -258,11 +491,37 @@ gh release download v0.3.0 \
 sha256sum --check SHA256SUMS
 ```
 
-В release YAML остаётся заменить только настройки конкретного TrueNAS: management IP,
-`/mnt/tank/...` paths и при необходимости имена TLS/secrets файлов. Image tag менять нельзя:
-все три службы намеренно закреплены на одном `sha256` digest.
+В release YAML замените management IP, example SAN IP, `/mnt/tank/...` paths и при
+необходимости имена TLS/secrets файлов. Все три `image:` уже закреплены на одном `sha256`
+digest — их менять нельзя. Перед установкой полезно проверить оставшиеся site placeholders и
+Compose syntax:
 
-Установить через **Apps → Discover Apps → Custom App → Install via YAML**. После запуска:
+```bash
+grep -nE 'REPLACE_|/mnt/tank|10\.20\.40\.10' \
+  iscsi-reset-service-v0.3.0-truenas.yaml
+docker compose -f iscsi-reset-service-v0.3.0-truenas.yaml config --quiet
+```
+
+Установите через **Apps → Discover Apps → Custom App → Install via YAML**. При GUI bootstrap
+сначала откройте configurator, создайте config и перезапустите весь App, как описано выше.
+
+### Контроль после первого полного restart
+
+На TrueNAS проверьте владельцев и наличие только ожидаемых persistent files:
+
+```bash
+stat -c '%u:%g %a %n' \
+  /mnt/tank/iscsi-reset/config \
+  /mnt/tank/iscsi-reset/config/config.yaml \
+  /mnt/tank/iscsi-reset/state \
+  /mnt/tank/iscsi-reset/state/releases.sqlite3 \
+  /mnt/tank/iscsi-reset/secrets/* \
+  /mnt/tank/iscsi-reset/tls/*
+```
+
+Ожидание: каталоги принадлежат `10001:10001`, `config.yaml` имеет mode `0600`, secrets/keys —
+`0400`; `releases.sqlite3` существует только после старта admin service с валидным config.
+Затем проверьте API:
 
 ```bash
 curl --cacert reset-ca.crt https://10.20.40.10:8443/healthz
@@ -272,7 +531,8 @@ curl --cacert admin-ca.crt \
   https://<TRUENAS_MANAGEMENT_IP>:8444/healthz
 ```
 
-Admin `/readyz` должен вернуть `ready`. Reset `/readyz` станет ready после первого activate.
+Admin `/readyz` должен вернуть `ready`. Reset `/readyz` до первого activate закономерно
+возвращает `503`, а после activation должен стать `ready`.
 
 Открыть configurator с административного компьютера:
 
@@ -283,7 +543,8 @@ ssh -N -L 8445:127.0.0.1:8445 <truenas>
 Затем перейти на `http://127.0.0.1:8445`. Сервер проверяет loopback client/Host/Origin,
 использует отдельную session cookie (`HttpOnly`, `SameSite=Strict`), CSRF token, 30 минут idle и
 8 часов maximum lifetime. Assets встроены в image; внешних CDN нет. После сохранения GUI
-показывает saved/startup revisions и требует штатный restart всего Custom App.
+показывает saved/startup revisions и требует штатный restart всего Custom App. Hot reload и
+автоматический redeploy отсутствуют.
 
 ## Установка на Publisher PC
 

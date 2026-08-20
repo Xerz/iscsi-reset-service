@@ -74,6 +74,18 @@ Browser и временный mock server остановлены; тестовы
 - Анонимное получение GHCR pull token и manifest по tag и immutable digest — HTTP 200;
   `docker-content-digest` точно совпал с release bundle.
 
+### Bootstrap-документация после v0.3.0 — 2026-08-19
+
+- README дополнен последовательной подготовкой до установки App: master/bootstrap zvol и clone
+  parents, iSCSI objects, служебные datasets, UID/GID и modes, API credentials, peppers,
+  configurator token, TLS files, GUI/manual bootstrap и first-restart checks.
+- Runtime/discovery role lists сверены с официальными role requirements TrueNAS API v25.10.5;
+  для `pool.snapshot.rollback` используется более узкая альтернативная роль `SNAPSHOT_WRITE`,
+  поэтому `POOL_WRITE` не добавлен.
+- `git diff --check` — passed. Код, schema, deployment YAML и release artifacts не изменялись.
+- Команды и минимальные privileges остаются ожидающими выполнения на физическом TrueNAS по
+  `TEST-PLAN.md`; документальная сверка не считается стендовой проверкой.
+
 ### Ожидает отдельной среды
 
 - Минимальный набор read-only ролей discovery user на реальном TrueNAS SCALE 25.10 patch
