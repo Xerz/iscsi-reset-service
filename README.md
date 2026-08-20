@@ -127,8 +127,12 @@ flowchart TD
 |---|---|
 | iSCSI portal | `10.20.40.10:3260` |
 | Reset API для игровых ПК | `https://10.20.40.10:8443` |
-| Release admin API | `https://<TRUENAS_MANAGEMENT_IP>:8444` |
+| Release admin API, local bind | `https://<ADMIN_BIND_IP>:8444` |
+| Release admin API для Publisher | `https://<ADMIN_CONNECT_IP>:8444` |
 | Configurator через SSH tunnel | `http://127.0.0.1:8445` |
+
+Без NAT `ADMIN_BIND_IP` и `ADMIN_CONNECT_IP` обычно совпадают. При DNAT первый адрес обязан быть
+реально назначен интерфейсу TrueNAS, а второй — это адрес, который Publisher указывает в URL.
 
 Custom App запускает три одинаково ограниченных контейнера из одного image digest. Reset API
 читает SQLite read-only; admin API изменяет её; configurator читает SQLite read-only и один
@@ -136,7 +140,7 @@ Custom App запускает три одинаково ограниченных
 
 - сертификат клиента, выданный отдельным local CA;
 - отдельный Bearer admin token;
-- точный management IP Publisher PC из YAML.
+- точный source IP Publisher PC из YAML, фактически наблюдаемый приложением после NAT.
 
 Все три контейнера работают как `10001:10001`, с read-only root filesystem, `cap_drop: ALL`, без
 privileged, Docker socket и `/dev/zvol`.
@@ -412,7 +416,7 @@ tokens показываются один раз и не должны попад�
 | Host file | Требование |
 |---|---|
 | `tls/reset-server.crt` / `tls/reset-server.key` | Server certificate с SAN `IP:10.20.40.10` |
-| `tls/admin-server.crt` / `tls/admin-server.key` | Server certificate с SAN management IP TrueNAS |
+| `tls/admin-server.crt` / `tls/admin-server.key` | Server certificate с SAN IP, который Publisher использует в Admin API URL |
 | `tls/admin-client-ca.crt` | CA, которой подписан Publisher client certificate |
 
 Publisher PC отдельно получает admin server CA, client certificate с EKU `Client
@@ -432,8 +436,9 @@ private key в TrueNAS App не монтируются.
 ключи CA на TrueNAS и Windows не копируйте. Команды интерактивно запросят passwords для трёх CA
 keys и отдельно password для PFX; passwords не передавайте через command-line arguments.
 
-Сначала проверьте версию, создайте новый пустой каталог и укажите реальные IP. `ADMIN_IP` —
-management IP самого TrueNAS, на котором Admin API будет слушать `:8444`:
+Сначала проверьте версию, создайте новый пустой каталог и укажите реальные IP.
+`ADMIN_CONNECT_IP` — адрес из `ApiBaseUrl` на Publisher PC. Это может быть NAT/VIP и он не обязан
+совпадать с локальным адресом, на котором контейнер слушает `:8444`:
 
 ```bash
 openssl version
@@ -442,8 +447,13 @@ mkdir iscsi-reset-pki
 cd iscsi-reset-pki
 
 RESET_IP=10.20.40.10
-ADMIN_IP=192.168.1.10
+ADMIN_CONNECT_IP=192.168.1.150
 ```
+
+Например, при DNAT `192.168.1.150:8444 → 192.168.3.218:8444` certificate получает SAN
+`192.168.1.150`, а в release YAML задаётся `ADMIN_BIND_HOST: 192.168.3.218`. Локальный bind IP
+не требуется добавлять в SAN, пока ни один TLS client не обращается к нему напрямую. Если нужны
+оба варианта подключения, добавьте оба: `subjectAltName=IP:192.168.1.150,IP:192.168.3.218`.
 
 `openssl version` должен показывать `OpenSSL 3.x`, не LibreSSL. Каталог не переиспользуйте для
 повторной генерации: при ошибке начните с нового пустого каталога.
@@ -498,7 +508,7 @@ openssl req -new -sha256 \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth" \
-  -addext "subjectAltName=IP:${ADMIN_IP}"
+  -addext "subjectAltName=IP:${ADMIN_CONNECT_IP}"
 
 openssl x509 -req -sha256 -days 825 \
   -in admin-server.csr \
@@ -554,7 +564,7 @@ openssl verify -CAfile admin-ca.crt -purpose sslserver admin-server.crt
 openssl verify -CAfile admin-client-ca.crt -purpose sslclient publisher-client.crt
 
 openssl x509 -in reset-server.crt -noout -checkip "$RESET_IP"
-openssl x509 -in admin-server.crt -noout -checkip "$ADMIN_IP"
+openssl x509 -in admin-server.crt -noout -checkip "$ADMIN_CONNECT_IP"
 
 openssl x509 -in reset-server.crt -noout -subject -issuer -dates \
   -ext subjectAltName,extendedKeyUsage
@@ -610,11 +620,72 @@ sudo stat -c '%u:%g %a %n' /mnt/tank/iscsi-reset/tls/*
 1. Оставьте `/mnt/tank/iscsi-reset/config` и `/mnt/tank/iscsi-reset/state` пустыми.
 2. Установите Custom App из release YAML. Reset/admin временно будут перезапускаться из-за
    отсутствующего config; configurator на `127.0.0.1:8445` должен запуститься.
-3. Откройте SSH tunnel, войдите configurator token, выберите только найденные TrueNAS objects,
-   сгенерируйте client/admin tokens и сохраните config.
-4. Убедитесь, что появился `/config/config.yaml` mode `0600`, затем перезапустите **весь**
+3. Откройте SSH tunnel и войдите однажды сохранённым raw configurator token.
+4. Заполните пять разделов по инструкции ниже, сгенерируйте client/admin tokens и сохраните
+   config. Configurator только читает TrueNAS discovery и не создаёт storage objects.
+5. Убедитесь, что появился `/config/config.yaml` mode `0600`, затем перезапустите **весь**
    Custom App. Admin service создаст `/state/releases.sqlite3`; configurator должен показать
    одинаковые saved/startup revisions.
+
+#### Открыть configurator через SSH tunnel
+
+В **System → Services → SSH → Edit** обязательно включите **Allow TCP Port Forwarding**,
+ограничьте SSH management-интерфейсом и используйте key authentication. Сохраните настройку и
+запустите либо перезапустите SSH service. На административном компьютере выполните, подставив
+SSH user, адрес и при необходимости `-p PORT`:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:8445:127.0.0.1:8445 \
+  <ssh-user>@<TRUENAS_SSH_ADDRESS>
+```
+
+Терминал ничего не выводит и остаётся занят — это нормально, не закрывайте его. В другом
+терминале можно проверить tunnel:
+
+```bash
+curl http://127.0.0.1:8445/healthz
+```
+
+Если SSH выводит `administratively prohibited: open failed`, сервер запретил forwarding:
+повторно проверьте **System → Services → SSH → Edit → Allow TCP Port Forwarding**, сохраните
+настройку, перезапустите SSH service и откройте новое SSH-соединение. Уже установленная SSH
+сессия новую настройку не подхватит.
+
+Затем откройте **`http://127.0.0.1:8445`** в browser. Это намеренно HTTP внутри зашифрованного
+SSH tunnel. Введите raw token, который был показан при `configurator-token generate`; строка
+`hmac-sha256:...` из secret-файла для входа не подходит. Если raw token потерян, восстановить
+его из digest невозможно: сгенерируйте новую пару, замените
+`configurator_token_digest`, задайте `10001:10001`/`0400` и перезапустите App.
+
+#### Заполнить разделы configurator
+
+1. **Статус:** убедитесь, что badge показывает `TrueNAS discovery OK`, а targets и datasets
+   найдены. Если iSCSI objects менялись после входа, нажмите **Обновить discovery**.
+2. **Сеть:** выберите существующий iSCSI portal; задайте canonical SAN CIDR, timezone и release
+   prefix. В `Publisher management IP` укажите source IP Publisher, который Admin API фактически
+   увидит после NAT, а не `ADMIN_CONNECT_IP` назначения. Нажмите **Сгенерировать admin token**,
+   скопируйте raw token в password manager для Publisher PC и закройте dialog; digest форма
+   подставит автоматически.
+3. **Publisher:** введите SAN source IP и точный initiator IQN Publisher PC, выберите publisher
+   target и нажмите **Заполнить из target**. Проверьте каждую строку: logical volume name,
+   extent/LUN и master dataset должны соответствовать worksheet.
+4. **Клиенты:** для каждого ПК нажмите **Добавить клиента**, задайте уникальное имя, SAN IP,
+   точный initiator IQN и его отдельный target, затем нажмите **Заполнить из target**. Для
+   каждого volume обязательно перепроверьте extent/LUN, drive letter, label и **Clone parent**:
+   автоматически предложенный первый dataset нужного pool может быть не вашим client parent.
+   Нажмите **Сгенерировать client token** и сохраните raw token отдельно для этого ПК.
+5. **YAML:** обычно вручную не редактируйте. Он синхронизируется с формами; advanced-изменения
+   нужно сначала провести через **Проверить и применить к формам**.
+
+Raw tokens показываются только один раз. До закрытия dialog сохраните admin token и каждый
+client token в password manager; в `config.yaml` останутся только HMAC digests.
+
+В нижней панели нажмите **Проверить**. Исправьте все ошибки и предупреждения об отсутствии
+точного IQN/authorized network, затем нажмите **Сохранить config.yaml**. После сообщения
+`Требуется restart Custom App` откройте **Apps → Installed Applications**, найдите Custom App и
+нажмите кнопку `restart_alt`. После запуска обновите страницу configurator: saved revision и
+startup revision должны совпасть, а restart banner — исчезнуть.
 
 Для ручного bootstrap сначала подготовьте schema v2 из `config/config.example.yaml`, замените
 все example IP/IQN/extent/LUN/dataset и token digests, а затем установите файл:
@@ -658,7 +729,7 @@ Raw token показывается один раз. В YAML помещается
 
 - GHCR image и immutable digest;
 - `/mnt/tank/...` paths;
-- `REPLACE_WITH_TRUENAS_MANAGEMENT_IP`;
+- `REPLACE_WITH_TRUENAS_MANAGEMENT_IP` — локальный `ADMIN_BIND_IP`, назначенный TrueNAS;
 - example SAN address `10.20.40.10`, если у вас другой portal/reset IP;
 - TLS/secrets filenames.
 
@@ -673,7 +744,7 @@ gh release download v0.3.0 \
 sha256sum --check SHA256SUMS
 ```
 
-В release YAML замените management IP, example SAN IP, `/mnt/tank/...` paths и при
+В release YAML замените локальный admin bind IP, example SAN IP, `/mnt/tank/...` paths и при
 необходимости имена TLS/secrets файлов. Все три `image:` уже закреплены на одном `sha256`
 digest — их менять нельзя. Перед установкой полезно проверить оставшиеся site placeholders и
 Compose syntax:
@@ -710,19 +781,14 @@ curl --cacert reset-ca.crt https://10.20.40.10:8443/healthz
 
 curl --cacert admin-ca.crt \
   --cert publisher-client.crt --key publisher-client.key \
-  https://<TRUENAS_MANAGEMENT_IP>:8444/healthz
+  https://<ADMIN_CONNECT_IP>:8444/healthz
 ```
 
 Admin `/readyz` должен вернуть `ready`. Reset `/readyz` до первого activate закономерно
 возвращает `503`, а после activation должен стать `ready`.
 
-Открыть configurator с административного компьютера:
-
-```bash
-ssh -N -L 8445:127.0.0.1:8445 <truenas>
-```
-
-Затем перейти на `http://127.0.0.1:8445`. Сервер проверяет loopback client/Host/Origin,
+Для повторного доступа откройте SSH tunnel по инструкции bootstrap и перейдите на
+`http://127.0.0.1:8445`. Сервер проверяет loopback client/Host/Origin,
 использует отдельную session cookie (`HttpOnly`, `SameSite=Strict`), CSRF token, 30 минут idle и
 8 часов maximum lifetime. Assets встроены в image; внешних CDN нет. После сохранения GUI
 показывает saved/startup revisions и требует штатный restart всего Custom App. Hot reload и
@@ -735,7 +801,7 @@ ssh -N -L 8445:127.0.0.1:8445 <truenas>
 ```powershell
 $pfxPassword = Read-Host -AsSecureString "Client PFX password"
 .\Install-IscsiReleasePublisher.ps1 `
-  -ApiBaseUrl "https://<TRUENAS_MANAGEMENT_IP>:8444" `
+  -ApiBaseUrl "https://<ADMIN_CONNECT_IP>:8444" `
   -AdminToken "<RAW_ADMIN_TOKEN>" `
   -CaCertificatePath ".\admin-ca.crt" `
   -ClientCertificatePfxPath ".\publisher-client.pfx" `

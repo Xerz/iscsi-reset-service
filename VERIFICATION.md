@@ -90,6 +90,11 @@ Browser и временный mock server остановлены; тестовы
 
 - В README разделены initiator IQN и target `Authorized Networks`: IQN задаётся в initiator
   group, SAN source IP `/32` — в target, что соответствует TrueNAS 25.10 UI/API model.
+- Для Admin API разделены `ADMIN_BIND_IP`, клиентский `ADMIN_CONNECT_IP`/certificate SAN и
+  фактически наблюдаемый после NAT source IP; NAT-сценарий не считается проверенным на стенде.
+- GUI bootstrap расписан до уровня действий в TrueNAS/SSH/browser: loopback tunnel, пять
+  разделов, одноразовые raw tokens, live validation, save и полный app restart; отдельно
+  задокументирован отказ `administratively prohibited` при выключенном TCP port forwarding.
 - Добавлена пошаговая private PKI для новичка: три независимых CA, два server certificates с
   SAN/serverAuth, Publisher client certificate с clientAuth, password-protected PFX, матрица
   распространения и TrueNAS file permissions.
