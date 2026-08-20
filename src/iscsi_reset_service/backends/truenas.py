@@ -160,7 +160,7 @@ class TrueNASBackend(StorageBackend):
                     "extra": {
                         "flat": True,
                         "retrieve_children": True,
-                        "properties": [],
+                        "properties": ["keystatus"],
                         "retrieve_user_props": False,
                     }
                 },

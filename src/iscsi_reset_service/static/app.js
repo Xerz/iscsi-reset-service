@@ -7,6 +7,7 @@ const state = {
   discovery: null,
   status: null,
   yamlDirty: false,
+  needsDiscoveryDefaults: false,
   activePanel: "status",
 };
 
@@ -88,21 +89,22 @@ async function login(event) {
 
 async function loadApplication() {
   try {
-    const [status, document, discovery] = await Promise.all([
+    const [status, document] = await Promise.all([
       api("/v1/configurator/status"),
       api("/v1/configurator/config"),
-      api("/v1/configurator/discovery"),
     ]);
     state.status = status;
     state.csrf = status.csrf_token;
-    state.discovery = discovery;
+    state.discovery = null;
     state.baseRevision = document.source_revision;
     state.draft = document.config || defaultDraft();
     state.yamlDirty = false;
+    state.needsDiscoveryDefaults = !document.config && !document.yaml;
     $("#yaml-editor").value = document.yaml || yamlDump(state.draft);
     $("#login-view").hidden = true;
     $("#app-view").hidden = false;
     renderAll();
+    await refreshDiscovery(false);
   } catch (error) {
     if (error.code === "UNAUTHORIZED") {
       state.csrf = null;
@@ -120,20 +122,34 @@ function renderAll() {
   renderNetwork();
   renderPublisher();
   renderClients();
-  $("#connection-badge").textContent = "TrueNAS discovery OK";
-  $("#connection-badge").className = "badge good";
+  renderDiscoveryState();
+}
+
+function renderDiscoveryState() {
+  const available = state.discovery !== null;
+  $("#connection-badge").textContent = available ? "TrueNAS discovery OK" : "Discovery unavailable";
+  $("#connection-badge").className = available ? "badge good" : "badge error";
+  setTopologyActionsEnabled(available);
+}
+
+function setTopologyActionsEnabled(enabled) {
+  ["#validate-button", "#apply-yaml", "#save-button"].forEach((selector) => {
+    $(selector).disabled = !enabled;
+  });
 }
 
 function renderStatus() {
   const status = state.status || {};
   const saved = state.draft ? configRevisionHint() : "—";
+  const targetCount = state.discovery === null ? "—" : state.discovery.targets.length;
+  const datasetCount = state.discovery === null ? "—" : state.discovery.datasets.length;
   $("#status-grid").innerHTML = [
     statusCard("Startup revision", status.startup_revision || "нет"),
     statusCard("Saved revision", status.saved_revision || saved || "нет"),
     statusCard("Source revision", state.baseRevision || "новый файл"),
     statusCard("Config", status.config_valid ? "валиден" : (status.config_exists ? "ошибка" : "не создан")),
-    statusCard("TrueNAS targets", state.discovery?.targets?.length ?? 0),
-    statusCard("Datasets", state.discovery?.datasets?.length ?? 0),
+    statusCard("TrueNAS targets", targetCount),
+    statusCard("Datasets", datasetCount),
   ].join("");
   const restart = status.restart_required || (
     status.startup_revision && status.saved_revision !== status.startup_revision
@@ -450,6 +466,10 @@ async function generateConfiguredToken(kind, clientName = null) {
 }
 
 async function validateYaml(applyToForms = false) {
+  if (state.discovery === null) {
+    setValidation("Discovery недоступен: проверка live topology заблокирована.", "error");
+    return null;
+  }
   setValidation("Проверка live topology…");
   try {
     const result = await api("/v1/configurator/config/validate", {
@@ -472,6 +492,10 @@ async function validateYaml(applyToForms = false) {
 }
 
 async function saveConfig() {
+  if (state.discovery === null) {
+    setValidation("Discovery недоступен: сохранение config.yaml заблокировано.", "error");
+    return;
+  }
   $("#save-button").disabled = true;
   setValidation("Повторная проверка и атомарное сохранение…");
   try {
@@ -493,21 +517,35 @@ async function saveConfig() {
     setValidation(`${error.code}: ${error.message}`, "error");
     if (error.code === "CONFIG_CHANGED") await loadApplication();
   } finally {
-    $("#save-button").disabled = false;
+    setTopologyActionsEnabled(state.discovery !== null);
   }
 }
 
-async function refreshDiscovery() {
+async function refreshDiscovery(announceSuccess = true) {
+  state.discovery = null;
+  setTopologyActionsEnabled(false);
   $("#connection-badge").textContent = "Обновление…";
   $("#connection-badge").className = "badge neutral";
   try {
     state.discovery = await api("/v1/configurator/discovery");
+    if (state.needsDiscoveryDefaults) {
+      state.draft = defaultDraft();
+      $("#yaml-editor").value = yamlDump(state.draft);
+      state.needsDiscoveryDefaults = false;
+    }
     renderAll();
-    setGlobalMessage("Discovery обновлён без mutations.", "good");
+    setGlobalMessage(announceSuccess ? "Discovery обновлён без mutations." : "", "good");
+    return true;
   } catch (error) {
-    $("#connection-badge").textContent = "Discovery unavailable";
-    $("#connection-badge").className = "badge error";
-    setGlobalMessage(error.message, "error");
+    if (error.code === "UNAUTHORIZED") {
+      state.csrf = null;
+      $("#login-view").hidden = false;
+      $("#app-view").hidden = true;
+      return false;
+    }
+    renderAll();
+    setGlobalMessage(`Discovery unavailable: ${error.message}`, "error");
+    return false;
   }
 }
 
@@ -525,6 +563,7 @@ function switchPanel(panel) {
 function syncYamlFromDraft() {
   $("#yaml-editor").value = yamlDump(state.draft);
   state.yamlDirty = false;
+  state.needsDiscoveryDefaults = false;
   setValidation("Draft изменён; выполните проверку перед сохранением.");
 }
 
@@ -625,6 +664,8 @@ async function logout() {
   try { await api("/v1/configurator/session", { method: "DELETE" }); } catch (_) { /* local session only */ }
   state.csrf = null;
   state.draft = null;
+  state.discovery = null;
+  state.needsDiscoveryDefaults = false;
   $("#app-view").hidden = true;
   $("#login-view").hidden = false;
   $("#login-token").focus();
@@ -632,14 +673,18 @@ async function logout() {
 
 $("#login-form").addEventListener("submit", login);
 $("#logout-button").addEventListener("click", logout);
-$("#refresh-button").addEventListener("click", refreshDiscovery);
+$("#refresh-button").addEventListener("click", () => refreshDiscovery());
 $("#fill-publisher").addEventListener("click", fillPublisherFromTarget);
 $("#add-client").addEventListener("click", addClient);
 $("#validate-button").addEventListener("click", () => validateYaml(false).catch(() => {}));
 $("#apply-yaml").addEventListener("click", () => validateYaml(true).catch(() => {}));
 $("#save-button").addEventListener("click", saveConfig);
 $("#download-yaml").addEventListener("click", downloadYaml);
-$("#yaml-editor").addEventListener("input", () => { state.yamlDirty = true; setValidation("Raw YAML изменён; примените его к формам или сохраните после проверки."); });
+$("#yaml-editor").addEventListener("input", () => {
+  state.yamlDirty = true;
+  state.needsDiscoveryDefaults = false;
+  setValidation("Raw YAML изменён; примените его к формам или сохраните после проверки.");
+});
 $("#token-dialog").addEventListener("close", () => { $("#raw-token").value = ""; });
 $("#copy-token").addEventListener("click", async () => { await navigator.clipboard.writeText($("#raw-token").value); $("#copy-token").textContent = "Скопировано"; });
 $$(`.nav-item`).forEach((button) => button.addEventListener("click", () => switchPanel(button.dataset.panel)));

@@ -1,4 +1,4 @@
-# Механический тест-план v0.3.0
+# Механический тест-план v0.3.1
 
 Все destructive проверки выполнять сначала на отдельных master/client zvol размером 1 GiB.
 Перед началом сохранить конфиг TrueNAS и SQLite state dataset.
@@ -20,6 +20,8 @@
 
 1. Убедиться, что discovery user имеет только `DATASET_READ` и необходимые
    `SHARING_ISCSI_*_READ` роли. Попытка любого write JSON-RPC этим key должна отклоняться.
+   Во всех трёх контейнерах `TRUENAS_API_URL` должен указывать на локальный
+   management IP TrueNAS, а не на `127.0.0.1` и не на Publisher NAT/VIP.
 2. С удалённого компьютера проверить, что прямое соединение к `<TRUENAS_IP>:8445` невозможно.
 3. Открыть `ssh -N -L 8445:127.0.0.1:8445 <truenas>` и войти через
    `http://127.0.0.1:8445` отдельным configurator token.
@@ -28,18 +30,26 @@
 5. Сверить discovery UI с TrueNAS: portal/listen address, полный IQN targets, initiator groups,
    extents/NAA/serial/dataset, targetextent/LUN и ZFS datasets. Locked/file extents и clone
    parents другого pool не должны предлагаться.
-6. Изменить безопасное поле, проверить form↔YAML, duplicate-key error и однократную выдачу raw
+   Точный `pool.dataset.query` с `properties:["keystatus"]` должен вернуть
+   `locked:false` для master zvol и filesystem clone parents. На текущем стенде
+   проверить `SSDGames/MainGames`, `Sas/Games-Device/Older-Games/oldergames`,
+   `SSDGames/clients/{chimera,beast}` и `Sas/clients/{chimera,beast}`.
+6. После успешного login имитировать `503` на discovery: должна остаться
+   authenticated shell с `Discovery unavailable`, а validate/apply/save — заблокированы.
+   После успешного **Обновить discovery** списки publisher/clone parent должны
+   заполниться, а три кнопки — снова включиться.
+7. Изменить безопасное поле, проверить form↔YAML, duplicate-key error и однократную выдачу raw
    token. Raw token не должен появиться в config, browser storage, application/audit logs.
-7. Имитировать параллельное редактирование: второй save со старым `base_revision` должен вернуть
+8. Имитировать параллельное редактирование: второй save со старым `base_revision` должен вернуть
    `409`, не меняя файл/history.
-8. При active release изменить publisher volume dataset; при incomplete release изменить
+9. При active release изменить publisher volume dataset; при incomplete release изменить
    publisher/portal. Оба save должны отклониться без записи. Повторить с недоступной и повреждённой
    SQLite.
-9. Между validate и save удалить/изменить выбранный mock/staging TrueNAS object: повторное live
+10. Между validate и save удалить/изменить выбранный mock/staging TrueNAS object: повторное live
    discovery должно заблокировать save.
-10. Выполнить разрешённый save. Проверить mode `0600`, immutable-копию в `/config/history`, новый
+11. Выполнить разрешённый save. Проверить mode `0600`, immutable-копию в `/config/history`, новый
     saved revision, прежний startup revision и обязательный restart banner.
-11. Перезапустить весь Custom App и проверить совпадение startup/saved revisions. Убедиться, что
+12. Перезапустить весь Custom App и проверить совпадение startup/saved revisions. Убедиться, что
     Reset/Admin контракты и active release не изменились.
 
 ## 1. Первый release и безопасный reset

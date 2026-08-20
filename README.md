@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.3.0
+# iSCSI Reset Service v0.3.1
 
 Fail-closed комплект для TrueNAS SCALE 25.10 и Windows 11:
 
@@ -687,6 +687,41 @@ client token в password manager; в `config.yaml` останутся тольк
 нажмите кнопку `restart_alt`. После запуска обновите страницу configurator: saved revision и
 startup revision должны совпасть, а restart banner — исчезнуть.
 
+#### Если discovery недоступен или список Clone parent пуст
+
+После успешного входа configurator остаётся в авторизованной оболочке, даже если
+TrueNAS discovery вернул `503`. Badge покажет `Discovery unavailable`, а кнопки
+проверки и сохранения будут заблокированы. Исправьте URL/credential/roles и нажмите
+**Обновить discovery**; повторный вход не требуется.
+
+На TrueNAS 25.10 поле `locked` должно вычисляться middleware при запросе
+`properties: ["keystatus"]`. Проверьте точный payload, заменив пути на свои:
+
+```bash
+midclt call pool.dataset.query \
+  '[["id","in",[
+    "nvme/masters/games-ssd",
+    "nvme/clients/chimera",
+    "hdd/masters/games-hdd",
+    "hdd/clients/chimera"
+  ]]]' \
+  '{"extra":{
+    "flat":true,
+    "retrieve_children":true,
+    "properties":["keystatus"],
+    "retrieve_user_props":false
+  }}' |
+jq 'map({id,type,locked,keystatus})'
+```
+
+Для master zvol ожидается `type: "VOLUME"`, для clone parent —
+`type: "FILESYSTEM"`; в обоих случаях `locked` должен быть ровно `false`. Значения
+`true` и `null` намеренно исключаются. Выпадающий список **Clone parent** показывает
+только unlocked filesystem datasets из того же pool, что и master: например, для master в
+`nvme/...` должен появиться `nvme/clients/chimera`, а для master в `hdd/...` —
+`hdd/clients/chimera`. Не обходите пустой список ручной записью в YAML: сначала добейтесь
+успешного discovery и `locked: false`.
+
 Для ручного bootstrap сначала подготовьте schema v2 из `config/config.example.yaml`, замените
 все example IP/IQN/extent/LUN/dataset и token digests, а затем установите файл:
 
@@ -705,8 +740,11 @@ docker run --rm --network none --read-only --user 10001:10001 \
   config validate --path /config/config.yaml
 ```
 
-TrueNAS API соединение внутри host networking использует `wss://127.0.0.1/api/current`.
-Отключение его TLS-проверки разрешено только вместе с
+TrueNAS API во всех трёх контейнерах должен использовать локальный management IP TrueNAS:
+`wss://<TRUENAS_MANAGEMENT_IP>/api/current`. Это адрес, реально назначенный management-
+интерфейсу, например `192.168.3.218`, а не `127.0.0.1` и не Publisher NAT/VIP. Loopback остаётся
+только bind-адресом configurator `:8445` для SSH tunnel. Отключение TLS-проверки TrueNAS API
+разрешено только вместе с
 `TRUENAS_TLS_INSECURE_ACK=I_ACCEPT_MITM_RISK`.
 
 ## Установка Custom App и последующие токены
@@ -729,7 +767,8 @@ Raw token показывается один раз. В YAML помещается
 
 - GHCR image и immutable digest;
 - `/mnt/tank/...` paths;
-- `REPLACE_WITH_TRUENAS_MANAGEMENT_IP` — локальный `ADMIN_BIND_IP`, назначенный TrueNAS;
+- `REPLACE_WITH_TRUENAS_MANAGEMENT_IP` — локальный management IP, назначенный TrueNAS; он
+  подставляется в `ADMIN_BIND_HOST` и в `TRUENAS_API_URL` всех трёх контейнеров;
 - example SAN address `10.20.40.10`, если у вас другой portal/reset IP;
 - TLS/secrets filenames.
 
@@ -737,8 +776,8 @@ Raw token показывается один раз. В YAML помещается
 ссылаются на один публичный образ по immutable digest, поэтому GHCR credentials не нужны.
 
 ```bash
-gh release download v0.3.0 \
-  --pattern 'iscsi-reset-service-v0.3.0-truenas.yaml' \
+gh release download v0.3.1 \
+  --pattern 'iscsi-reset-service-v0.3.1-truenas.yaml' \
   --pattern 'image-digest.txt' \
   --pattern 'SHA256SUMS'
 sha256sum --check SHA256SUMS
@@ -751,8 +790,8 @@ Compose syntax:
 
 ```bash
 grep -nE 'REPLACE_|/mnt/tank|10\.20\.40\.10' \
-  iscsi-reset-service-v0.3.0-truenas.yaml
-docker compose -f iscsi-reset-service-v0.3.0-truenas.yaml config --quiet
+  iscsi-reset-service-v0.3.1-truenas.yaml
+docker compose -f iscsi-reset-service-v0.3.1-truenas.yaml config --quiet
 ```
 
 Установите через **Apps → Discover Apps → Custom App → Install via YAML**. При GUI bootstrap
@@ -916,10 +955,10 @@ Invoke-Pester .\powershell\tests -Output Detailed -CI
 
 Обычный CI и release workflow используют один полный gate: Python/Ruff, Pester на Windows
 PowerShell 5.1 и Compose interaction suite. Публикация запускается тегом, который обязан точно
-соответствовать версии в `pyproject.toml`, например `v0.3.0`.
+соответствовать версии в `pyproject.toml`, например `v0.3.1`.
 
 После успешных проверок workflow публикует только точный version tag
-`ghcr.io/xerz/iscsi-reset-service:v0.3.0`, фиксирует фактический digest, добавляет SBOM и
+`ghcr.io/xerz/iscsi-reset-service:v0.3.1`, фиксирует фактический digest, добавляет SBOM и
 provenance attestation и создаёт GitHub Release. Mutable tag `latest` не создаётся. В release
 прикладываются TrueNAS YAML, полная digest-ссылка и `SHA256SUMS`; реальный TrueNAS автоматически
 не изменяется.

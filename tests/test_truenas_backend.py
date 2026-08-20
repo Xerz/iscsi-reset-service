@@ -44,6 +44,25 @@ def test_dataset_state_accepts_truenas_user_properties_shapes() -> None:
     assert listed.user_properties["org.openai:iscsi-reset-volume"] == "ssd"
 
 
+@pytest.mark.parametrize(
+    ("truenas_value", "expected"),
+    [(False, False), (True, True), (None, None)],
+)
+def test_dataset_state_preserves_truenas_locked_tristate(
+    truenas_value: bool | None,
+    expected: bool | None,
+) -> None:
+    state = _dataset_state(
+        {
+            "id": "nvme/clients/chimera",
+            "type": "FILESYSTEM",
+            "locked": truenas_value,
+        }
+    )
+
+    assert state.locked is expected
+
+
 class RecordingRpc:
     def __init__(self) -> None:
         self.calls = []
@@ -195,7 +214,7 @@ async def test_configuration_discovery_uses_read_only_query_methods() -> None:
                     "extra": {
                         "flat": True,
                         "retrieve_children": True,
-                        "properties": [],
+                        "properties": ["keystatus"],
                         "retrieve_user_props": False,
                     }
                 },

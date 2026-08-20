@@ -15,7 +15,7 @@ services:
       CONFIG_PATH: /config/config.yaml
       RELEASE_DB_PATH: /state/releases.sqlite3
       TOKEN_PEPPER_FILE: /run/secrets/token_pepper
-      TRUENAS_API_URL: wss://127.0.0.1/api/current
+      TRUENAS_API_URL: wss://REPLACE_WITH_TRUENAS_MANAGEMENT_IP/api/current
       TRUENAS_API_USERNAME: iscsi-reset-service
       TRUENAS_API_KEY_FILE: /run/secrets/truenas_api_key
       TRUENAS_TLS_VERIFY: "false"
@@ -51,7 +51,7 @@ services:
       RELEASE_DB_PATH: /state/releases.sqlite3
       TOKEN_PEPPER_FILE: /run/secrets/token_pepper
       ADMIN_TOKEN_PEPPER_FILE: /run/secrets/admin_token_pepper
-      TRUENAS_API_URL: wss://127.0.0.1/api/current
+      TRUENAS_API_URL: wss://REPLACE_WITH_TRUENAS_MANAGEMENT_IP/api/current
       TRUENAS_API_USERNAME: iscsi-reset-service
       TRUENAS_API_KEY_FILE: /run/secrets/truenas_api_key
       TRUENAS_TLS_VERIFY: "false"
@@ -90,7 +90,7 @@ services:
       TOKEN_PEPPER_FILE: /run/secrets/token_pepper
       ADMIN_TOKEN_PEPPER_FILE: /run/secrets/admin_token_pepper
       CONFIGURATOR_TOKEN_DIGEST_FILE: /run/secrets/configurator_token_digest
-      TRUENAS_API_URL: wss://127.0.0.1/api/current
+      TRUENAS_API_URL: wss://REPLACE_WITH_TRUENAS_MANAGEMENT_IP/api/current
       TRUENAS_DISCOVERY_API_USERNAME: iscsi-reset-configurator
       TRUENAS_DISCOVERY_API_KEY_FILE: /run/secrets/truenas_discovery_api_key
       TRUENAS_TLS_VERIFY: "false"

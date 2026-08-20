@@ -1,5 +1,56 @@
 # Verification record
 
+## Hotfix worktree v0.3.1 — 2026-08-20
+
+### Операторские доказательства исходной ошибки на TrueNAS 25.10
+
+Ниже записаны результаты, которые оператор получил на физическом TrueNAS до сборки patched
+image. Это доказательство причины дефекта, но не проверка hotfix image:
+
+- `pool.dataset.query` с прежним `properties: []` возвращал `locked: null` для master zvol и
+  filesystem clone parents. Из-за fail-closed проверки configurator отклонял master как не
+  подтверждённый unlocked zvol и не заполнял список Clone parent.
+- Тот же query с `properties: ["keystatus"]` вернул `locked: false` и
+  `keystatus.value: "NONE"` для `SSDGames/MainGames`,
+  `Sas/Games-Device/Older-Games/oldergames`, `SSDGames/clients/{chimera,beast}` и
+  `Sas/clients/{chimera,beast}`. Отдельные `zfs list` и `iscsi.extent.query` подтвердили тип
+  `volume`, DISK extents, zvol paths и `locked: false` у extent IDs 3/4.
+- TrueNAS middleware отклонил добавление `127.0.0.1` в `ui_address` как адрес, не назначенный
+  машине; соединение контейнера к `wss://127.0.0.1/api/current` получало connection refused.
+  Локальный management IP `192.168.3.218` является правильным адресом API для этого стенда;
+  Publisher NAT/VIP для него не используется.
+
+### Автоматически и локально пройдено
+
+- `ruff check src tests` — passed.
+- `pytest -q` на Python 3.14.4 — **103 passed**. Предупреждения относятся к deprecated asyncio
+  policy API тестового окружения Python 3.14.
+- `node --check src/iscsi_reset_service/static/app.js` — passed.
+- `docker compose config --quiet` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host; `Interaction suite passed`, все
+  три контейнера сообщили version `0.3.1`. После прогона выполнен
+  `docker compose down --volumes`.
+- Release renderer с тестовым digest и последующий `docker compose config --quiet` — passed:
+  три одинаковые digest-pinned image references, три management-IP `TRUENAS_API_URL`, ни одного
+  TrueNAS API URL на loopback.
+- В in-app browser на локальном mock backend пройден regression-сценарий: неверный token
+  оставляет login error; правильный token и первый discovery `503` открывают authenticated
+  shell с `Discovery unavailable`, неизвестными counts и отключёнными validate/apply/save;
+  успешный refresh возвращает badge `TrueNAS discovery OK`, включает действия, показывает три
+  targets, шесть datasets и clone parents из обоих pools.
+
+### Ожидает patched image и физических стендов
+
+- Patched image v0.3.1 ещё должен быть установлен на реальный TrueNAS 25.10. До этой проверки
+  реальный configurator flow не считается пройденным.
+- После установки заново проверить `locked: false` для двух master zvol и наличие
+  `SSDGames/clients/{chimera,beast}` и `Sas/clients/{chimera,beast}` в соответствующих списках
+  Clone parent, затем выполнить save/restart/revision flow.
+- Реальные Windows PowerShell 5.1/Pester, publish workflow, checksum и release-bundle проверки
+  будут зафиксированы после CI/tag; локальный Compose PowerShell simulation не заменяет
+  Windows runner.
+
 ## Configurator worktree v0.3.0 — 2026-08-19
 
 ### Автоматически и локально пройдено

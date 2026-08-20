@@ -32,6 +32,10 @@ def test_render_bundle_pins_all_services_and_preserves_site_placeholders() -> No
     assert TEMPLATE_HEADER not in rendered
     assert RELEASE_HEADER in rendered
     assert "REPLACE_WITH_TRUENAS_MANAGEMENT_IP" in rendered
+    assert rendered.count(
+        "TRUENAS_API_URL: wss://REPLACE_WITH_TRUENAS_MANAGEMENT_IP/api/current"
+    ) == 3
+    assert "TRUENAS_API_URL: wss://127.0.0.1/api/current" not in rendered
     assert rendered.count("/mnt/tank/") == template.count("/mnt/tank/")
 
 
