@@ -39,6 +39,23 @@ image. Это доказательство причины дефекта, но �
   shell с `Discovery unavailable`, неизвестными counts и отключёнными validate/apply/save;
   успешный refresh возвращает badge `TrueNAS discovery OK`, включает действия, показывает три
   targets, шесть datasets и clone parents из обоих pools.
+- GitHub CI run `32370007730` — passed: Python/Ruff/pytest, Windows PowerShell 5.1/Pester и
+  Compose interaction.
+
+### Опубликованный release v0.3.1
+
+- Commit `be4269e5013d119c5beb04614cd387a70fb857f8` опубликован в `main` и помечен
+  аннотированным tag `v0.3.1` после успешного CI.
+- Publish run `32370268538` — passed: tag/version validation, повторный полный verification
+  gate, GHCR build, provenance attestation, renderer bundle и GitHub Release.
+- Опубликованный immutable image digest:
+  `sha256:b19ec56a39a0bfd53e8a046f79a3eaaafc8c52fda9f4fd713d2c3868ab748fa1`.
+- С GitHub Release заново скачаны `iscsi-reset-service-v0.3.1-truenas.yaml`,
+  `image-digest.txt` и `SHA256SUMS`; `shasum -a 256 -c SHA256SUMS` и
+  `docker compose -f iscsi-reset-service-v0.3.1-truenas.yaml config --quiet` — passed.
+- Bundle содержит три одинаковые image references с опубликованным digest, три
+  `wss://REPLACE_WITH_TRUENAS_MANAGEMENT_IP/api/current`, management placeholder для Admin API
+  и loopback bind только для configurator; TrueNAS API URL на loopback отсутствует.
 
 ### Ожидает patched image и физических стендов
 
@@ -47,9 +64,8 @@ image. Это доказательство причины дефекта, но �
 - После установки заново проверить `locked: false` для двух master zvol и наличие
   `SSDGames/clients/{chimera,beast}` и `Sas/clients/{chimera,beast}` в соответствующих списках
   Clone parent, затем выполнить save/restart/revision flow.
-- Реальные Windows PowerShell 5.1/Pester, publish workflow, checksum и release-bundle проверки
-  будут зафиксированы после CI/tag; локальный Compose PowerShell simulation не заменяет
-  Windows runner.
+- Реальные iSCSI/NTFS, TLS/mTLS, SSH tunnel и save/restart flow patched image остаются
+  ожидающими физического TrueNAS/Windows стенда по `TEST-PLAN.md`.
 
 ## Configurator worktree v0.3.0 — 2026-08-19
 
