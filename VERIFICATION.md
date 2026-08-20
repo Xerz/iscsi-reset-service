@@ -86,6 +86,18 @@ Browser и временный mock server остановлены; тестовы
 - Команды и минимальные privileges остаются ожидающими выполнения на физическом TrueNAS по
   `TEST-PLAN.md`; документальная сверка не считается стендовой проверкой.
 
+### Уточнение bootstrap-документации — 2026-08-20
+
+- В README разделены initiator IQN и target `Authorized Networks`: IQN задаётся в initiator
+  group, SAN source IP `/32` — в target, что соответствует TrueNAS 25.10 UI/API model.
+- Добавлена пошаговая private PKI для новичка: три независимых CA, два server certificates с
+  SAN/serverAuth, Publisher client certificate с clientAuth, password-protected PFX, матрица
+  распространения и TrueNAS file permissions.
+- Полная последовательность OpenSSL-команд выполнена локально с dummy IP/keys на OpenSSL 3.6.2:
+  три `openssl verify` с `sslserver`/`sslclient`, обе `x509 -checkip` и чтение PFX — passed.
+- Реальный импорт PFX в Windows PowerShell 5.1, TLS/mTLS handshake, SAN IP конкретного TrueNAS и
+  certificate rotation остаются ожидающими физического стенда.
+
 ### Ожидает отдельной среды
 
 - Минимальный набор read-only ролей discovery user на реальном TrueNAS SCALE 25.10 patch

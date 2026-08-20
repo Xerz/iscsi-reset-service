@@ -269,12 +269,15 @@ config, а не признак первого запуска.
 ### 3. Создайте iSCSI objects через Shares → Block (iSCSI)
 
 1. Создайте portal на SAN address, например `10.20.40.10:3260`.
-2. Создайте один publisher target. Ограничьте его точным initiator IQN Publisher PC и SAN
-   network `10.20.40.100/32`.
+2. Создайте publisher initiator group и укажите в нём только точный IQN Publisher PC. Затем
+   создайте publisher target: в **Authorized Networks** самого target добавьте SAN address
+   `10.20.40.100/32`, а в **Add Groups** выберите подготовленные portal и initiator group.
 3. Для каждого master zvol создайте отдельный **Device/DISK extent**, затем target–extent
    association с выбранным LUN. Сохраните extent ID, NAA и serial.
-4. Для каждого игрового ПК создайте отдельные target и initiator group с точными IQN и `/32`
-   SAN address этого ПК.
+4. Для каждого игрового ПК создайте отдельный initiator group с точным IQN. Создайте отдельный
+   target, добавьте его SAN address с маской `/32` в **Authorized Networks** target и свяжите
+   target с нужными portal и initiator group через **Add Groups**. IP в форме initiator group
+   указывать не нужно.
 5. Для каждого client volume создайте отдельный постоянный Device/DISK extent, первоначально
    направленный на его `__bootstrap` zvol, и association с нужным LUN. Сохраните extent ID, NAA
    и serial, затем **выключите client extent**. File extents не поддерживаются.
@@ -416,10 +419,189 @@ Publisher PC отдельно получает admin server CA, client certifica
 Authentication` и PFX/private key. Игровые ПК получают только CA reset server. PFX и client
 private key в TrueNAS App не монтируются.
 
+#### Пошаговый вариант для собственной PKI
+
+Если в сети уже есть корпоративный CA, лучше запросить у него три leaf certificates с такими
+же SAN/EKU. Если CA нет, команды ниже создают три независимых private CA:
+
+- reset server CA подписывает только HTTPS certificate Reset API;
+- admin server CA подписывает только HTTPS certificate Admin API;
+- admin client CA подписывает только mTLS certificate Publisher PC.
+
+Генерируйте PKI на отдельном доверенном компьютере с **OpenSSL 3.x**, а не внутри App. Закрытые
+ключи CA на TrueNAS и Windows не копируйте. Команды интерактивно запросят passwords для трёх CA
+keys и отдельно password для PFX; passwords не передавайте через command-line arguments.
+
+Сначала проверьте версию, создайте новый пустой каталог и укажите реальные IP. `ADMIN_IP` —
+management IP самого TrueNAS, на котором Admin API будет слушать `:8444`:
+
 ```bash
-chown 10001:10001 /mnt/tank/iscsi-reset/tls/*
-chmod 0400 /mnt/tank/iscsi-reset/tls/*
+openssl version
+umask 077
+mkdir iscsi-reset-pki
+cd iscsi-reset-pki
+
+RESET_IP=10.20.40.10
+ADMIN_IP=192.168.1.10
 ```
+
+`openssl version` должен показывать `OpenSSL 3.x`, не LibreSSL. Каталог не переиспользуйте для
+повторной генерации: при ошибке начните с нового пустого каталога.
+
+Создайте CA и server certificate для Reset API:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -aes-256-cbc -out reset-ca.key
+
+openssl req -x509 -new -sha256 -days 3650 \
+  -key reset-ca.key -out reset-ca.crt \
+  -subj "/CN=iSCSI Reset Server CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -out reset-server.key
+
+openssl req -new -sha256 \
+  -key reset-server.key -out reset-server.csr \
+  -subj "/CN=iscsi-reset-api" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "subjectAltName=IP:${RESET_IP}"
+
+openssl x509 -req -sha256 -days 825 \
+  -in reset-server.csr \
+  -CA reset-ca.crt -CAkey reset-ca.key -CAcreateserial \
+  -copy_extensions copy -out reset-server.crt
+```
+
+Создайте отдельный CA и server certificate для Admin API:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -aes-256-cbc -out admin-server-ca.key
+
+openssl req -x509 -new -sha256 -days 3650 \
+  -key admin-server-ca.key -out admin-ca.crt \
+  -subj "/CN=iSCSI Reset Admin Server CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -out admin-server.key
+
+openssl req -new -sha256 \
+  -key admin-server.key -out admin-server.csr \
+  -subj "/CN=iscsi-reset-admin" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "subjectAltName=IP:${ADMIN_IP}"
+
+openssl x509 -req -sha256 -days 825 \
+  -in admin-server.csr \
+  -CA admin-ca.crt -CAkey admin-server-ca.key -CAcreateserial \
+  -copy_extensions copy -out admin-server.crt
+```
+
+Создайте третий CA, client certificate Publisher PC и password-protected PFX:
+
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -aes-256-cbc -out admin-client-ca.key
+
+openssl req -x509 -new -sha256 -days 3650 \
+  -key admin-client-ca.key -out admin-client-ca.crt \
+  -subj "/CN=iSCSI Reset Admin Client CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
+  -out publisher-client.key
+
+openssl req -new -sha256 \
+  -key publisher-client.key -out publisher-client.csr \
+  -subj "/CN=iscsi-reset-publisher" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature" \
+  -addext "extendedKeyUsage=clientAuth"
+
+openssl x509 -req -sha256 -days 825 \
+  -in publisher-client.csr \
+  -CA admin-client-ca.crt -CAkey admin-client-ca.key -CAcreateserial \
+  -copy_extensions copy -out publisher-client.crt
+
+openssl pkcs12 -export \
+  -inkey publisher-client.key \
+  -in publisher-client.crt \
+  -certfile admin-client-ca.crt \
+  -name "iSCSI Reset Publisher" \
+  -out publisher-client.pfx
+```
+
+Leaf private keys `reset-server.key`, `admin-server.key` и `publisher-client.key` намеренно
+создаются без password: сервер стартует non-interactively, а Publisher импортирует закрытый key
+из зашифрованного PFX. Поэтому рабочий каталог должен оставаться закрытым, а PFX обязан иметь
+сильный отдельный password.
+
+Проверьте цепочки, назначение certificates и оба IP до копирования:
+
+```bash
+openssl verify -CAfile reset-ca.crt -purpose sslserver reset-server.crt
+openssl verify -CAfile admin-ca.crt -purpose sslserver admin-server.crt
+openssl verify -CAfile admin-client-ca.crt -purpose sslclient publisher-client.crt
+
+openssl x509 -in reset-server.crt -noout -checkip "$RESET_IP"
+openssl x509 -in admin-server.crt -noout -checkip "$ADMIN_IP"
+
+openssl x509 -in reset-server.crt -noout -subject -issuer -dates \
+  -ext subjectAltName,extendedKeyUsage
+openssl x509 -in admin-server.crt -noout -subject -issuer -dates \
+  -ext subjectAltName,extendedKeyUsage
+openssl x509 -in publisher-client.crt -noout -subject -issuer -dates \
+  -ext extendedKeyUsage
+
+openssl pkcs12 -in publisher-client.pfx -info -noout
+```
+
+Первые пять проверок должны закончиться `OK`/`does match certificate`; в Publisher certificate
+должен быть `TLS Web Client Authentication`, а в двух server certificates — `TLS Web Server
+Authentication` и правильный SAN IP.
+
+Разложите только эти файлы:
+
+| Назначение | Файлы |
+|---|---|
+| TrueNAS `/mnt/tank/iscsi-reset/tls` | `reset-server.crt`, `reset-server.key`, `admin-server.crt`, `admin-server.key`, `admin-client-ca.crt` |
+| Publisher PC | `admin-ca.crt`, `publisher-client.pfx` и password PFX по отдельному защищённому каналу |
+| Каждый игровой ПК | только `reset-ca.crt` |
+| Offline encrypted backup | весь PKI-каталог, особенно три CA keys, certificates и serial-файлы для renewal |
+
+Никогда не копируйте `reset-ca.key`, `admin-server-ca.key` или `admin-client-ca.key` на TrueNAS,
+Publisher либо игровой ПК. `publisher-client.key` отдельно на Publisher не нужен: он уже внутри
+PFX. CSR-файлы секретами не являются, но для работы App не нужны.
+
+Импортировать эти certificates в системный раздел **Certificates** TrueNAS не требуется: App
+читает PEM-файлы непосредственно через bind mounts. Передайте пять TrueNAS-файлов по SFTP/SCP
+или другим защищённым способом сначала во временный закрытый каталог, затем установите их в
+dataset. Например, после копирования в `/tmp/iscsi-reset-tls` выполните в TrueNAS Shell:
+
+```bash
+sudo install -o 10001 -g 10001 -m 0400 \
+  /tmp/iscsi-reset-tls/reset-server.crt \
+  /tmp/iscsi-reset-tls/reset-server.key \
+  /tmp/iscsi-reset-tls/admin-server.crt \
+  /tmp/iscsi-reset-tls/admin-server.key \
+  /tmp/iscsi-reset-tls/admin-client-ca.crt \
+  /mnt/tank/iscsi-reset/tls/
+
+sudo stat -c '%u:%g %a %n' /mnt/tank/iscsi-reset/tls/*
+```
+
+Ожидание для всех пяти файлов: owner `10001:10001`, mode `400`. Если pool называется не `tank`,
+замените путь. При последующей замене certificates нужен штатный restart всего Custom App.
 
 ### 7. Выберите способ создания первого config
 
