@@ -1,9 +1,6 @@
-schema_version: 2
+schema_version: 3
 allowed_source_cidr: 10.20.40.0/24
 portal: { address: 10.20.40.10, port: 3260 }
-admin_api:
-  allowed_source_ip: 192.168.1.101
-  token_digest: hmac-sha256:1e10fc6038b9541fce978670e80928f93d27f34170cfd2e92ea8ea70ed84219a
 release_management:
   prefix: games
   timezone: Asia/Yekaterinburg

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import ipaddress
@@ -25,6 +26,7 @@ from iscsi_reset_service.config import (
     parse_config_yaml,
 )
 from iscsi_reset_service.models import ConfigurationDiscovery, TargetState
+from iscsi_reset_service.release_manager import ReleaseManager
 from iscsi_reset_service.release_store import ReleaseStore, ReleaseStoreError
 
 MAX_CONFIG_BYTES = 512 * 1024
@@ -93,52 +95,95 @@ class SaveResult:
 
 
 @dataclass(slots=True)
-class ConfiguratorRuntime:
-    backend: StorageBackend
+class ManagementRuntime:
+    discovery_backend: StorageBackend
+    mutation_backend: StorageBackend
     repository: ConfigRepository
     client_pepper: bytes
-    admin_pepper: bytes
+    management_pepper: bytes
     login_digest: str
+    store: ReleaseStore
+    config: ServiceConfig | None
+    release_manager: ReleaseManager | None
+    mutation_lock: asyncio.Lock
 
     @classmethod
-    def from_env(cls) -> ConfiguratorRuntime:
+    def from_env(cls) -> ManagementRuntime:
         backend_name = os.environ.get(
-            "CONFIGURATOR_BACKEND", os.environ.get("BACKEND", "truenas")
+            "MANAGEMENT_BACKEND", os.environ.get("BACKEND", "truenas")
         ).lower()
         if backend_name == "mock":
             state_path = os.environ.get("MOCK_STATE_PATH")
-            backend: StorageBackend = (
+            discovery_backend: StorageBackend = (
                 MockBackend.from_file(state_path) if state_path else MockBackend()
             )
+            mutation_backend = discovery_backend
         elif backend_name == "truenas":
-            api_key = _read_secret("TRUENAS_DISCOVERY_API_KEY_FILE")
-            rpc = TrueNASRpcClient(
-                os.environ.get("TRUENAS_API_URL", "wss://127.0.0.1/api/current"),
+            api_url = os.environ.get("TRUENAS_API_URL")
+            if not api_url:
+                raise ValueError("TRUENAS_API_URL must use the TrueNAS management IP")
+            discovery_key = _read_secret("TRUENAS_DISCOVERY_API_KEY_FILE")
+            discovery_rpc = TrueNASRpcClient(
+                api_url,
                 os.environ.get(
-                    "TRUENAS_DISCOVERY_API_USERNAME", "iscsi-reset-configurator"
+                    "TRUENAS_DISCOVERY_API_USERNAME", "iscsi-reset-discovery"
                 ),
-                api_key,
+                discovery_key,
                 tls_verify=_env_bool("TRUENAS_TLS_VERIFY", True),
                 insecure_ack=os.environ.get("TRUENAS_TLS_INSECURE_ACK"),
             )
-            backend = TrueNASBackend(rpc)
+            mutation_key = _read_secret("TRUENAS_API_KEY_FILE")
+            mutation_rpc = TrueNASRpcClient(
+                api_url,
+                os.environ.get("TRUENAS_API_USERNAME", "iscsi-reset-service"),
+                mutation_key,
+                tls_verify=_env_bool("TRUENAS_TLS_VERIFY", True),
+                insecure_ack=os.environ.get("TRUENAS_TLS_INSECURE_ACK"),
+            )
+            discovery_backend = TrueNASBackend(discovery_rpc)
+            mutation_backend = TrueNASBackend(mutation_rpc)
         else:
-            raise ValueError("CONFIGURATOR_BACKEND must be truenas or mock")
+            raise ValueError("MANAGEMENT_BACKEND must be truenas or mock")
 
         client_pepper = _read_secret("TOKEN_PEPPER_FILE").encode("utf-8")
-        admin_pepper = _read_secret("ADMIN_TOKEN_PEPPER_FILE").encode("utf-8")
-        if len(client_pepper) < 32 or len(admin_pepper) < 32:
+        management_pepper = _read_secret("MANAGEMENT_TOKEN_PEPPER_FILE").encode("utf-8")
+        if len(client_pepper) < 32 or len(management_pepper) < 32:
             raise ValueError("token peppers must be at least 32 bytes")
-        login_digest = _read_secret("CONFIGURATOR_TOKEN_DIGEST_FILE")
+        login_digest = _read_secret("MANAGEMENT_TOKEN_DIGEST_FILE")
         if not TOKEN_DIGEST_RE.fullmatch(login_digest):
-            raise ValueError("configurator token digest is invalid")
+            raise ValueError("management token digest is invalid")
 
         repository = ConfigRepository(
             os.environ.get("CONFIG_PATH", "/config/config.yaml"),
             os.environ.get("RELEASE_DB_PATH", "/state/releases.sqlite3"),
-            backend,
+            discovery_backend,
         )
-        return cls(backend, repository, client_pepper, admin_pepper, login_digest)
+        store = ReleaseStore(
+            os.environ.get("RELEASE_DB_PATH", "/state/releases.sqlite3"),
+            read_only=False,
+        )
+        config = repository.startup_config
+        release_manager = None
+        if config is not None:
+            store.initialize()
+            release_manager = ReleaseManager(config, mutation_backend, store)
+        return cls(
+            discovery_backend,
+            mutation_backend,
+            repository,
+            client_pepper,
+            management_pepper,
+            login_digest,
+            store,
+            config,
+            release_manager,
+            asyncio.Lock(),
+        )
+
+    async def close(self) -> None:
+        await self.discovery_backend.close()
+        if self.mutation_backend is not self.discovery_backend:
+            await self.mutation_backend.close()
 
 
 class ConfigRepository:
@@ -153,6 +198,7 @@ class ConfigRepository:
         self.backend = backend
         document = self.read()
         self.startup_revision = document.config.revision if document.config else None
+        self.startup_config = document.config
 
     def read(self) -> ConfigDocument:
         try:

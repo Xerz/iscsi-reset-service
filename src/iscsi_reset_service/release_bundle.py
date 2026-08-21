@@ -9,7 +9,7 @@ from pathlib import Path
 IMAGE_PLACEHOLDER = (
     "ghcr.io/REPLACE_OWNER/iscsi-reset-service@sha256:REPLACE_WITH_IMMUTABLE_DIGEST"
 )
-EXPECTED_IMAGE_REFERENCES = 3
+EXPECTED_IMAGE_REFERENCES = 2
 TEMPLATE_HEADER = "# Replace the image digest, management IP and every /mnt/tank/... path."
 RELEASE_HEADER = "# Image is digest-pinned. Replace the management IP and every /mnt/tank/... path."
 
@@ -26,7 +26,7 @@ def render_truenas_bundle(
     image_repository: str,
     digest: str,
 ) -> str:
-    """Replace exactly the three image placeholders with one immutable reference."""
+    """Replace exactly the two image placeholders with one immutable reference."""
     if not _IMAGE_REPOSITORY_PATTERN.fullmatch(image_repository):
         raise ValueError(
             "image repository must be a lowercase, untagged ghcr.io repository path"
@@ -51,7 +51,7 @@ def render_truenas_bundle(
     if "REPLACE_OWNER" in rendered or "REPLACE_WITH_IMMUTABLE_DIGEST" in rendered:
         raise ValueError("rendered bundle still contains an image placeholder")
     if rendered.count(pinned_image) != EXPECTED_IMAGE_REFERENCES:
-        raise ValueError("rendered bundle does not contain exactly three pinned image references")
+        raise ValueError("rendered bundle does not contain exactly two pinned image references")
 
     return rendered
 

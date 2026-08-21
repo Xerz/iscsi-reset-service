@@ -65,6 +65,31 @@ async def test_activation_requires_exact_confirmation_and_is_atomic(
 
 
 @pytest.mark.asyncio
+async def test_activation_rechecks_publisher_is_still_disconnected(
+    service_config, backend, release_store
+) -> None:
+    manager = ReleaseManager(service_config, backend, release_store)
+    staged = await manager.stage("stage-before-race", "127.0.0.1")
+    backend.sessions.append(
+        SessionState(
+            initiator_iqn=service_config.publisher.initiator_iqn,
+            initiator_addr=str(service_config.publisher.source_ip),
+            target_iqn=service_config.publisher.target_iqn,
+        )
+    )
+
+    with pytest.raises(PublisherSessionActiveError):
+        await manager.activate(
+            staged.release,
+            f"ACTIVATE {staged.release}",
+            "activate-after-reconnect",
+            "127.0.0.1",
+        )
+
+    assert release_store.active_release().name != staged.release
+
+
+@pytest.mark.asyncio
 async def test_client_prepare_lazily_uses_newly_activated_release(
     service_config, backend, release_store
 ) -> None:

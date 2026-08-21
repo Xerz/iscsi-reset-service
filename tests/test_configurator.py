@@ -20,7 +20,7 @@ from iscsi_reset_service.release_store import ReleaseStore
 
 def test_yaml_parser_rejects_duplicate_keys() -> None:
     source = dump_config(ServiceConfig.model_validate(config_dict()))
-    duplicate = source.replace("schema_version: 2", "schema_version: 2\nschema_version: 2")
+    duplicate = source.replace("schema_version: 3", "schema_version: 3\nschema_version: 3")
 
     with pytest.raises(ValueError, match="duplicate key: schema_version"):
         parse_config_yaml(duplicate)
@@ -39,7 +39,7 @@ def test_canonical_yaml_is_deterministic_and_drops_comments() -> None:
 
 def test_invalid_existing_yaml_remains_editable(tmp_path) -> None:
     config_path = tmp_path / "config.yaml"
-    invalid = "schema_version: 2\nschema_version: 2\n"
+    invalid = "schema_version: 3\nschema_version: 3\n"
     config_path.write_text(invalid, encoding="utf-8")
 
     document = ConfigRepository(
@@ -68,7 +68,7 @@ async def test_repository_validates_live_topology_and_canonicalizes(tmp_path) ->
 
     assert result.config.revision == config.revision
     assert result.warnings == []
-    assert result.yaml.startswith("schema_version: 2\n")
+    assert result.yaml.startswith("schema_version: 3\n")
 
 
 @pytest.mark.asyncio

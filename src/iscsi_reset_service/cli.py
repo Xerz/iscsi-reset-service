@@ -4,17 +4,15 @@ import argparse
 import asyncio
 import json
 import os
-import ssl
 from pathlib import Path
 
 import uvicorn
 
-from iscsi_reset_service.admin_api import create_admin_app
 from iscsi_reset_service.api import create_app
 from iscsi_reset_service.backends import TrueNASBackend
 from iscsi_reset_service.config import load_config
-from iscsi_reset_service.configurator import ConfiguratorRuntime
-from iscsi_reset_service.configurator_api import create_configurator_app
+from iscsi_reset_service.configurator import ManagementRuntime
+from iscsi_reset_service.configurator_api import create_management_app
 from iscsi_reset_service.coordinator import ResetCoordinator
 from iscsi_reset_service.logging_config import configure_logging
 from iscsi_reset_service.release_manager import ReleaseManager
@@ -27,9 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("serve-reset", help="run the SAN reset HTTPS API")
-    subparsers.add_parser("serve-admin", help="run the management mTLS API")
     subparsers.add_parser(
-        "serve-configurator", help="run the loopback-only configuration UI"
+        "serve-management", help="run the loopback-only administration UI"
     )
 
     config_parser = subparsers.add_parser("config", help="configuration commands")
@@ -48,26 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     token_generate.add_argument("--pepper-file", default=os.environ.get("TOKEN_PEPPER_FILE"))
 
-    admin_token_parser = subparsers.add_parser(
-        "admin-token", help="administrator token commands"
+    management_token_parser = subparsers.add_parser(
+        "management-token", help="management login token commands"
     )
-    admin_token_sub = admin_token_parser.add_subparsers(
-        dest="admin_token_command", required=True
+    management_token_sub = management_token_parser.add_subparsers(
+        dest="management_token_command", required=True
     )
-    admin_token_generate = admin_token_sub.add_parser("generate")
-    admin_token_generate.add_argument(
-        "--pepper-file", default=os.environ.get("ADMIN_TOKEN_PEPPER_FILE")
-    )
-
-    configurator_token_parser = subparsers.add_parser(
-        "configurator-token", help="configurator login token commands"
-    )
-    configurator_token_sub = configurator_token_parser.add_subparsers(
-        dest="configurator_token_command", required=True
-    )
-    configurator_token_generate = configurator_token_sub.add_parser("generate")
-    configurator_token_generate.add_argument(
-        "--pepper-file", default=os.environ.get("ADMIN_TOKEN_PEPPER_FILE")
+    management_token_generate = management_token_sub.add_parser("generate")
+    management_token_generate.add_argument(
+        "--pepper-file", default=os.environ.get("MANAGEMENT_TOKEN_PEPPER_FILE")
     )
 
     releases_parser = subparsers.add_parser("releases", help="release commands")
@@ -123,7 +109,7 @@ async def _release_command(command: str) -> int:
         await runtime.backend.close()
 
 
-def _server_tls(runtime: Runtime, *, admin: bool) -> dict:
+def _server_tls(runtime: Runtime) -> dict:
     cert_file = os.environ.get("SERVER_CERT_FILE")
     key_file = os.environ.get("SERVER_KEY_FILE")
     if not isinstance(runtime.backend, TrueNASBackend):
@@ -133,63 +119,42 @@ def _server_tls(runtime: Runtime, *, admin: bool) -> dict:
         }
     if not cert_file or not key_file:
         raise ValueError("TrueNAS mode requires SERVER_CERT_FILE and SERVER_KEY_FILE")
-    result: dict[str, object] = {
+    return {
         "ssl_certfile": cert_file,
         "ssl_keyfile": key_file,
     }
-    if admin:
-        client_ca = os.environ.get("ADMIN_CLIENT_CA_FILE")
-        if not client_ca:
-            raise ValueError("admin API requires ADMIN_CLIENT_CA_FILE")
-        result["ssl_ca_certs"] = client_ca
-        result["ssl_cert_reqs"] = ssl.CERT_REQUIRED
-    return result
 
 
-def _serve(*, admin: bool) -> int:
-    role = "admin" if admin else "reset"
-    runtime = Runtime.from_env(role=role)
-    if admin:
-        bind_host = os.environ.get("ADMIN_BIND_HOST", "")
-        bind_port = int(os.environ.get("ADMIN_BIND_PORT", "8444"))
-        if isinstance(runtime.backend, TrueNASBackend):
-            if not bind_host or bind_host in {"0.0.0.0", str(runtime.config.portal.address)}:
-                raise ValueError(
-                    "ADMIN_BIND_HOST must be the dedicated TrueNAS management IP"
-                )
-            if bind_port != 8444:
-                raise ValueError("TrueNAS admin API must bind management port 8444")
-        app = create_admin_app(runtime)
-    else:
-        bind_host = os.environ.get("BIND_HOST", "10.20.40.10")
-        bind_port = int(os.environ.get("BIND_PORT", "8443"))
-        if isinstance(runtime.backend, TrueNASBackend) and (
-            bind_host != str(runtime.config.portal.address) or bind_port != 8443
-        ):
-            raise ValueError(
-                "TrueNAS reset API must bind only to the configured SAN portal IP on 8443"
-            )
-        app = create_app(runtime)
+def _serve_reset() -> int:
+    runtime = Runtime.from_env(role="reset")
+    bind_host = os.environ.get("BIND_HOST", "10.20.40.10")
+    bind_port = int(os.environ.get("BIND_PORT", "8443"))
+    if isinstance(runtime.backend, TrueNASBackend) and (
+        bind_host != str(runtime.config.portal.address) or bind_port != 8443
+    ):
+        raise ValueError(
+            "TrueNAS reset API must bind only to the configured SAN portal IP on 8443"
+        )
     uvicorn.run(
-        app,
+        create_app(runtime),
         host=bind_host,
         port=bind_port,
         proxy_headers=False,
         server_header=False,
         access_log=False,
-        **_server_tls(runtime, admin=admin),
+        **_server_tls(runtime),
     )
     return 0
 
 
-def _serve_configurator() -> int:
-    runtime = ConfiguratorRuntime.from_env()
-    bind_host = os.environ.get("CONFIGURATOR_BIND_HOST", "127.0.0.1")
-    bind_port = int(os.environ.get("CONFIGURATOR_BIND_PORT", "8445"))
+def _serve_management() -> int:
+    runtime = ManagementRuntime.from_env()
+    bind_host = os.environ.get("MANAGEMENT_BIND_HOST", "127.0.0.1")
+    bind_port = int(os.environ.get("MANAGEMENT_BIND_PORT", "8445"))
     if bind_host != "127.0.0.1" or bind_port != 8445:
-        raise ValueError("configurator must bind only to 127.0.0.1:8445")
+        raise ValueError("management UI must bind only to 127.0.0.1:8445")
     uvicorn.run(
-        create_configurator_app(runtime),
+        create_management_app(runtime),
         host=bind_host,
         port=bind_port,
         proxy_headers=False,
@@ -214,11 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(os.environ.get("LOG_LEVEL", "INFO"))
 
     if args.command == "serve-reset":
-        return _serve(admin=False)
-    if args.command == "serve-admin":
-        return _serve(admin=True)
-    if args.command == "serve-configurator":
-        return _serve_configurator()
+        return _serve_reset()
+    if args.command == "serve-management":
+        return _serve_management()
 
     if args.command == "config" and args.config_command == "validate":
         config = load_config(args.path)
@@ -255,24 +218,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if args.command == "admin-token" and args.admin_token_command == "generate":
-        pepper = _read_pepper(parser, args.pepper_file)
-        token = generate_token()
-        print(
-            json.dumps(
-                {
-                    "token": token,
-                    "token_digest": token_digest(token, pepper),
-                    "warning": "The raw administrator token is shown once.",
-                },
-                indent=2,
-            )
-        )
-        return 0
-
     if (
-        args.command == "configurator-token"
-        and args.configurator_token_command == "generate"
+        args.command == "management-token"
+        and args.management_token_command == "generate"
     ):
         pepper = _read_pepper(parser, args.pepper_file)
         token = generate_token()
@@ -281,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "token": token,
                     "token_digest": token_digest(token, pepper),
-                    "warning": "The raw configurator token is shown once.",
+                    "warning": "The raw management token is shown once.",
                 },
                 indent=2,
             )

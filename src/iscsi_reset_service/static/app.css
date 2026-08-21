@@ -465,6 +465,24 @@ button.danger:hover {
   background: var(--danger-soft);
 }
 
+.button-link {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  padding: .5rem .8rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 620;
+  text-decoration: none;
+}
+
+.button-link:hover {
+  border-color: #58749a;
+  background: var(--surface-3);
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -551,6 +569,10 @@ button:disabled {
   color: var(--success);
 }
 
+.warning-text {
+  color: var(--warning);
+}
+
 .status-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -578,8 +600,78 @@ button:disabled {
   line-height: 1.7;
 }
 
+.dashboard-section {
+  margin-top: 1rem;
+}
+
+.summary-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: .45rem;
+}
+
+.error-list {
+  color: var(--danger);
+}
+
+.data-table {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.data-header,
+.data-row {
+  display: grid;
+  gap: .75rem;
+  align-items: center;
+  min-width: 820px;
+  padding: .7rem .8rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.data-row:last-child {
+  border-bottom: 0;
+}
+
+.data-header {
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: .72rem;
+  font-weight: 650;
+}
+
+.client-status-row {
+  grid-template-columns: minmax(110px, .7fr) minmax(120px, .8fr) minmax(190px, 1.25fr) minmax(125px, .8fr) minmax(220px, 1.6fr);
+}
+
+.row-detail {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.mono {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .82rem;
+}
+
+.release-card .card-heading {
+  align-items: flex-start;
+}
+
+.release-card h3 {
+  margin-bottom: .55rem;
+}
+
+.release-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(240px, .7fr);
+  gap: 1rem;
+}
+
 #publisher-iqn,
-#admin-digest,
 .client-iqn,
 .client-digest,
 .publisher-dataset,
@@ -696,6 +788,10 @@ dialog::backdrop {
     padding: .65rem .8rem;
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .release-grid {
+    grid-template-columns: 1fr;
   }
 
   .nav-item {

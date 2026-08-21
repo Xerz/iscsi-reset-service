@@ -1,150 +1,138 @@
-# Механический тест-план v0.3.1
+# Механический тест-план v0.4.0
 
-Все destructive проверки выполнять сначала на отдельных master/client zvol размером 1 GiB.
-Перед началом сохранить конфиг TrueNAS и SQLite state dataset.
+Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
+1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
+пункт этого плана не разрешает удалять snapshots, clones или releases.
 
 ## 0. Preflight
 
-1. Выполнить `config validate` и `releases validate`.
-2. Проверить, что admin API слушает только management IP:8444, reset API — только
-   `10.20.40.10:8443`, configurator — только `127.0.0.1:8445`.
-3. Проверить admin API четырьмя запросами:
-   - без client certificate — TLS handshake отклонён;
-   - с неверным client certificate — TLS handshake отклонён;
-   - с правильным certificate, но неверным token — HTTP 401;
-   - с правильными credentials с другого management IP — HTTP 403.
-4. В Windows сравнить publisher/client IQN с `Get-InitiatorPort`.
-5. Записать master/client extent ID, LUN, NAA, serial и disk paths.
+1. Проверить, что Custom App содержит ровно два контейнера: `iscsi-reset-api` и
+   `iscsi-reset-management`.
+2. Убедиться, что наружу опубликован только reset HTTPS на SAN IP `:8443`, а management HTTP
+   привязан к `127.0.0.1:8445`. Порта `8444`, admin TLS и Publisher credentials быть не должно.
+3. В обоих контейнерах проверить UID/GID `10001`, read-only root, `cap_drop: ALL`,
+   `no-new-privileges`, отсутствие privileged, Docker socket и `/dev/zvol`.
+4. Сверить publisher/client IQN с `Get-InitiatorPort`. Записать master/client extent ID, LUN,
+   NAA, serial и dataset paths.
+5. Убедиться, что discovery key имеет только `DATASET_READ` и необходимые
+   `SHARING_ISCSI_*_READ` роли. Любой write JSON-RPC этим key должен отклоняться.
+6. Проверить service key отдельно: read/query и необходимые iSCSI/ZFS mutations доступны
+   только ему. Оба API URL должны указывать на management IP TrueNAS, не на loopback и не на
+   Publisher NAT/VIP.
 
-## 0a. Configurator и SSH tunnel
+## 1. Management UI и начальная настройка
 
-1. Убедиться, что discovery user имеет только `DATASET_READ` и необходимые
-   `SHARING_ISCSI_*_READ` роли. Попытка любого write JSON-RPC этим key должна отклоняться.
-   Во всех трёх контейнерах `TRUENAS_API_URL` должен указывать на локальный
-   management IP TrueNAS, а не на `127.0.0.1` и не на Publisher NAT/VIP.
-2. С удалённого компьютера проверить, что прямое соединение к `<TRUENAS_IP>:8445` невозможно.
-3. Открыть `ssh -N -L 8445:127.0.0.1:8445 <truenas>` и войти через
-   `http://127.0.0.1:8445` отдельным configurator token.
-4. Проверить отказ для неверного token, non-loopback Host, неверного Origin и отсутствующего
-   CSRF; cookie должна быть `HttpOnly`/`SameSite=Strict`, framing — запрещён.
-5. Сверить discovery UI с TrueNAS: portal/listen address, полный IQN targets, initiator groups,
-   extents/NAA/serial/dataset, targetextent/LUN и ZFS datasets. Locked/file extents и clone
-   parents другого pool не должны предлагаться.
-   Точный `pool.dataset.query` с `properties:["keystatus"]` должен вернуть
-   `locked:false` для master zvol и filesystem clone parents. На текущем стенде
-   проверить `SSDGames/MainGames`, `Sas/Games-Device/Older-Games/oldergames`,
-   `SSDGames/clients/{chimera,beast}` и `Sas/clients/{chimera,beast}`.
-6. После успешного login имитировать `503` на discovery: должна остаться
-   authenticated shell с `Discovery unavailable`, а validate/apply/save — заблокированы.
-   После успешного **Обновить discovery** списки publisher/clone parent должны
-   заполниться, а три кнопки — снова включиться.
-7. Изменить безопасное поле, проверить form↔YAML, duplicate-key error и однократную выдачу raw
-   token. Raw token не должен появиться в config, browser storage, application/audit logs.
-8. Имитировать параллельное редактирование: второй save со старым `base_revision` должен вернуть
-   `409`, не меняя файл/history.
-9. При active release изменить publisher volume dataset; при incomplete release изменить
-   publisher/portal. Оба save должны отклониться без записи. Повторить с недоступной и повреждённой
-   SQLite.
-10. Между validate и save удалить/изменить выбранный mock/staging TrueNAS object: повторное live
-   discovery должно заблокировать save.
-11. Выполнить разрешённый save. Проверить mode `0600`, immutable-копию в `/config/history`, новый
-    saved revision, прежний startup revision и обязательный restart banner.
-12. Перезапустить весь Custom App и проверить совпадение startup/saved revisions. Убедиться, что
-    Reset/Admin контракты и active release не изменились.
+1. С удалённого компьютера убедиться, что прямое соединение к `<TRUENAS_IP>:8445` невозможно.
+2. Открыть `ssh -N -L 8445:127.0.0.1:8445 <truenas>` и войти на
+   `http://127.0.0.1:8445` management token.
+3. Проверить отказ для неверного token, non-loopback Host, неверного Origin и отсутствующего
+   CSRF. Cookie должна быть `HttpOnly`/`SameSite=Strict`; framing и внешние assets запрещены.
+4. Сверить discovery с TrueNAS: portals, targets/IQN, initiators, extents/NAA/serial/dataset,
+   target–extent–LUN и datasets. File/locked extents и clone parents другого pool не должны
+   предлагаться.
+5. Убедиться, что `pool.dataset.query` с `properties:["keystatus"]` возвращает
+   `locked:false` для master zvol и filesystem clone parents. `true` и `null` должны
+   исключаться.
+6. Имитировать ошибку discovery: authenticated shell остаётся открыт, последняя картина
+   отмечена stale, mutations заблокированы. После успешного refresh блокировка снимается.
+7. Проверить все шесть разделов, form↔YAML, duplicate keys и однократную выдачу raw client
+   token. Raw token не должен появиться в config, browser storage, logs или audit.
+8. Сохранить initial schema v3 config. Проверить mode `0600`, копию в `/config/history`, новый
+   saved revision, прежний startup revision и обязательный restart banner.
+9. До restart убедиться, что stage/activate заблокированы. Перезапустить весь Custom App и
+   проверить равенство startup/saved revisions.
+10. Повторить save со старым `base_revision`, с исчезнувшим TrueNAS object, недоступной и
+    повреждённой SQLite. Файл и history не должны быть повреждены.
 
-## 1. Первый release и безопасный reset
+## 2. Publisher helper: безопасное отключение
 
-1. На тестовых master-дисках создать `baseline.txt`; перевести диски offline и снова online,
-   чтобы проверить штатность процедуры.
-2. Запустить `Publish-IscsiRelease.ps1` и дождаться запроса `ACTIVATE <release>`.
-3. До ввода confirmation проверить, что master target уже подключён, а точный набор master
-   disks снова online.
-4. Подтвердить `ACTIVATE <release>`.
-5. Проверить `GET /v1/admin/releases`: созданный release имеет `staged=true` и `active=true`.
-6. Загрузить тестовый игровой ПК, проверить наличие `baseline.txt`.
-7. Создать на клиентском клоне `delete-me.txt`, перезагрузить ПК.
-8. После загрузки проверить: `baseline.txt` существует, `delete-me.txt` отсутствует.
+1. Скачать из панели новый revision-pinned `publisher.json` и скопировать вместе с общим
+   `Publish-IscsiRelease.ps1` на тестовый Publisher PC.
+2. При подключённом ровно один раз master target выполнить `-Action Disconnect`.
+3. Проверить перед mutations полный target/session и набор дисков по нормализованным NAA.
+4. После выполнения проверить: pending state записан, только доказанные master disks offline,
+   target disconnected, manifest revision сохранён.
+5. Повторить с неверным NAA, лишним/отсутствующим диском, нулём и двумя sessions. Ни один диск
+   не должен измениться.
+6. Имитировать сбой после первого offline. Helper должен завершиться ошибкой, pending state
+   сохраниться, а повторный запуск не должен затронуть посторонние диски.
 
-Ожидание: master disks переподключены, клиент видит только полностью reset-набор LUN.
+## 3. Stage и activation до reconnect
 
-## 2. Stage без activation
+1. При подключённом Publisher проверить, что кнопка создания release заблокирована и dashboard
+   показывает точную session либо identity conflict.
+2. После успешного `Disconnect` обновить dashboard: Publisher должен быть `disconnected`, без
+   partial-match conflict.
+3. Нажать «Создать релиз». Проверить snapshots каждого publisher volume, полный immutable
+   mapping в SQLite, staged state и включённые master extents.
+4. До reconnect ввести точную строку `ACTIVATE <release>`. Проверить повторную сверку snapshots,
+   topology, enabled extents, отсутствия Publisher session, config revision и SQLite.
+5. Убедиться, что active pointer изменился одной SQLite-транзакцией. Publisher пока отображается
+   disconnected; автоматического rollback нет.
+6. Выполнить `-Action Reconnect` с тем же manifest revision и pending state. Проверить
+   непостоянную session, точный набор NAA, перевод дисков online только после полной сверки и
+   удаление pending state.
+7. Повторить Reconnect с другой revision, неверным NAA и неожиданной session. Pending state
+   должен сохраниться, посторонние диски не меняются.
 
-1. Добавить в master `STAGED_ONLY.txt`.
-2. Запустить publisher и дождаться запроса activation.
-3. До ответа проверить, что master target уже подключён и диски online.
-4. Отказаться вводить точную строку activation.
-5. Проверить release list: новый release staged, предыдущий остаётся active.
-6. Перезагрузить игровой ПК — `STAGED_ONLY.txt` отсутствует.
-7. Повторно запустить publisher: он должен использовать pending release, проверить master
-   connection и не создавать новый release.
-8. Ввести точное подтверждение, затем перезагрузить игровой ПК.
-
-Ожидание: после activation файл появляется; Windows reset script и token не менялись.
-
-## 3. Активная publisher session
-
-1. Оставить master target подключённым.
-2. Вызвать admin `POST /v1/admin/releases/stage` напрямую с новым request ID.
-3. Снова прочитать extent state и release list.
-
-Ожидание: HTTP `409 PUBLISHER_SESSION_ACTIVE`; extent enabled/path, snapshots и active pointer
-не изменились.
-
-## 4. Частичный snapshot и восстановление
+## 4. Incomplete release и reconciliation
 
 1. На mock/staging стенде включить failpoint второго `pool.snapshot.create`.
-2. Запустить publisher.
-3. Проверить: первый snapshot существует, второй отсутствует, release `incomplete`, старый
-   release active, оба master extent disabled.
-4. Удалить failpoint и повторить publisher с сохранённым `publish.pending.json`.
-5. Проверить: недостающий snapshot создан, release staged, оба extent enabled с прежними
-   paths/NAA/serial.
+2. Начать stage и проверить: первый snapshot существует, второй отсутствует, release
+   `incomplete`, прежний release active, master extents disabled.
+3. Убрать failpoint. Панель должна показывать «Продолжить», а не создавать новый release.
+4. Повторить action: должен использоваться сохранённый request ID, первый snapshot не
+   пересоздаётся, недостающий создаётся, release становится staged.
+5. Имитировать Publisher reconnect до activation. Activation обязана отклониться без изменения
+   active pointer.
 
-Ожидание: первый snapshot не пересоздаётся и ничего автоматически не удаляется.
+## 5. Dashboard клиентов и releases
 
-## 5. Неверный NAA на Publisher PC
+1. Для каждого клиента отдельно сверить точную session classification по source IP, initiator
+   IQN и target IQN. Частичное совпадение должно отображаться как conflict.
+2. Сверить target/LUN, extent path, managed ZFS properties, origin snapshot и `@clean` для
+   каждого volume.
+3. Проверить состояния `unprepared`, `partial`, `outdated` и `active`; connected должен
+   отображаться отдельно от версии.
+4. После activation нового release перезагрузить один клиент. Он должен стать active, а
+   остальные остаться outdated независимо от connection state.
+5. Только после перехода всех настроенных клиентов на active release проверить badge старого
+   release «кандидат для ручной очистки». Active/incomplete release или release с текущим
+   client mapping такого badge иметь не должен.
+6. Сверить существование snapshots и число clone dependencies через TrueNAS. Никакой delete
+   button/API и автоматического удаления быть не должно.
+7. Отключить TrueNAS API или повредить SQLite: последняя картина остаётся stale, stage/activate
+   заблокированы, login не сбрасывается.
 
-1. В test config/override временно подменить один NAA из ответа publisher API.
-2. Запустить publisher при подключённом master target.
-3. Снять состояния всех локальных дисков до/после.
+## 6. Client reset и сохранность состояния
 
-Ожидание: stage не вызван, target не отключён, ни один диск не переведён offline.
+1. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
+2. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
+   client marker — исчезнуть после проверенного rollback к `@clean`.
+3. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
+   clones не должны пересекаться.
+4. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
+   неполном release mapping, неправильном origin и сбое после mutation.
+5. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
+   должны сохраниться.
+6. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
+   вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
-## 6. Клиентская изоляция и новый active release
-
-1. Активировать R2 с новым marker-файлом.
-2. Одновременно загрузить Chimera и Beast.
-3. Проверить target IQN, LUN, NAA и clone paths каждого ПК.
-4. Записать разные локальные marker-файлы и снова одновременно перезагрузить оба ПК.
-
-Ожидание: оба видят R2, локальные markers исчезли, клоны/targets не пересеклись.
-
-## 7. Сохранность SQLite
-
-1. Записать active release и checksum `/state/releases.sqlite3`.
-2. Перезапустить все три контейнера, затем выполнить App redeploy с тем же state mount.
-3. Проверить active release и загрузить один игровой ПК.
-4. На отдельной копии стенда убрать/повредить SQLite.
-
-Ожидание: после штатного redeploy active сохраняется; при потере/повреждении БД reset
-`/readyz` возвращает 503 и Windows ничего не подключает.
-
-## 8. Чек-лист результата
+## 7. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
-| mTLS/token/IP | Все три защиты обязательны |  | ☐ |
-| Configurator tunnel | Только loopback через SSH |  | ☐ |
-| Discovery permissions | Read-only user не может выполнять mutations |  | ☐ |
+| Два контейнера | Reset + loopback Management |  | ☐ |
+| Management security | Token/cookie/CSRF/Host/Origin |  | ☐ |
+| Discovery/service roles | Read-only и mutation keys разделены |  | ☐ |
 | Config save | 409/live recheck/SQLite guards/atomic history |  | ☐ |
 | Restart revisions | После restart startup = saved |  | ☐ |
-| Первый release | Stage + atomic activate |  | ☐ |
-| Rollback 1 GiB | baseline есть, mutation нет |  | ☐ |
-| Stage без activate | Старый release остаётся active |  | ☐ |
-| Publisher session | 409, без mutations |  | ☐ |
-| Partial snapshot | Disabled → same-ID recovery |  | ☐ |
-| Wrong NAA | Локальные диски не изменены |  | ☐ |
-| Новый release | Ленивая миграция на следующем boot |  | ☐ |
-| Chimera + Beast | Targets и clones изолированы |  | ☐ |
-| Redeploy | Active release сохранён |  | ☐ |
-| Lost SQLite | Reset API fail-closed |  | ☐ |
+| Publisher Disconnect | Exact session/NAA, pending до mutations |  | ☐ |
+| Stage | Fail-closed, immutable полный mapping |  | ☐ |
+| Incomplete retry | Исходный request ID, без удаления snapshots |  | ☐ |
+| Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |
+| Publisher Reconnect | Same revision, nonpersistent, exact NAA |  | ☐ |
+| Client dashboard | Session отдельно от mapped release |  | ☐ |
+| Unused criterion | Только кандидат, dependencies показаны |  | ☐ |
+| Client reset | Полный доказанный набор LUN |  | ☐ |
+| Lost SQLite/API | Fail-closed и stale dashboard |  | ☐ |

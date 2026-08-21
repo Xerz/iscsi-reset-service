@@ -5,24 +5,46 @@ $tokenPath = Join-Path $root "client.token"
 $statePath = Join-Path $root "windows-state.json"
 Set-Content -LiteralPath $tokenPath -Value "chimera-interaction-token" -NoNewline
 
-# The simulation shares configurator's network namespace, matching an SSH tunnel endpoint.
-$configuratorOrigin = "http://127.0.0.1:8445"
-$loginBody = @{ token = "configurator-test-token" } | ConvertTo-Json
+# The simulation shares management's network namespace, matching an SSH tunnel endpoint.
+$managementOrigin = "http://127.0.0.1:8445"
+$loginBody = @{ token = "management-test-token" } | ConvertTo-Json
 $login = Invoke-RestMethod `
     -Method Post `
-    -Uri "$configuratorOrigin/v1/configurator/session" `
-    -Headers @{ Origin = $configuratorOrigin } `
+    -Uri "$managementOrigin/v1/management/session" `
+    -Headers @{ Origin = $managementOrigin } `
     -ContentType "application/json" `
     -Body $loginBody `
-    -SessionVariable configuratorSession
-$configuratorHeaders = @{
-    Origin = $configuratorOrigin
+    -SessionVariable managementSession
+$managementHeaders = @{
+    Origin = $managementOrigin
     "X-CSRF-Token" = [string]$login.csrf_token
+}
+$staged = Invoke-RestMethod `
+    -Method Post `
+    -Uri "$managementOrigin/v1/management/releases/stage" `
+    -Headers $managementHeaders `
+    -WebSession $managementSession
+if ([string]$staged.status -ne "staged") { throw "Release was not staged" }
+$body = @{ confirmation = "ACTIVATE $($staged.release)" } | ConvertTo-Json
+$activated = Invoke-RestMethod `
+    -Method Post `
+    -Uri "$managementOrigin/v1/management/releases/$($staged.release)/activate" `
+    -Headers $managementHeaders `
+    -ContentType "application/json" `
+    -Body $body `
+    -WebSession $managementSession
+if ([string]$activated.status -ne "active") { throw "Release was not activated" }
+$dashboard = Invoke-RestMethod `
+    -Method Get `
+    -Uri "$managementOrigin/v1/management/dashboard" `
+    -WebSession $managementSession
+if ([string]$dashboard.active_release -ne [string]$staged.release) {
+    throw "Dashboard did not report the activated release"
 }
 $document = Invoke-RestMethod `
     -Method Get `
-    -Uri "$configuratorOrigin/v1/configurator/config" `
-    -WebSession $configuratorSession
+    -Uri "$managementOrigin/v1/management/config" `
+    -WebSession $managementSession
 $document.config.clients.chimera.volumes.ssd.label = "COMPOSE_CONFIG"
 $validateBody = @{
     base_revision = [string]$document.source_revision
@@ -30,52 +52,32 @@ $validateBody = @{
 } | ConvertTo-Json -Depth 20
 $validated = Invoke-RestMethod `
     -Method Post `
-    -Uri "$configuratorOrigin/v1/configurator/config/validate" `
-    -Headers $configuratorHeaders `
+    -Uri "$managementOrigin/v1/management/config/validate" `
+    -Headers $managementHeaders `
     -ContentType "application/json" `
     -Body $validateBody `
-    -WebSession $configuratorSession
+    -WebSession $managementSession
 $saveBody = @{
     base_revision = [string]$document.source_revision
     yaml = [string]$validated.yaml
 } | ConvertTo-Json -Depth 5
 $saved = Invoke-RestMethod `
     -Method Put `
-    -Uri "$configuratorOrigin/v1/configurator/config" `
-    -Headers $configuratorHeaders `
+    -Uri "$managementOrigin/v1/management/config" `
+    -Headers $managementHeaders `
     -ContentType "application/json" `
     -Body $saveBody `
-    -WebSession $configuratorSession
+    -WebSession $managementSession
 if (-not [bool]$saved.restart_required) {
-    throw "Configurator save did not require a Custom App restart"
+    throw "Management save did not require a Custom App restart"
 }
-$configuratorStatus = Invoke-RestMethod `
+$managementStatus = Invoke-RestMethod `
     -Method Get `
-    -Uri "$configuratorOrigin/v1/configurator/status" `
-    -WebSession $configuratorSession
-if ([string]$configuratorStatus.saved_revision -eq [string]$configuratorStatus.startup_revision) {
-    throw "Configurator revisions did not diverge after save"
+    -Uri "$managementOrigin/v1/management/status" `
+    -WebSession $managementSession
+if ([string]$managementStatus.saved_revision -eq [string]$managementStatus.startup_revision) {
+    throw "Management revisions did not diverge after save"
 }
-
-$adminHeaders = @{
-    Authorization = "Bearer publisher-interaction-token"
-    "X-Test-Source-IP" = "192.168.1.101"
-    "X-Request-ID" = "compose-stage"
-}
-$staged = Invoke-RestMethod `
-    -Method Post `
-    -Uri "http://admin:8081/v1/admin/releases/stage" `
-    -Headers $adminHeaders
-if ([string]$staged.status -ne "staged") { throw "Release was not staged" }
-$adminHeaders["X-Request-ID"] = "compose-activate"
-$body = @{ confirmation = "ACTIVATE $($staged.release)" } | ConvertTo-Json
-$activated = Invoke-RestMethod `
-    -Method Post `
-    -Uri "http://admin:8081/v1/admin/releases/$($staged.release)/activate" `
-    -Headers $adminHeaders `
-    -ContentType "application/json" `
-    -Body $body
-if ([string]$activated.status -ne "active") { throw "Release was not activated" }
 
 @{
     sessions = @()

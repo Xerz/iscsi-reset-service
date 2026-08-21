@@ -91,8 +91,19 @@ def test_client_may_use_subset_of_publisher_volumes() -> None:
     assert set(config.clients["beast"].volumes) == {"ssd"}
 
 
-def test_schema_v1_has_explicit_migration_error(tmp_path) -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_old_schemas_have_explicit_error(tmp_path, version: int) -> None:
     path = tmp_path / "old.yaml"
-    path.write_text("schema_version: 1\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="schema_version 1 is not supported"):
+    path.write_text(f"schema_version: {version}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="schema_version 1 and 2 are unsupported"):
         load_config(path)
+
+
+def test_schema_v3_rejects_removed_admin_api() -> None:
+    raw = config_dict()
+    raw["admin_api"] = {
+        "allowed_source_ip": "192.168.1.101",
+        "token_digest": f"hmac-sha256:{'0' * 64}",
+    }
+    with pytest.raises(ValidationError, match="admin_api"):
+        ServiceConfig.model_validate(raw)

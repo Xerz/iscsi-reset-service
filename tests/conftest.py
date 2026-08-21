@@ -10,22 +10,16 @@ from iscsi_reset_service.release_store import ReleaseStore
 from iscsi_reset_service.security import token_digest
 
 PEPPER = b"test-pepper-is-at-least-thirty-two-bytes-long"
-ADMIN_PEPPER = b"admin-pepper-is-also-at-least-thirty-two-bytes"
 CHIMERA_TOKEN = "chimera-test-token"
 BEAST_TOKEN = "beast-test-token"
-ADMIN_TOKEN = "publisher-administrator-test-token"
 ACTIVE_RELEASE = "games-2026.08.18.1"
 
 
 def config_dict() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "allowed_source_cidr": "10.20.40.0/24",
         "portal": {"address": "10.20.40.10", "port": 3260},
-        "admin_api": {
-            "allowed_source_ip": "192.168.1.101",
-            "token_digest": token_digest(ADMIN_TOKEN, ADMIN_PEPPER),
-        },
         "release_management": {
             "prefix": "games",
             "timezone": "Asia/Yekaterinburg",

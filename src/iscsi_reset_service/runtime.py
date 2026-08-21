@@ -40,25 +40,17 @@ class Runtime:
     backend: StorageBackend
     pepper: bytes
     store: ReleaseStore
-    admin_pepper: bytes | None = None
     allow_test_source_header: bool = False
 
     @classmethod
     def from_env(cls, *, role: str | None = None) -> Runtime:
         role = (role or os.environ.get("SERVICE_ROLE", "reset")).lower()
-        if role not in {"reset", "admin", "cli"}:
-            raise ValueError("SERVICE_ROLE must be reset, admin, or cli")
+        if role not in {"reset", "cli"}:
+            raise ValueError("SERVICE_ROLE must be reset or cli")
         config = load_config(os.environ.get("CONFIG_PATH", "/config/config.yaml"))
         pepper = _read_secret("TOKEN_PEPPER_FILE", "TOKEN_PEPPER").encode("utf-8")
         if len(pepper) < 32:
             raise ValueError("token pepper must be at least 32 bytes")
-        admin_pepper = None
-        if role == "admin":
-            admin_pepper = _read_secret(
-                "ADMIN_TOKEN_PEPPER_FILE", "ADMIN_TOKEN_PEPPER"
-            ).encode("utf-8")
-            if len(admin_pepper) < 32:
-                raise ValueError("admin token pepper must be at least 32 bytes")
         store = ReleaseStore(
             os.environ.get("RELEASE_DB_PATH", "/state/releases.sqlite3"),
             read_only=role == "reset",
@@ -72,8 +64,11 @@ class Runtime:
             allow_test_header = _env_bool("ALLOW_TEST_SOURCE_HEADER", False)
         elif backend_name == "truenas":
             api_key = _read_secret("TRUENAS_API_KEY_FILE", "TRUENAS_API_KEY")
+            api_url = os.environ.get("TRUENAS_API_URL")
+            if not api_url:
+                raise ValueError("TRUENAS_API_URL must use the TrueNAS management IP")
             rpc = TrueNASRpcClient(
-                os.environ.get("TRUENAS_API_URL", "wss://127.0.0.1/api/current"),
+                api_url,
                 os.environ.get("TRUENAS_API_USERNAME", "iscsi-reset-service"),
                 api_key,
                 tls_verify=_env_bool("TRUENAS_TLS_VERIFY", True),
@@ -83,4 +78,4 @@ class Runtime:
             allow_test_header = False
         else:
             raise ValueError("BACKEND must be truenas or mock")
-        return cls(config, backend, pepper, store, admin_pepper, allow_test_header)
+        return cls(config, backend, pepper, store, allow_test_header)

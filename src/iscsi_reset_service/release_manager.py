@@ -209,6 +209,10 @@ class ReleaseManager:
             for snapshot in record.snapshots.values():
                 if not await self.backend.snapshot_exists(snapshot):
                     raise NotReadyError(f"Release snapshot does not exist: {snapshot}")
+            await self._require_no_session()
+            await self._verify_target_luns()
+            await self._publisher_extents()
+            await self._verify_enabled(True)
             activated = self.store.activate(release_name, request_id)
             self._audit(
                 request_id=request_id,

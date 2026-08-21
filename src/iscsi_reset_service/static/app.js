@@ -5,10 +5,13 @@ const state = {
   baseRevision: null,
   draft: null,
   discovery: null,
+  dashboard: null,
+  dashboardStale: false,
+  dashboardTimer: null,
   status: null,
   yamlDirty: false,
   needsDiscoveryDefaults: false,
-  activePanel: "status",
+  activePanel: "overview",
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -52,10 +55,9 @@ function setValidation(message, kind = "") {
 function defaultDraft() {
   const listen = state.discovery?.portals?.flatMap((item) => item.listen)[0];
   return {
-    schema_version: 2,
+    schema_version: 3,
     allowed_source_cidr: "10.20.40.0/24",
     portal: { address: listen?.address || "10.20.40.10", port: listen?.port || 3260 },
-    admin_api: { allowed_source_ip: "192.168.1.101", token_digest: digestPlaceholder() },
     release_management: { prefix: "games", timezone: "Asia/Yekaterinburg" },
     publisher: { source_ip: "10.20.40.100", initiator_iqn: "", target_iqn: "", volumes: {} },
     clients: {},
@@ -72,7 +74,7 @@ async function login(event) {
   const error = $("#login-error");
   error.hidden = true;
   try {
-    const result = await api("/v1/configurator/session", {
+    const result = await api("/v1/management/session", {
       method: "POST",
       body: JSON.stringify({ token: input.value }),
     });
@@ -90,12 +92,14 @@ async function login(event) {
 async function loadApplication() {
   try {
     const [status, document] = await Promise.all([
-      api("/v1/configurator/status"),
-      api("/v1/configurator/config"),
+      api("/v1/management/status"),
+      api("/v1/management/config"),
     ]);
     state.status = status;
     state.csrf = status.csrf_token;
     state.discovery = null;
+    state.dashboard = null;
+    state.dashboardStale = false;
     state.baseRevision = document.source_revision;
     state.draft = document.config || defaultDraft();
     state.yamlDirty = false;
@@ -104,7 +108,8 @@ async function loadApplication() {
     $("#login-view").hidden = true;
     $("#app-view").hidden = false;
     renderAll();
-    await refreshDiscovery(false);
+    await refreshAll(false);
+    startDashboardPolling();
   } catch (error) {
     if (error.code === "UNAUTHORIZED") {
       state.csrf = null;
@@ -118,6 +123,8 @@ async function loadApplication() {
 
 function renderAll() {
   renderStatus();
+  renderDashboard();
+  renderReleases();
   renderCandidates();
   renderNetwork();
   renderPublisher();
@@ -140,21 +147,123 @@ function setTopologyActionsEnabled(enabled) {
 
 function renderStatus() {
   const status = state.status || {};
+  const dashboard = state.dashboard || {};
   const saved = state.draft ? configRevisionHint() : "—";
-  const targetCount = state.discovery === null ? "—" : state.discovery.targets.length;
-  const datasetCount = state.discovery === null ? "—" : state.discovery.datasets.length;
   $("#status-grid").innerHTML = [
     statusCard("Startup revision", status.startup_revision || "нет"),
     statusCard("Saved revision", status.saved_revision || saved || "нет"),
-    statusCard("Source revision", state.baseRevision || "новый файл"),
     statusCard("Config", status.config_valid ? "валиден" : (status.config_exists ? "ошибка" : "не создан")),
-    statusCard("TrueNAS targets", targetCount),
-    statusCard("Datasets", datasetCount),
+    statusCard("Active release", dashboard.active_release || "нет"),
+    statusCard("Клиенты обновлены", dashboard.all_clients_updated ? "да" : "нет"),
+    statusCard(
+      "Dependencies",
+      state.dashboardStale
+        ? "stale"
+        : `TrueNAS ${dashboard.dependencies?.truenas || "—"} · SQLite ${dashboard.dependencies?.sqlite || "—"}`,
+    ),
   ].join("");
   const restart = status.restart_required || (
     status.startup_revision && status.saved_revision !== status.startup_revision
   );
   $("#restart-banner").hidden = !restart;
+}
+
+function renderDashboard() {
+  const dashboard = state.dashboard;
+  const publisherNode = $("#publisher-status");
+  const clientsNode = $("#dashboard-clients");
+  if (!dashboard || dashboard.setup_required) {
+    publisherNode.innerHTML = '<p class="empty-state">Сохраните schema v3 config и перезапустите Custom App.</p>';
+    clientsNode.innerHTML = '<p class="empty-state">Клиенты появятся после restart.</p>';
+    $("#clients-summary").textContent = "setup required";
+    $("#clients-summary").className = "badge warning";
+    $("#manifest-link").hidden = true;
+    return;
+  }
+  const publisher = dashboard.publisher;
+  const publisherErrors = publisher.errors?.length
+    ? `<ul class="compact-list error-list">${publisher.errors.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`
+    : '<span class="muted">Topology проверена.</span>';
+  publisherNode.innerHTML = `<div class="summary-row">
+    ${statusBadge(connectionLabel(publisher.connection_status), connectionKind(publisher.connection_status))}
+    ${statusBadge(publisher.extents_enabled ? "Extents enabled" : "Extents disabled", publisher.extents_enabled ? "good" : "warning")}
+    ${statusBadge(publisher.topology_valid ? "Topology valid" : "Topology error", publisher.topology_valid ? "good" : "error")}
+  </div>${publisherErrors}`;
+  $("#manifest-link").hidden = Boolean(dashboard.restart_required);
+
+  const rows = dashboard.clients.map((client) => `<div class="data-row client-status-row">
+    <strong>${esc(client.name)}</strong>
+    ${statusBadge(connectionLabel(client.connection_status), connectionKind(client.connection_status))}
+    <span class="mono">${esc(client.mapped_release || "—")}</span>
+    ${statusBadge(updateLabel(client.update_status), updateKind(client.update_status))}
+    <span class="row-detail">${esc(client.errors?.join("; ") || "OK")}</span>
+  </div>`).join("");
+  clientsNode.innerHTML = `<div class="data-header client-status-row"><span>ПК</span><span>Подключение</span><span>Mapped release</span><span>Версия</span><span>Проверка</span></div>${rows || '<p class="empty-state">Нет клиентов.</p>'}`;
+  const updated = dashboard.clients.filter((item) => item.update_status === "updated").length;
+  $("#clients-summary").textContent = `${updated}/${dashboard.clients.length} на active`;
+  $("#clients-summary").className = `badge ${dashboard.all_clients_updated ? "good" : "warning"}`;
+}
+
+function renderReleases() {
+  const dashboard = state.dashboard;
+  const list = $("#releases-list");
+  const button = $("#stage-release");
+  const message = $("#release-message");
+  if (!dashboard || dashboard.setup_required) {
+    list.innerHTML = '<section class="card empty-state">Release state станет доступен после сохранения config и restart.</section>';
+    button.disabled = true;
+    message.hidden = true;
+    return;
+  }
+  const action = dashboard.release_action;
+  button.textContent = action.kind === "continue" ? `Продолжить ${action.release}` : "Создать релиз";
+  button.disabled = !action.can_stage || state.dashboardStale;
+  message.hidden = action.can_stage && !state.dashboardStale;
+  message.textContent = state.dashboardStale
+    ? "Live dashboard устарел: release actions заблокированы."
+    : (action.reasons || []).join("; ");
+  list.innerHTML = dashboard.releases.slice().reverse().map((release) => {
+    const snapshotProblems = release.snapshots.filter((item) => !item.exists);
+    const canActivate = release.status === "staged" && !release.active
+      && dashboard.publisher.connection_status === "disconnected"
+      && dashboard.publisher.topology_valid && dashboard.publisher.extents_enabled
+      && !dashboard.restart_required && !state.dashboardStale;
+    const badges = [
+      statusBadge(release.active ? "active" : release.status, release.active ? "good" : (release.status === "incomplete" ? "error" : "neutral")),
+      release.unused_by_current_mappings ? statusBadge("не используется mappings", "warning") : "",
+      snapshotProblems.length ? statusBadge("snapshot missing", "error") : "",
+    ].join("");
+    const snapshots = release.snapshots.map((item) => `<li><span class="mono">${esc(item.snapshot)}</span> ${statusBadge(item.exists ? "есть" : "нет", item.exists ? "good" : "error")}</li>`).join("");
+    return `<section class="card release-card" data-release="${esc(release.name)}">
+      <div class="card-heading"><div><h3>${esc(release.name)}</h3><div class="summary-row">${badges}</div></div>
+      ${canActivate ? `<button type="button" class="primary activate-release" data-release-name="${esc(release.name)}">Activate</button>` : ""}</div>
+      <div class="release-grid"><div><p class="status-label">Snapshots</p><ul class="compact-list">${snapshots || "<li>Пока нет</li>"}</ul></div>
+      <div><p class="status-label">Mapped clients</p><p>${esc(release.mapped_clients.join(", ") || "нет")}</p>
+      <p class="status-label">Managed clone dependencies</p><p>${esc(String(release.clone_dependencies.length))}</p></div></div>
+      ${release.unused_by_current_mappings ? '<p class="message warning-text">Кандидат для ручной проверки очистки; это не разрешение на удаление snapshots.</p>' : ""}
+    </section>`;
+  }).join("") || '<section class="card empty-state">Релизы ещё не создавались.</section>';
+  $$(".activate-release").forEach((item) => item.addEventListener("click", () => activateRelease(item.dataset.releaseName)));
+}
+
+function statusBadge(label, kind = "neutral") {
+  return `<span class="badge ${kind}">${esc(label)}</span>`;
+}
+
+function connectionLabel(value) {
+  return ({ connected: "подключён", disconnected: "отключён", conflict: "identity conflict" })[value] || value;
+}
+
+function connectionKind(value) {
+  return value === "connected" ? "good" : (value === "disconnected" ? "neutral" : "error");
+}
+
+function updateLabel(value) {
+  return ({ updated: "обновлён", outdated: "устарел", partial: "ошибка mapping", unprepared: "не подготовлен" })[value] || value;
+}
+
+function updateKind(value) {
+  return value === "updated" ? "good" : (value === "partial" ? "error" : "warning");
 }
 
 function statusCard(label, value) {
@@ -194,15 +303,10 @@ function renderNetwork() {
   $("#network-form").innerHTML = `
     ${field("Allowed source CIDR", "network-cidr", draft.allowed_source_cidr, "CIDR обязан быть canonical IPv4 network.")}
     <div class="field"><label for="network-portal">iSCSI portal</label><select id="network-portal">${options(portalOptions, currentPortal)}</select><p class="help">Только listen addresses из TrueNAS.</p></div>
-    ${field("Publisher management IP", "admin-ip", draft.admin_api.allowed_source_ip, "Точный IP Publisher PC для Admin API.", "text", "ip-candidates")}
-    ${field("Admin token digest", "admin-digest", draft.admin_api.token_digest, "Можно вставить digest или сгенерировать новый token.")}
-    <div class="field full"><button id="generate-admin-token" type="button" class="secondary">Сгенерировать admin token</button></div>
     ${field("Release prefix", "release-prefix", draft.release_management.prefix)}
     ${field("Timezone", "release-timezone", draft.release_management.timezone)}
   `;
   bindInput("#network-cidr", (value) => draft.allowed_source_cidr = value);
-  bindInput("#admin-ip", (value) => draft.admin_api.allowed_source_ip = value);
-  bindInput("#admin-digest", (value) => draft.admin_api.token_digest = value);
   bindInput("#release-prefix", (value) => draft.release_management.prefix = value);
   bindInput("#release-timezone", (value) => draft.release_management.timezone = value);
   $("#network-portal").addEventListener("change", (event) => {
@@ -210,7 +314,6 @@ function renderNetwork() {
     draft.portal = { address, port: Number(port) };
     syncYamlFromDraft();
   });
-  $("#generate-admin-token").addEventListener("click", () => generateConfiguredToken("admin"));
 }
 
 function renderPublisher() {
@@ -449,11 +552,9 @@ function addClient() {
 
 async function generateConfiguredToken(kind, clientName = null) {
   try {
-    const result = await api("/v1/configurator/tokens", { method: "POST", body: JSON.stringify({ kind }) });
-    if (kind === "admin") state.draft.admin_api.token_digest = result.token_digest;
-    else state.draft.clients[clientName].token_digest = result.token_digest;
+    const result = await api("/v1/management/tokens", { method: "POST", body: JSON.stringify({ kind }) });
+    state.draft.clients[clientName].token_digest = result.token_digest;
     syncYamlFromDraft();
-    renderNetwork();
     renderClients();
     const input = $("#raw-token");
     input.value = result.token;
@@ -472,7 +573,7 @@ async function validateYaml(applyToForms = false) {
   }
   setValidation("Проверка live topology…");
   try {
-    const result = await api("/v1/configurator/config/validate", {
+    const result = await api("/v1/management/config/validate", {
       method: "POST",
       body: JSON.stringify({ base_revision: state.baseRevision, yaml: $("#yaml-editor").value }),
     });
@@ -499,7 +600,7 @@ async function saveConfig() {
   $("#save-button").disabled = true;
   setValidation("Повторная проверка и атомарное сохранение…");
   try {
-    const result = await api("/v1/configurator/config", {
+    const result = await api("/v1/management/config", {
       method: "PUT",
       body: JSON.stringify({ base_revision: state.baseRevision, yaml: $("#yaml-editor").value }),
     });
@@ -507,11 +608,12 @@ async function saveConfig() {
     state.status.saved_revision = result.saved_revision;
     state.status.source_revision = result.source_revision;
     state.status.restart_required = result.restart_required;
-    const validated = await api("/v1/configurator/config");
+    const validated = await api("/v1/management/config");
     state.draft = validated.config;
     $("#yaml-editor").value = validated.yaml;
     state.yamlDirty = false;
     renderAll();
+    await refreshDashboard(false);
     setValidation(`Сохранено: ${result.saved_revision}. Требуется restart Custom App.`, "good");
   } catch (error) {
     setValidation(`${error.code}: ${error.message}`, "error");
@@ -527,7 +629,7 @@ async function refreshDiscovery(announceSuccess = true) {
   $("#connection-badge").textContent = "Обновление…";
   $("#connection-badge").className = "badge neutral";
   try {
-    state.discovery = await api("/v1/configurator/discovery");
+    state.discovery = await api("/v1/management/discovery");
     if (state.needsDiscoveryDefaults) {
       state.draft = defaultDraft();
       $("#yaml-editor").value = yamlDump(state.draft);
@@ -546,6 +648,75 @@ async function refreshDiscovery(announceSuccess = true) {
     renderAll();
     setGlobalMessage(`Discovery unavailable: ${error.message}`, "error");
     return false;
+  }
+}
+
+async function refreshDashboard(announceSuccess = false) {
+  try {
+    state.dashboard = await api("/v1/management/dashboard");
+    state.dashboardStale = false;
+    renderStatus();
+    renderDashboard();
+    renderReleases();
+    if (announceSuccess) setGlobalMessage("Live state обновлён.", "good");
+    return true;
+  } catch (error) {
+    if (error.code === "UNAUTHORIZED") {
+      await logout();
+      return false;
+    }
+    state.dashboardStale = true;
+    renderStatus();
+    renderDashboard();
+    renderReleases();
+    setGlobalMessage(`Live state unavailable: ${error.message}`, "error");
+    return false;
+  }
+}
+
+async function refreshAll(announceSuccess = true) {
+  const discoveryOk = await refreshDiscovery(false);
+  const dashboardOk = await refreshDashboard(false);
+  if (announceSuccess && discoveryOk && dashboardOk) setGlobalMessage("Discovery и live state обновлены.", "good");
+  return discoveryOk && dashboardOk;
+}
+
+function startDashboardPolling() {
+  if (state.dashboardTimer) window.clearInterval(state.dashboardTimer);
+  state.dashboardTimer = window.setInterval(() => {
+    if (!["overview", "releases"].includes(state.activePanel) || $("#app-view").hidden) return;
+    refreshDashboard(false);
+  }, 10000);
+}
+
+async function stageRelease() {
+  const button = $("#stage-release");
+  button.disabled = true;
+  setGlobalMessage("Создание snapshots и проверка master topology…");
+  try {
+    const result = await api("/v1/management/releases/stage", { method: "POST" });
+    setGlobalMessage(`Release ${result.release} создан и staged. Проверьте его и нажмите Activate.`, "good");
+    await refreshDashboard(false);
+  } catch (error) {
+    setGlobalMessage(`${error.code}: ${error.message}`, "error");
+    await refreshDashboard(false);
+  }
+}
+
+async function activateRelease(releaseName) {
+  const required = `ACTIVATE ${releaseName}`;
+  const confirmation = window.prompt(`Введите точно: ${required}`);
+  if (confirmation === null) return;
+  try {
+    const result = await api(`/v1/management/releases/${encodeURIComponent(releaseName)}/activate`, {
+      method: "POST",
+      body: JSON.stringify({ confirmation }),
+    });
+    setGlobalMessage(`Release ${result.release} активирован. Теперь запустите Publisher helper с -Action Reconnect.`, "good");
+    await refreshDashboard(false);
+  } catch (error) {
+    setGlobalMessage(`${error.code}: ${error.message}`, "error");
+    await refreshDashboard(false);
   }
 }
 
@@ -661,10 +832,14 @@ function downloadYaml() {
 }
 
 async function logout() {
-  try { await api("/v1/configurator/session", { method: "DELETE" }); } catch (_) { /* local session only */ }
+  try { await api("/v1/management/session", { method: "DELETE" }); } catch (_) { /* local session only */ }
   state.csrf = null;
   state.draft = null;
   state.discovery = null;
+  state.dashboard = null;
+  state.dashboardStale = false;
+  if (state.dashboardTimer) window.clearInterval(state.dashboardTimer);
+  state.dashboardTimer = null;
   state.needsDiscoveryDefaults = false;
   $("#app-view").hidden = true;
   $("#login-view").hidden = false;
@@ -673,7 +848,8 @@ async function logout() {
 
 $("#login-form").addEventListener("submit", login);
 $("#logout-button").addEventListener("click", logout);
-$("#refresh-button").addEventListener("click", () => refreshDiscovery());
+$("#refresh-button").addEventListener("click", () => refreshAll());
+$("#stage-release").addEventListener("click", stageRelease);
 $("#fill-publisher").addEventListener("click", fillPublisherFromTarget);
 $("#add-client").addEventListener("click", addClient);
 $("#validate-button").addEventListener("click", () => validateYaml(false).catch(() => {}));

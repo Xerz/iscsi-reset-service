@@ -254,10 +254,6 @@ class ReleaseStageResponse(ApiModel):
     snapshots: dict[str, str]
 
 
-class ActivateRequest(ApiModel):
-    confirmation: str
-
-
 class ReleaseActivateResponse(ApiModel):
     schema_version: Literal[1] = 1
     status: Literal["active"] = "active"

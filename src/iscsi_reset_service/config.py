@@ -70,19 +70,6 @@ class PortalConfig(StrictModel):
         return self
 
 
-class AdminApiConfig(StrictModel):
-    allowed_source_ip: IPvAnyAddress
-    token_digest: str
-
-    @model_validator(mode="after")
-    def validate_admin(self) -> AdminApiConfig:
-        if self.allowed_source_ip.version != 4:
-            raise ValueError("admin_api.allowed_source_ip must be IPv4")
-        if not TOKEN_DIGEST_RE.fullmatch(self.token_digest):
-            raise ValueError("admin_api.token_digest must be hmac-sha256:<64 lowercase hex>")
-        return self
-
-
 class ReleaseManagementConfig(StrictModel):
     prefix: str = "games"
     timezone: str = "Asia/Yekaterinburg"
@@ -203,10 +190,9 @@ class ClientConfig(StrictModel):
 
 
 class ServiceConfig(StrictModel):
-    schema_version: Literal[2]
+    schema_version: Literal[3]
     allowed_source_cidr: str
     portal: PortalConfig
-    admin_api: AdminApiConfig
     release_management: ReleaseManagementConfig
     publisher: PublisherConfig
     clients: dict[str, ClientConfig]
@@ -311,10 +297,10 @@ def parse_config_yaml(source: str) -> ServiceConfig:
         raise ValueError(str(problem)) from exc
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
-    if raw.get("schema_version") == 1:
+    if raw.get("schema_version") in {1, 2}:
         raise ValueError(
-            "schema_version 1 is not supported since v0.2.0; move releases/active_release "
-            "to the release database and add admin_api, release_management and publisher"
+            "schema_version 1 and 2 are unsupported; create a schema_version 3 "
+            "configuration without admin_api"
         )
     return ServiceConfig.model_validate(raw)
 

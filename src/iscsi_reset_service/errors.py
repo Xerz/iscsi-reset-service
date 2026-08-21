@@ -14,23 +14,9 @@ class AuthenticationError(ServiceError):
         super().__init__(401, "UNAUTHORIZED", "Unknown or missing reset token")
 
 
-class AdminAuthenticationError(ServiceError):
-    def __init__(self) -> None:
-        super().__init__(401, "UNAUTHORIZED", "Unknown or missing administrator token")
-
-
 class SourceAddressError(ServiceError):
     def __init__(self) -> None:
         super().__init__(403, "SOURCE_IP_MISMATCH", "Token is not valid from this source address")
-
-
-class AdminSourceAddressError(ServiceError):
-    def __init__(self) -> None:
-        super().__init__(
-            403,
-            "SOURCE_IP_MISMATCH",
-            "Administrator token is not valid from this source address",
-        )
 
 
 class SessionActiveError(ServiceError):

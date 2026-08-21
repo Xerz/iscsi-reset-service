@@ -3,20 +3,20 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>iSCSI Reset Configurator</title>
+    <title>iSCSI Reset Administration</title>
     <link rel="stylesheet" href="/assets/app.css">
   </head>
   <body>
     <main id="login-view" class="login-shell">
       <section class="login-card" aria-labelledby="login-title">
         <p class="login-context">Доступ через SSH-туннель</p>
-        <h1 id="login-title">iSCSI Reset Configurator</h1>
+        <h1 id="login-title">iSCSI Reset Administration</h1>
         <p class="muted login-description">
-          Введите отдельный токен конфигуратора. Он используется только для входа и не
+          Введите отдельный management token. Он используется только для входа и не
           сохраняется браузером.
         </p>
         <form id="login-form">
-          <label for="login-token">Токен конфигуратора</label>
+          <label for="login-token">Management token</label>
           <input id="login-token" name="token" type="password" autocomplete="off" required>
           <button type="submit" class="primary">Войти</button>
         </form>
@@ -28,11 +28,11 @@
       <header class="topbar">
         <div class="product-heading">
           <span class="product-name">iSCSI Reset Service</span>
-          <h1>Конфигуратор</h1>
+          <h1>Администрирование</h1>
         </div>
         <div class="topbar-actions">
           <span id="connection-badge" class="badge neutral">Загрузка</span>
-          <button id="refresh-button" type="button" class="secondary">Обновить discovery</button>
+          <button id="refresh-button" type="button" class="secondary">Обновить</button>
           <button id="logout-button" type="button" class="ghost">Выйти</button>
         </div>
       </header>
@@ -43,8 +43,9 @@
       <div id="global-message" class="banner" role="status" hidden></div>
 
       <div class="workspace">
-        <nav class="sidebar" aria-label="Разделы конфигуратора">
-          <button type="button" class="nav-item active" data-panel="status">Статус</button>
+        <nav class="sidebar" aria-label="Разделы администрирования">
+          <button type="button" class="nav-item active" data-panel="overview">Обзор</button>
+          <button type="button" class="nav-item" data-panel="releases">Релизы</button>
           <button type="button" class="nav-item" data-panel="network">Сеть</button>
           <button type="button" class="nav-item" data-panel="publisher">Publisher</button>
           <button type="button" class="nav-item" data-panel="clients">Клиенты</button>
@@ -52,30 +53,41 @@
         </nav>
 
         <section class="content">
-          <div id="panel-status" class="panel active">
+          <div id="panel-overview" class="panel active">
             <div class="panel-heading">
               <div>
-                <h2>Статус</h2>
-                <p class="panel-description">Текущее состояние конфигурации и discovery.</p>
+                <h2>Обзор</h2>
+                <p class="panel-description">Конфигурация, подключения и версии клиентов.</p>
               </div>
             </div>
             <div id="status-grid" class="status-grid"></div>
-            <section class="card">
-              <h3>Правила сохранения</h3>
-              <ul class="compact-list">
-                <li>TrueNAS используется только для read-only discovery.</li>
-                <li>Ссылки на target, extent, LUN и dataset перепроверяются перед записью.</li>
-                <li>Active и incomplete releases блокируют несовместимые изменения.</li>
-                <li>Новый YAML применяется только после restart всего Custom App.</li>
-              </ul>
+            <section class="card dashboard-section">
+              <div class="card-heading"><h3>Publisher</h3><a id="manifest-link" class="button-link" href="/v1/management/publisher/manifest">Скачать manifest</a></div>
+              <div id="publisher-status" class="empty-state">Management runtime ещё не загружен.</div>
             </section>
+            <section class="card dashboard-section">
+              <div class="card-heading"><h3>Компьютеры</h3><span id="clients-summary" class="badge neutral">—</span></div>
+              <div id="dashboard-clients" class="data-table"></div>
+            </section>
+          </div>
+
+          <div id="panel-releases" class="panel">
+            <div class="panel-heading">
+              <div>
+                <h2>Релизы</h2>
+                <p class="panel-description">Snapshots, текущие mappings и ручной выпуск новой версии.</p>
+              </div>
+              <button id="stage-release" type="button" class="primary" disabled>Создать релиз</button>
+            </div>
+            <div id="release-message" class="banner warning" hidden></div>
+            <div id="releases-list" class="stack"></div>
           </div>
 
           <div id="panel-network" class="panel">
             <div class="panel-heading">
               <div>
                 <h2>Сеть</h2>
-                <p class="panel-description">Portal, доступ к Admin API и именование releases.</p>
+                <p class="panel-description">iSCSI portal и именование releases.</p>
               </div>
             </div>
             <div id="network-form" class="form-grid"></div>

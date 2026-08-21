@@ -1,11 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$ConfigPath = "C:\ProgramData\IscsiResetPublisher\publisher.json",
-    [string]$TokenPath = "C:\ProgramData\IscsiResetPublisher\admin.token",
-    [string]$PendingPath = "C:\ProgramData\IscsiResetPublisher\publish.pending.json",
-    [string]$Confirmation = "",
-    [string]$SimulationSourceIp = "",
-    [switch]$AllowHttpForSimulation,
+    [ValidateSet("Disconnect", "Reconnect")][string]$Action = "Disconnect",
+    [string]$ManifestPath = "C:\ProgramData\IscsiResetPublisher\publisher.json",
+    [string]$PendingPath = "C:\ProgramData\IscsiResetPublisher\publisher.pending.json",
     [switch]$PassThruExitCode,
     [switch]$NoMain
 )
@@ -20,74 +17,34 @@ function Normalize-PublisherDiskId {
     return $normalized
 }
 
-function Invoke-PublisherRequest {
-    param(
-        [Parameter(Mandatory = $true)][ValidateSet("GET", "POST")][string]$Method,
-        [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][string]$Token,
-        [Parameter(Mandatory = $true)][string]$RequestId,
-        [string]$CertificateThumbprint = "",
-        [object]$Body = $null
-    )
-    $headers = @{ Authorization = "Bearer $Token"; "X-Request-ID" = $RequestId }
-    if (-not [string]::IsNullOrWhiteSpace($script:SimulationSourceIp)) {
-        $headers["X-Test-Source-IP"] = $script:SimulationSourceIp
+function Read-PublisherManifest {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Publisher manifest not found: $Path" }
+    $manifest = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ([int]$manifest.schema_version -ne 1) { throw "Unsupported publisher manifest schema" }
+    if ([string]::IsNullOrWhiteSpace([string]$manifest.config_revision)) {
+        throw "Publisher manifest has no config revision"
     }
-    $parameters = @{
-        Method = $Method
-        Uri = $Uri
-        Headers = $headers
-        TimeoutSec = 180
+    if ([string]::IsNullOrWhiteSpace([string]$manifest.target_iqn)) {
+        throw "Publisher manifest has no target IQN"
     }
-    if (-not [string]::IsNullOrWhiteSpace($CertificateThumbprint)) {
-        $parameters["CertificateThumbprint"] = $CertificateThumbprint
+    if ($null -eq $manifest.portal -or
+        [string]::IsNullOrWhiteSpace([string]$manifest.portal.address) -or
+        [int]$manifest.portal.port -lt 1) {
+        throw "Publisher manifest has an invalid portal"
     }
-    if ($null -ne $Body) {
-        $parameters["Body"] = ($Body | ConvertTo-Json -Compress)
-        $parameters["ContentType"] = "application/json"
+    $volumes = @($manifest.volumes)
+    if ($volumes.Count -eq 0) { throw "Publisher manifest has no volumes" }
+    $ids = @($volumes | ForEach-Object {
+        Normalize-PublisherDiskId ([string]$_.disk_unique_id)
+    })
+    if (@($ids | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+        throw "Publisher manifest contains an empty disk ID"
     }
-    return Invoke-RestMethod @parameters
-}
-
-function Get-PublisherHttpStatus {
-    param([Parameter(Mandatory = $true)]$Exception)
-    if ($Exception.Data.Contains("StatusCode")) {
-        return [int]$Exception.Data["StatusCode"]
+    if (@($ids | Select-Object -Unique).Count -ne $ids.Count) {
+        throw "Publisher manifest contains duplicate disk IDs"
     }
-    $responseProperty = $Exception.PSObject.Properties["Response"]
-    if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
-        try { return [int]$responseProperty.Value.StatusCode } catch { return 0 }
-    }
-    return 0
-}
-
-function Invoke-StageWithRetry {
-    param(
-        [Parameter(Mandatory = $true)][string]$BaseUrl,
-        [Parameter(Mandatory = $true)][string]$Token,
-        [Parameter(Mandatory = $true)][string]$RequestId,
-        [string]$CertificateThumbprint = "",
-        [int]$TimeoutSeconds = 120
-    )
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    $delay = 2
-    while ($true) {
-        try {
-            return Invoke-PublisherRequest `
-                -Method POST `
-                -Uri "$BaseUrl/v1/admin/releases/stage" `
-                -Token $Token `
-                -RequestId $RequestId `
-                -CertificateThumbprint $CertificateThumbprint
-        } catch {
-            $status = Get-PublisherHttpStatus -Exception $_.Exception
-            if (($status -notin @(409, 423, 503)) -or ([DateTime]::UtcNow -ge $deadline)) {
-                throw
-            }
-            Start-Sleep -Seconds $delay
-            $delay = [Math]::Min(10, $delay * 2)
-        }
-    }
+    return $manifest
 }
 
 function Get-PublisherSession {
@@ -122,15 +79,68 @@ function Assert-PublisherDisks {
     return $matched
 }
 
+function Save-PublisherPending {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    $directory = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $temporary = Join-Path $directory (".publisher-pending-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    [ordered]@{
+        schema_version = 1
+        config_revision = [string]$Manifest.config_revision
+        target_iqn = [string]$Manifest.target_iqn
+        disk_unique_ids = @($Manifest.volumes | ForEach-Object {
+            Normalize-PublisherDiskId ([string]$_.disk_unique_id)
+        } | Sort-Object)
+        created_at = [DateTime]::UtcNow.ToString("o")
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+function Assert-PublisherPending {
+    param(
+        [Parameter(Mandatory = $true)]$Pending,
+        [Parameter(Mandatory = $true)]$Manifest
+    )
+    if ([int]$Pending.schema_version -ne 1 -or
+        [string]$Pending.config_revision -ne [string]$Manifest.config_revision -or
+        [string]$Pending.target_iqn -ne [string]$Manifest.target_iqn) {
+        throw "Pending state does not match the publisher manifest revision"
+    }
+    $pendingIds = @($Pending.disk_unique_ids | ForEach-Object {
+        Normalize-PublisherDiskId ([string]$_)
+    } | Sort-Object)
+    $manifestIds = @($Manifest.volumes | ForEach-Object {
+        Normalize-PublisherDiskId ([string]$_.disk_unique_id)
+    } | Sort-Object)
+    if (($pendingIds -join ",") -ne ($manifestIds -join ",")) {
+        throw "Pending state disk IDs do not match the publisher manifest"
+    }
+}
+
 function Set-PublisherDisksOffline {
     param([Parameter(Mandatory = $true)]$Disks)
+    $errors = @()
     foreach ($disk in $Disks) {
-        if (-not $disk.IsOffline) { Set-Disk -Number $disk.Number -IsOffline $true }
+        try {
+            if (-not $disk.IsOffline) { Set-Disk -Number $disk.Number -IsOffline $true }
+        } catch {
+            $errors += "Disk $($disk.Number): $($_.Exception.Message)"
+        }
     }
     foreach ($disk in $Disks) {
-        $current = Get-Disk -Number $disk.Number
-        if (-not $current.IsOffline) { throw "Disk $($disk.Number) did not go offline" }
+        try {
+            $current = Get-Disk -Number $disk.Number
+            if (-not $current.IsOffline) { $errors += "Disk $($disk.Number) did not go offline" }
+        } catch {
+            $errors += "Disk $($disk.Number) verification failed"
+        }
     }
+    if ($errors.Count -gt 0) { throw ($errors -join "; ") }
 }
 
 function Ensure-PublisherPortal {
@@ -147,35 +157,29 @@ function Ensure-PublisherPortal {
 }
 
 function Connect-PublisherTarget {
-    param(
-        [Parameter(Mandatory = $true)]$Publisher,
-        [Parameter(Mandatory = $true)]$ExpectedVolumes
-    )
-    Ensure-PublisherPortal -Portal $Publisher.portal
-    Update-IscsiTarget -NodeAddress ([string]$Publisher.target_iqn) -ErrorAction SilentlyContinue | Out-Null
-    $existingSessions = @(Get-PublisherSession -TargetIqn ([string]$Publisher.target_iqn))
-    if ($existingSessions.Count -eq 0) {
+    param([Parameter(Mandatory = $true)]$Manifest)
+    Ensure-PublisherPortal -Portal $Manifest.portal
+    Update-IscsiTarget -NodeAddress ([string]$Manifest.target_iqn) -ErrorAction SilentlyContinue | Out-Null
+    $sessions = @(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn))
+    if ($sessions.Count -eq 0) {
         Connect-IscsiTarget `
-            -NodeAddress ([string]$Publisher.target_iqn) `
-            -TargetPortalAddress ([string]$Publisher.portal.address) `
-            -TargetPortalPortNumber ([int]$Publisher.portal.port) `
+            -NodeAddress ([string]$Manifest.target_iqn) `
+            -TargetPortalAddress ([string]$Manifest.portal.address) `
+            -TargetPortalPortNumber ([int]$Manifest.portal.port) `
             -IsPersistent $false `
             -IsMultipathEnabled $false `
             -AuthenticationType NONE | Out-Null
-    } elseif ($existingSessions.Count -ne 1) {
-        throw "Publisher target has $($existingSessions.Count) sessions; expected at most one"
+    } elseif ($sessions.Count -ne 1) {
+        throw "Publisher target has $($sessions.Count) sessions; expected at most one"
     }
+
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     do {
-        $sessions = @(Get-PublisherSession -TargetIqn ([string]$Publisher.target_iqn))
+        $sessions = @(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn))
         if ($sessions.Count -eq 1) {
             $disks = @(Get-PublisherSessionDisks -Session $sessions[0])
-            if ($disks.Count -eq $ExpectedVolumes.Count) {
-                $matched = @(Assert-PublisherDisks -ExpectedVolumes $ExpectedVolumes -Disks $disks)
-                foreach ($disk in $matched) {
-                    if ($disk.IsOffline) { Set-Disk -Number $disk.Number -IsOffline $false }
-                }
-                return
+            if ($disks.Count -eq @($Manifest.volumes).Count) {
+                return @(Assert-PublisherDisks -ExpectedVolumes @($Manifest.volumes) -Disks $disks)
             }
         }
         Start-Sleep -Seconds 1
@@ -183,94 +187,60 @@ function Connect-PublisherTarget {
     throw "Publisher target did not reconnect with the expected disks"
 }
 
-function Save-PendingPublication {
-    param([string]$Path, [string]$RequestId, [string]$Release = "")
-    [ordered]@{
-        request_id = $RequestId
-        release = $Release
-    } | ConvertTo-Json | Set-Content -LiteralPath $Path -Encoding UTF8
+function Invoke-PublisherDisconnect {
+    param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$StatePath)
+    if (Test-Path -LiteralPath $StatePath) {
+        $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        Assert-PublisherPending -Pending $pending -Manifest $Manifest
+        if (@(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn)).Count -eq 0) {
+            return
+        }
+        throw "Pending state exists but Publisher is still connected; recover manually"
+    }
+    $sessions = @(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn))
+    if ($sessions.Count -ne 1) { throw "Disconnect requires exactly one Publisher session" }
+    $disks = @(Get-PublisherSessionDisks -Session $sessions[0])
+    $matched = @(Assert-PublisherDisks -ExpectedVolumes @($Manifest.volumes) -Disks $disks)
+    Save-PublisherPending -Path $StatePath -Manifest $Manifest
+    Set-PublisherDisksOffline -Disks $matched
+    Disconnect-IscsiTarget -NodeAddress ([string]$Manifest.target_iqn) -Confirm:$false
+    if (@(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn)).Count -ne 0) {
+        throw "Publisher target did not disconnect"
+    }
+}
+
+function Invoke-PublisherReconnect {
+    param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$StatePath)
+    if (-not (Test-Path -LiteralPath $StatePath)) { throw "Publisher pending state not found" }
+    $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+    Assert-PublisherPending -Pending $pending -Manifest $Manifest
+    $matched = @(Connect-PublisherTarget -Manifest $Manifest)
+    foreach ($disk in $matched) {
+        if ($disk.IsOffline) { Set-Disk -Number $disk.Number -IsOffline $false }
+    }
+    foreach ($disk in $matched) {
+        if ((Get-Disk -Number $disk.Number).IsOffline) {
+            throw "Disk $($disk.Number) did not come online"
+        }
+    }
+    Remove-Item -LiteralPath $StatePath -Force
 }
 
 function Invoke-PublisherMain {
-    param([string]$PublisherConfigPath, [string]$AdminTokenPath, [string]$StatePath)
-    $publisher = $null
-    $token = ""
-    $config = $null
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("Disconnect", "Reconnect")][string]$RequestedAction,
+        [Parameter(Mandatory = $true)][string]$PublisherManifestPath,
+        [Parameter(Mandatory = $true)][string]$StatePath
+    )
     try {
-        if (-not (Test-Path -LiteralPath $PublisherConfigPath)) { throw "Config file not found" }
-        if (-not (Test-Path -LiteralPath $AdminTokenPath)) { throw "Admin token file not found" }
-        $config = Get-Content -LiteralPath $PublisherConfigPath -Raw | ConvertFrom-Json
-        $token = (Get-Content -LiteralPath $AdminTokenPath -Raw).Trim()
-        $baseUrl = ([string]$config.api_base_url).TrimEnd("/")
-        if ($baseUrl.StartsWith("http://") -and -not $script:AllowHttpForSimulation) {
-            throw "Plain HTTP is permitted only in explicit simulation mode"
-        }
-
-        $pending = $null
-        if (Test-Path -LiteralPath $StatePath) {
-            $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
-        }
-        $requestId = if ($null -ne $pending) {
-            [string]$pending.request_id
+        $manifest = Read-PublisherManifest -Path $PublisherManifestPath
+        if ($RequestedAction -eq "Disconnect") {
+            Invoke-PublisherDisconnect -Manifest $manifest -StatePath $StatePath
+            Write-Host "Publisher disconnected. Create and activate the release in the management UI."
         } else {
-            [Guid]::NewGuid().ToString("D")
+            Invoke-PublisherReconnect -Manifest $manifest -StatePath $StatePath
+            Write-Host "Publisher reconnected and exact disks verified."
         }
-        $publisher = Invoke-PublisherRequest `
-            -Method GET `
-            -Uri "$baseUrl/v1/admin/publisher" `
-            -Token $token `
-            -RequestId $requestId `
-            -CertificateThumbprint ([string]$config.certificate_thumbprint)
-
-        $releaseName = if ($null -ne $pending) { [string]$pending.release } else { "" }
-        if ([string]::IsNullOrWhiteSpace($releaseName)) {
-            if ($null -eq $pending) {
-                $sessions = @(Get-PublisherSession -TargetIqn ([string]$publisher.target_iqn))
-                if ($sessions.Count -ne 1) {
-                    throw "A new publication requires exactly one connected master session"
-                }
-                $disks = @(Get-PublisherSessionDisks -Session $sessions[0])
-                $matched = @(
-                    Assert-PublisherDisks `
-                        -ExpectedVolumes @($publisher.volumes) `
-                        -Disks $disks
-                )
-                Set-PublisherDisksOffline -Disks $matched
-                Disconnect-IscsiTarget `
-                    -NodeAddress ([string]$publisher.target_iqn) `
-                    -Confirm:$false
-                Save-PendingPublication -Path $StatePath -RequestId $requestId
-            }
-            $staged = Invoke-StageWithRetry `
-                -BaseUrl $baseUrl `
-                -Token $token `
-                -RequestId $requestId `
-                -CertificateThumbprint ([string]$config.certificate_thumbprint)
-            $releaseName = [string]$staged.release
-            Save-PendingPublication -Path $StatePath -RequestId $requestId -Release $releaseName
-        }
-
-        Connect-PublisherTarget -Publisher $publisher -ExpectedVolumes @($publisher.volumes)
-
-        $answer = $script:Confirmation
-        if ([string]::IsNullOrWhiteSpace($answer)) {
-            $answer = Read-Host "Type ACTIVATE $releaseName to activate the staged release"
-        }
-        if ($answer -ne "ACTIVATE $releaseName") {
-            Write-Warning "Release $releaseName remains staged and inactive"
-            return 2
-        }
-
-        $activateRequestId = [Guid]::NewGuid().ToString("D")
-        Invoke-PublisherRequest `
-            -Method POST `
-            -Uri "$baseUrl/v1/admin/releases/$releaseName/activate" `
-            -Token $token `
-            -RequestId $activateRequestId `
-            -CertificateThumbprint ([string]$config.certificate_thumbprint) `
-            -Body @{ confirmation = "ACTIVATE $releaseName" } | Out-Null
-        Remove-Item -LiteralPath $StatePath -Force
-        Write-Host "Release activated: $releaseName"
         return 0
     } catch {
         Write-Warning $_.Exception.Message
@@ -280,8 +250,8 @@ function Invoke-PublisherMain {
 
 if (-not $NoMain) {
     $exitCode = Invoke-PublisherMain `
-        -PublisherConfigPath $ConfigPath `
-        -AdminTokenPath $TokenPath `
+        -RequestedAction $Action `
+        -PublisherManifestPath $ManifestPath `
         -StatePath $PendingPath
     if ($PassThruExitCode) { Write-Output $exitCode } else { exit $exitCode }
 }

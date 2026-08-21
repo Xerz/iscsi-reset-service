@@ -18,16 +18,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from iscsi_reset_service import __version__
+from iscsi_reset_service.backends.base import BackendError
 from iscsi_reset_service.config import dump_config
 from iscsi_reset_service.configurator import (
     MAX_CONFIG_BYTES,
     ConfiguratorError,
-    ConfiguratorRuntime,
+    ManagementRuntime,
 )
+from iscsi_reset_service.errors import ServiceError
+from iscsi_reset_service.management import ManagementInspector
+from iscsi_reset_service.release_store import ReleaseStoreError
 from iscsi_reset_service.security import generate_token, token_digest, verify_token
 
-LOGGER = logging.getLogger("iscsi_reset_service.configurator_api")
-COOKIE_NAME = "iscsi_configurator_session"
+LOGGER = logging.getLogger("iscsi_reset_service.management_api")
+COOKIE_NAME = "iscsi_management_session"
 IDLE_SECONDS = 30 * 60
 MAX_SESSION_SECONDS = 8 * 60 * 60
 MAX_REQUEST_BYTES = MAX_CONFIG_BYTES + 64 * 1024
@@ -54,7 +58,11 @@ class DraftRequest(ApiRequest):
 
 
 class TokenRequest(ApiRequest):
-    kind: Literal["client", "admin"]
+    kind: Literal["client"]
+
+
+class ActivateRequest(ApiRequest):
+    confirmation: str = Field(min_length=1, max_length=160)
 
 
 @dataclass(slots=True)
@@ -93,24 +101,24 @@ class SessionStore:
         self.sessions.pop(session_id, None)
 
 
-def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
+def create_management_app(runtime: ManagementRuntime) -> FastAPI:
     sessions = SessionStore()
     static_dir = Path(__file__).with_name("static")
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         LOGGER.info(
-            "configurator_started version=%s startup_revision=%s",
+            "management_started version=%s startup_revision=%s",
             __version__,
             runtime.repository.startup_revision,
         )
         try:
             yield
         finally:
-            await runtime.backend.close()
+            await runtime.close()
 
     app = FastAPI(
-        title="iSCSI Reset Configurator",
+        title="iSCSI Reset Administration",
         version=__version__,
         docs_url=None,
         redoc_url=None,
@@ -146,16 +154,13 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
                 )
             else:
                 body = await request.body()
-                actual_length = len(body)
                 too_large = (
                     declared_length is not None and declared_length > MAX_REQUEST_BYTES
-                ) or actual_length > MAX_REQUEST_BYTES
+                ) or len(body) > MAX_REQUEST_BYTES
                 if too_large:
                     response = _error_response(
                         request,
-                        ConfiguratorError(
-                            413, "REQUEST_TOO_LARGE", "Request is too large"
-                        ),
+                        ConfiguratorError(413, "REQUEST_TOO_LARGE", "Request is too large"),
                     )
                 else:
                     response = await call_next(request)
@@ -172,16 +177,44 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
         return response
 
     @app.exception_handler(ConfiguratorError)
-    async def configurator_error_handler(
+    async def management_error_handler(
         request: Request, exc: ConfiguratorError
     ) -> JSONResponse:
         LOGGER.warning(
-            "configurator_request_failed request_id=%s code=%s status=%s",
+            "management_request_failed request_id=%s code=%s status=%s",
             request.state.request_id,
             exc.code,
             exc.status_code,
         )
         return _error_response(request, exc)
+
+    @app.exception_handler(ServiceError)
+    async def service_error_handler(request: Request, exc: ServiceError) -> JSONResponse:
+        LOGGER.warning(
+            "management_release_failed request_id=%s code=%s status=%s",
+            request.state.request_id,
+            exc.code,
+            exc.status_code,
+        )
+        return _error_response(
+            request,
+            ConfiguratorError(exc.status_code, exc.code, exc.message),
+        )
+
+    @app.exception_handler(BackendError)
+    @app.exception_handler(ReleaseStoreError)
+    async def dependency_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        LOGGER.exception(
+            "management_dependency_error request_id=%s", request.state.request_id
+        )
+        return _error_response(
+            request,
+            ConfiguratorError(
+                503,
+                "DEPENDENCY_UNAVAILABLE",
+                "A management dependency is unavailable",
+            ),
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -196,7 +229,7 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
         session_id = request.cookies.get(COOKIE_NAME, "")
         session = sessions.get(session_id)
         if session is None:
-            raise ConfiguratorError(401, "UNAUTHORIZED", "Configurator login required")
+            raise ConfiguratorError(401, "UNAUTHORIZED", "Management login required")
         return session
 
     auth_dependency = Depends(authenticated)
@@ -224,10 +257,14 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
             "startup_revision": runtime.repository.startup_revision,
         }
 
-    @app.post("/v1/configurator/session")
+    @app.post("/v1/management/session")
     async def login(body: LoginRequest, response: Response) -> dict[str, object]:
-        if not verify_token(body.token, runtime.login_digest, runtime.admin_pepper):
-            raise ConfiguratorError(401, "UNAUTHORIZED", "Unknown configurator token")
+        if not verify_token(
+            body.token,
+            runtime.login_digest,
+            runtime.management_pepper,
+        ):
+            raise ConfiguratorError(401, "UNAUTHORIZED", "Unknown management token")
         session_id, session = sessions.create()
         response.set_cookie(
             COOKIE_NAME,
@@ -244,7 +281,7 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
             "max_session_seconds": MAX_SESSION_SECONDS,
         }
 
-    @app.delete("/v1/configurator/session")
+    @app.delete("/v1/management/session")
     async def logout(
         request: Request, response: Response, _: Session = csrf
     ) -> Response:
@@ -253,7 +290,7 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
         response.status_code = 204
         return response
 
-    @app.get("/v1/configurator/status")
+    @app.get("/v1/management/status")
     async def status(session: Session = auth) -> dict[str, object]:
         document = runtime.repository.read()
         saved_revision = document.config.revision if document.config else None
@@ -267,17 +304,18 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
             "config_valid": document.config is not None,
             "config_error": document.error,
             "restart_required": runtime.repository.startup_revision != saved_revision,
+            "management_ready": runtime.config is not None,
         }
 
-    @app.get("/v1/configurator/discovery")
+    @app.get("/v1/management/discovery")
     async def discovery(_: Session = auth) -> dict[str, object]:
         return (await runtime.repository.discovery()).as_dict()
 
-    @app.get("/v1/configurator/config")
+    @app.get("/v1/management/config")
     async def get_config(_: Session = auth) -> dict[str, object]:
         return runtime.repository.read().as_dict()
 
-    @app.post("/v1/configurator/config/validate")
+    @app.post("/v1/management/config/validate")
     async def validate_config(body: DraftRequest, _: Session = csrf) -> dict[str, object]:
         result = (
             await runtime.repository.validate_object(body.config)
@@ -286,26 +324,175 @@ def create_configurator_app(runtime: ConfiguratorRuntime) -> FastAPI:
         )
         return result.as_dict()
 
-    @app.put("/v1/configurator/config")
+    @app.put("/v1/management/config")
     async def save_config(body: DraftRequest, _: Session = csrf) -> dict[str, object]:
-        source = body.yaml
-        if body.config is not None:
-            validated = await runtime.repository.validate_object(body.config)
-            source = dump_config(validated.config)
-        return (await runtime.repository.save_yaml(source or "", body.base_revision)).as_dict()
+        if runtime.mutation_lock.locked():
+            raise ConfiguratorError(423, "OPERATION_BUSY", "A management mutation is running")
+        async with runtime.mutation_lock:
+            source = body.yaml
+            if body.config is not None:
+                validated = await runtime.repository.validate_object(body.config)
+                source = dump_config(validated.config)
+            return (
+                await runtime.repository.save_yaml(source or "", body.base_revision)
+            ).as_dict()
 
-    @app.post("/v1/configurator/tokens")
+    @app.post("/v1/management/tokens")
     async def create_token(body: TokenRequest, _: Session = csrf) -> dict[str, str]:
         raw = generate_token()
-        pepper = runtime.client_pepper if body.kind == "client" else runtime.admin_pepper
         return {
             "kind": body.kind,
             "token": raw,
-            "token_digest": token_digest(raw, pepper),
+            "token_digest": token_digest(raw, runtime.client_pepper),
             "warning": "Raw token is shown once and is not retained by the service.",
         }
 
+    @app.get("/v1/management/dashboard")
+    async def dashboard(_: Session = auth) -> dict[str, object]:
+        if runtime.config is None:
+            return _setup_dashboard(runtime)
+        document = runtime.repository.read()
+        saved_revision = document.config.revision if document.config else None
+        inspector = ManagementInspector(
+            runtime.config,
+            runtime.discovery_backend,
+            runtime.store,
+        )
+        return await inspector.dashboard(
+            saved_revision=saved_revision,
+            restart_required=saved_revision != runtime.config.revision,
+        )
+
+    @app.get("/v1/management/releases")
+    async def releases(_: Session = auth) -> dict[str, object]:
+        result = await dashboard()
+        return {
+            "schema_version": 1,
+            "active_release": result.get("active_release"),
+            "all_clients_updated": result.get("all_clients_updated", False),
+            "release_action": result.get("release_action"),
+            "releases": result.get("releases", []),
+        }
+
+    @app.post("/v1/management/releases/stage")
+    async def stage(request: Request, _: Session = csrf) -> dict[str, object]:
+        manager = _require_release_manager(runtime)
+        if runtime.mutation_lock.locked():
+            raise ConfiguratorError(423, "OPERATION_BUSY", "A management mutation is running")
+        async with runtime.mutation_lock:
+            state = await dashboard()
+            action = state["release_action"]
+            if not action["can_stage"]:
+                raise ConfiguratorError(
+                    409,
+                    "RELEASE_NOT_READY",
+                    "; ".join(action["reasons"]) or "Release stage is not ready",
+                )
+            incomplete = next(
+                (item for item in runtime.store.list() if item.status == "incomplete"),
+                None,
+            )
+            request_id = incomplete.request_id if incomplete else request.state.request_id
+            source_ip = request.client.host if request.client else "127.0.0.1"
+            return (await manager.stage(request_id, source_ip)).model_dump()
+
+    @app.post("/v1/management/releases/{release_name}/activate")
+    async def activate(
+        release_name: str,
+        body: ActivateRequest,
+        request: Request,
+        _: Session = csrf,
+    ) -> dict[str, object]:
+        manager = _require_release_manager(runtime)
+        if runtime.mutation_lock.locked():
+            raise ConfiguratorError(423, "OPERATION_BUSY", "A management mutation is running")
+        async with runtime.mutation_lock:
+            state = await dashboard()
+            publisher = state["publisher"]
+            if state["restart_required"]:
+                raise ConfiguratorError(
+                    409, "RESTART_REQUIRED", "Restart Custom App before release operations"
+                )
+            if publisher["connection_status"] != "disconnected":
+                raise ConfiguratorError(
+                    409,
+                    "PUBLISHER_SESSION_ACTIVE",
+                    "Publisher must remain disconnected during activation",
+                )
+            if not publisher["topology_valid"] or not publisher["extents_enabled"]:
+                raise ConfiguratorError(
+                    409, "TOPOLOGY_MISMATCH", "Publisher topology is not ready"
+                )
+            source_ip = request.client.host if request.client else "127.0.0.1"
+            return (
+                await manager.activate(
+                    release_name,
+                    body.confirmation,
+                    request.state.request_id,
+                    source_ip,
+                )
+            ).model_dump()
+
+    @app.get("/v1/management/publisher/manifest")
+    async def publisher_manifest(_: Session = auth) -> JSONResponse:
+        manager = _require_release_manager(runtime)
+        document = runtime.repository.read()
+        saved_revision = document.config.revision if document.config else None
+        if saved_revision != runtime.config.revision:
+            raise ConfiguratorError(
+                409, "RESTART_REQUIRED", "Restart Custom App before exporting manifest"
+            )
+        publisher = await manager.publisher_configuration()
+        content = {
+            "schema_version": 1,
+            "config_revision": runtime.config.revision,
+            "portal": publisher.portal.model_dump(),
+            "target_iqn": publisher.target_iqn,
+            "volumes": [item.model_dump() for item in publisher.volumes],
+        }
+        return JSONResponse(
+            content=content,
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="publisher-{runtime.config.revision}.json"'
+                )
+            },
+        )
+
     return app
+
+
+def _require_release_manager(runtime: ManagementRuntime):
+    if runtime.config is None or runtime.release_manager is None:
+        raise ConfiguratorError(
+            409,
+            "SETUP_REQUIRED",
+            "Save a valid configuration and restart Custom App first",
+        )
+    return runtime.release_manager
+
+
+def _setup_dashboard(runtime: ManagementRuntime) -> dict[str, object]:
+    document = runtime.repository.read()
+    return {
+        "schema_version": 1,
+        "generated_at": None,
+        "startup_revision": None,
+        "saved_revision": document.config.revision if document.config else None,
+        "restart_required": document.config is not None,
+        "active_release": None,
+        "all_clients_updated": False,
+        "publisher": None,
+        "clients": [],
+        "releases": [],
+        "release_action": {
+            "kind": "create",
+            "release": None,
+            "can_stage": False,
+            "reasons": ["save a valid configuration and restart Custom App"],
+        },
+        "setup_required": True,
+    }
 
 
 def _error_response(request: Request, exc: ConfiguratorError) -> JSONResponse:

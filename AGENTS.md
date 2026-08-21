@@ -13,15 +13,14 @@
 1. `README.md` — архитектура, установка и публичные контракты;
 2. `VERIFICATION.md` — что действительно проверено, а что ещё ожидает стенда;
 3. `TEST-PLAN.md` — физические и destructive-проверки;
-4. `MIGRATION-v1-v2.md` — граница поддержки конфигурации;
-5. затрагиваемые модули и соответствующие тесты.
+4. затрагиваемые модули и соответствующие тесты.
 
 Не считайте mock/Compose доказательством работы с реальными TrueNAS, NTFS, сертификатами или
 Windows PowerShell 5.1. Эти границы всегда отражайте в `VERIFICATION.md`.
 
 ## Источники истины
 
-- `config/config.example.yaml` — документированный пример статической schema v2.
+- `config/config.example.yaml` — документированный пример статической schema v3.
 - `src/iscsi_reset_service/config.py` — фактическая схема и все topology-инварианты.
 - `src/iscsi_reset_service/release_store.py` — схема SQLite и транзакционные правила.
 - `src/iscsi_reset_service/release_manager.py` — state machine публикации master release.
@@ -30,7 +29,7 @@ Windows PowerShell 5.1. Эти границы всегда отражайте в
 - `src/iscsi_reset_service/backends/truenas.py` — TrueNAS 25.10 JSON-RPC mapping.
 - `src/iscsi_reset_service/backends/mock.py` — тестовая модель наблюдаемого состояния.
 - `src/iscsi_reset_service/api.py` — reset API; его Windows-контракт стабилен.
-- `src/iscsi_reset_service/admin_api.py` — management/admin API.
+- `src/iscsi_reset_service/configurator_api.py` — loopback-only Management UI/API.
 - `truenas/custom-app.yaml` — production-like deployment topology.
 - `compose.yaml` и `tests/interaction/` — локальный сквозной mock-стенд.
 
@@ -40,7 +39,7 @@ README и примеры должны меняться в том же набор
 
 ### Статическая конфигурация
 
-- Поддерживается только `schema_version: 2`.
+- Поддерживается только `schema_version: 3`; `admin_api` в YAML отсутствует.
 - YAML описывает topology, identities, extents, LUN и volume mapping.
 - В YAML не должны возвращаться `releases`, `active_release` или `release_override`.
 - Ключи `publisher.volumes` произвольны. Никогда не хардкодьте `ssd`, `hdd` или количество
@@ -55,7 +54,7 @@ README и примеры должны меняться в том же набор
 - Releases, `volume → snapshot`, `incomplete/staged`, idempotency, audit и active pointer
   хранятся только в SQLite.
 - Production path по умолчанию: `/state/releases.sqlite3`.
-- Reset role открывает SQLite read-only; admin/CLI — read-write.
+- Reset role открывает SQLite read-only; Management/CLI — read-write.
 - Release mapping после `staged` immutable.
 - Activation меняет только active pointer одной SQLite-транзакцией.
 - Не удаляйте автоматически старые releases, snapshots или clones.
@@ -67,8 +66,8 @@ README и примеры должны меняться в том же набор
 
 - iSCSI portal: `10.20.40.10:3260`.
 - Reset API: SAN IP `10.20.40.10:8443`, client Bearer token + точный SAN source IP.
-- Admin API: только выделенный management IP `:8444`, одновременно mTLS + отдельный admin
-  Bearer token + точный management IP Publisher PC.
+- Management UI/API: только `127.0.0.1:8445` через SSH-туннель, отдельный management token,
+  HttpOnly cookie и CSRF. Отдельного сетевого Admin API для Publisher нет.
 - Не доверяйте `X-Forwarded-For`: сервер запускается с `proxy_headers=False`.
 - `ALLOW_TEST_SOURCE_HEADER` допустим только с mock backend и никогда с TrueNAS backend.
 - Отключение TLS-проверки App → TrueNAS допустимо только при точном подтверждении
@@ -94,7 +93,7 @@ Reset API не сообщает release name, snapshot paths или чужой t
 
 ### Release stage/activate
 
-1. Проверить mTLS на уровне сервера, admin token и source IP.
+1. Проверить management session, CSRF, loopback Host/Origin и отсутствие Publisher session.
 2. Сверить полный publisher target: extent ID, dataset path, LUN, NAA и serial.
 3. До любых mutations потребовать отсутствие publisher session по SAN IP, initiator IQN и
    target IQN.
@@ -121,9 +120,10 @@ reconciliation. Activation требует точную строку `ACTIVATE <r
   partition либо другие provisioning-команды.
 - Client login всегда `IsPersistent=false`.
 - Если ошибка произошла после нового login, отключите только созданную этим запуском session.
-- Publisher при ошибке `stage` не переподключает master target.
-- После успешного `stage` Publisher PC обязан переподключить master target до запроса
-  activation; ошибка reconnect не должна активировать release.
+- Локальный Publisher helper перед `stage` сверяет полный NAA-набор, переводит диски offline и
+  отключает target; helper не имеет API credentials.
+- Activation выполняется при всё ещё отключённом Publisher после полной повторной проверки
+  TrueNAS. Publisher reconnect выполняется локальным helper уже после activation.
 - Секреты не должны попадать в JSONL, exceptions, stdout или audit.
 - На конкретной машине различаются только защищённые token/certificate/config файлы под
   `C:\ProgramData`; сами `.ps1` общие.
@@ -147,7 +147,7 @@ reconciliation. Activation требует точную строку `ACTIVATE <r
 
 ## TrueNAS backend
 
-- Целевая версия API: TrueNAS SCALE 25.10, `wss://127.0.0.1/api/current`.
+- Целевая версия API: TrueNAS SCALE 25.10, `wss://<management-ip>/api/current`.
 - Используйте официальные JSON-RPC методы и точные payloads.
 - При добавлении backend operation сначала расширьте `StorageBackend`, затем TrueNAS и Mock
   реализации, после чего добавьте payload unit test.
@@ -193,7 +193,7 @@ Invoke-Pester .\powershell\tests -Output Detailed -CI
 - Pydantic models и validation;
 - `config/config.example.yaml`;
 - unit, API, state-machine и interaction tests;
-- `README.md` и `MIGRATION-v1-v2.md`;
+- `README.md`;
 - `truenas/custom-app.yaml`, Docker/Compose environment;
 - PowerShell installers и scripts;
 - `TEST-PLAN.md` и `VERIFICATION.md`.
@@ -218,7 +218,7 @@ Reset API контракт с существующим Windows-клиентом 
 - Просмотрите diff и убедитесь, что unrelated пользовательские изменения сохранены.
 - Проверьте отсутствие generated artifacts (`__pycache__`, `.pytest_cache`, local SQLite,
   certificates, tokens) в комплекте. Детерминированные dummy fixtures
-  `tests/interaction/token-pepper` и `tests/interaction/admin-token-pepper` являются частью
+  `tests/interaction/token-pepper` и `tests/interaction/management-token-pepper` являются частью
   mock-suite и не считаются реальными секретами.
 - Выполните релевантный минимальный и сквозной набор тестов.
 - Обновите `VERIFICATION.md` без завышения уровня проверки.
