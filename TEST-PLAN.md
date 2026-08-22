@@ -74,7 +74,10 @@
 6. Выполнить `-Action Reconnect` с тем же manifest revision и pending state. Проверить
    непостоянную session, точный набор NAA, перевод дисков online только после полной сверки и
    удаление pending state.
-7. Повторить Reconnect с другой revision, неверным NAA и неожиданной session. Pending state
+7. Повторить `Reconnect` без зарегистрированного локального объекта master target. Helper
+   должен обновлять точный portal до появления IQN, не требуя ручного Refresh. При искусственном
+   timeout pending state и offline-диски должны сохраниться.
+8. Повторить Reconnect с другой revision, неверным NAA и неожиданной session. Pending state
    должен сохраниться, посторонние диски не меняются.
 
 ## 4. Incomplete release и reconciliation
@@ -115,19 +118,24 @@
    буквы двух client-дисков. Запустить задачу и проверить, что скрипт по NAA распознаёт оба
    диска, снимает конфликтующие access paths только с них, назначает конфигурационные буквы и
    оставляет session подключённой.
-3. Занять одну желаемую букву внешним тестовым диском. Повтор должен завершиться кодом `40`,
+3. На Windows без зарегистрированного `MSFT_iSCSITarget` для client IQN запустить задачу без
+   ручного Refresh в iSCSI Initiator. После `prepared` должны появиться
+   `target_discovery_started`, затем `target_discovered`; скрипт обязан обновить точный portal,
+   дождаться target и подключить его раньше 60-й проверки. Повторный `/v1/prepare` во время
+   ожидания не допускается.
+4. Занять одну желаемую букву внешним тестовым диском. Повтор должен завершиться кодом `40`,
    отключить только созданную session и не менять букву внешнего диска. Проверить этапы и
    сведения о дисках в `C:\ProgramData\IscsiReset\logs\reset.jsonl`.
-4. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
-5. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
+5. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
+6. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
    client marker — исчезнуть после проверенного rollback к `@clean`.
-6. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
+7. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
    clones не должны пересекаться.
-7. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
+8. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
    неполном release mapping, неправильном origin и сбое после mutation.
-8. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
+9. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
    должны сохраниться.
-9. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
+10. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
 ## 7. Один dual-role Publisher/client ПК

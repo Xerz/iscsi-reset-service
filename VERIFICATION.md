@@ -1,5 +1,46 @@
 # Verification record
 
+## Ожидание Windows iSCSI target после `prepare` — 2026-08-23
+
+### Операторские данные реальной Windows и TrueNAS
+
+- На реальном игровом ПК Reset API стал доступен, загрузил client config и завершил `prepare`
+  двух томов. Через 82 мс Windows PowerShell завершился на стадии `connect`: локальный объект
+  `MSFT_iSCSITarget` с ожидаемым `NodeAddress` ещё отсутствовал.
+- После ручного **Refresh** в панели Microsoft iSCSI Initiator target появился. Повторный ручной
+  запуск scheduled task подключил диски, и следующая перезагрузка также завершилась успешно.
+- Это подтверждает server-side prepare и локальную гонку discovery, но ещё не проверяет новое
+  автоматическое ожидание. Реальный token и другие секреты в предоставленном JSONL отсутствовали.
+
+В рабочем дереве client и Publisher helper больше не вызывают `Update-IscsiTarget` для ещё не
+существующего объекта. Они обновляют точный portal через `Update-IscsiTargetPortal`, немедленно
+проверяют ожидаемый IQN и при необходимости выполняют до 59 повторов с интервалом в одну
+секунду. Client не создаёт session и не меняет Windows-диски при timeout; Publisher сохраняет
+pending state и offline-диски.
+
+### Локальные автоматические проверки
+
+- PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — syntax passed для всех
+  `.ps1`.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **63 passed, 0 failed, 1 skipped**.
+  Покрыты немедленное обнаружение, появление target после нескольких refresh, посторонний IQN,
+  временная ошибка portal, ровно 60 проверок/59 ожиданий, client timeout без connect/disk
+  mutations, краткий JSONL и сохранение Publisher pending state. Пропущен только Windows ACL
+  object test.
+- `ruff check .` — passed.
+- `pytest -q --cov=iscsi_reset_service --cov-report=term-missing` на Python 3.12.7 —
+  **133 passed**, total coverage 79%.
+- `docker compose config --quiet` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  passed на локальном arm64 Docker host; оба сервиса сообщили version `0.4.4`, итог —
+  `Interaction suite passed`. После проверки выполнен `docker compose down --volumes`.
+- Локальный release-каталог содержит семь ожидаемых файлов. `sha256sum --check SHA256SUMS` и
+  `docker compose -f <bundle> config --quiet` завершились успешно.
+
+Windows PowerShell 5.1 CI и физический первый запуск без зарегистрированного
+`MSFT_iSCSITarget`, включая автоматический refresh client и Publisher, остаются ожидающими
+проверки. Версия намеренно остаётся `0.4.4`; commit, tag и release в эту проверку не входили.
+
 ## GitHub Release v0.4.4 — 2026-08-22
 
 - Hotfix собран из commits `d72ee30` и `0aaef0e`; аннотированный tag `v0.4.4` указывает на

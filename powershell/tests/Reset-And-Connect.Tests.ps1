@@ -27,6 +27,34 @@ BeforeAll {
             param($DiskNumber, $PartitionNumber, $AccessPath, $Confirm)
         }
     }
+    if ($null -eq (Get-Command Get-IscsiTargetPortal -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Get-IscsiTargetPortal" -Value { }
+    }
+    if ($null -eq (Get-Command New-IscsiTargetPortal -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:New-IscsiTargetPortal" -Value {
+            param($TargetPortalAddress, $TargetPortalPortNumber)
+        }
+    }
+    if ($null -eq (Get-Command Update-IscsiTargetPortal -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Update-IscsiTargetPortal" -Value {
+            param($TargetPortalAddress, $TargetPortalPortNumber)
+        }
+    }
+    if ($null -eq (Get-Command Get-IscsiTarget -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Get-IscsiTarget" -Value { }
+    }
+    if ($null -eq (Get-Command Connect-IscsiTarget -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Connect-IscsiTarget" -Value {
+            param(
+                $NodeAddress,
+                $TargetPortalAddress,
+                $TargetPortalPortNumber,
+                $IsPersistent,
+                $IsMultipathEnabled,
+                $AuthenticationType
+            )
+        }
+    }
 }
 
 Describe "Reset-And-Connect safety helpers" {
@@ -473,6 +501,113 @@ Describe "Prepare retry policy" {
     }
 }
 
+Describe "Windows iSCSI target discovery" {
+    BeforeEach {
+        $script:SimulationStatePath = ""
+        $script:DiscoveryTarget = "iqn.2026-08.lab.games:chimera"
+        $script:DiscoveryPortal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+        $script:DiscoveryQueries = 0
+        $script:DiscoveryRefreshes = 0
+        Mock Write-ResetLog { }
+        Mock Update-IscsiTargetPortal { $script:DiscoveryRefreshes++ }
+        Mock Get-IscsiTarget {
+            $script:DiscoveryQueries++
+            return [pscustomobject]@{ NodeAddress = $script:DiscoveryTarget }
+        }
+        Mock Start-Sleep { }
+        Mock Connect-IscsiTarget { }
+        Mock Set-Disk { }
+    }
+
+    It "returns immediately when the exact target is available" {
+        $target = Wait-ResetTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+            -Portal $script:DiscoveryPortal -RequestId "request-1"
+
+        $target.NodeAddress | Should -Be $script:DiscoveryTarget
+        Should -Invoke Update-IscsiTargetPortal -Times 1 -Exactly -ParameterFilter {
+            $TargetPortalAddress -eq "10.20.40.10" -and $TargetPortalPortNumber -eq 3260
+        }
+        Should -Invoke Get-IscsiTarget -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "target_discovery_started"
+        }
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "target_discovered" -and $Details.attempts -eq 1
+        }
+    }
+
+    It "refreshes once per second until the exact target appears" {
+        Mock Get-IscsiTarget {
+            $script:DiscoveryQueries++
+            if ($script:DiscoveryQueries -lt 3) {
+                return [pscustomobject]@{ NodeAddress = "iqn.2026-08.lab.games:other" }
+            }
+            return @(
+                [pscustomobject]@{ NodeAddress = "iqn.2026-08.lab.games:other" },
+                [pscustomobject]@{ NodeAddress = $script:DiscoveryTarget }
+            )
+        }
+
+        $target = Wait-ResetTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+            -Portal $script:DiscoveryPortal -RequestId "request-2"
+
+        $target.NodeAddress | Should -Be $script:DiscoveryTarget
+        Should -Invoke Update-IscsiTargetPortal -Times 3 -Exactly
+        Should -Invoke Get-IscsiTarget -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 1 }
+        Should -Invoke Write-ResetLog -Times 2 -Exactly
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "target_discovered" -and $Details.attempts -eq 3
+        }
+    }
+
+    It "continues after a transient portal refresh error" {
+        Mock Update-IscsiTargetPortal {
+            $script:DiscoveryRefreshes++
+            if ($script:DiscoveryRefreshes -eq 1) { throw "transient refresh failure" }
+        }
+        Mock Get-IscsiTarget {
+            $script:DiscoveryQueries++
+            if ($script:DiscoveryQueries -lt 2) { return @() }
+            return [pscustomobject]@{ NodeAddress = $script:DiscoveryTarget }
+        }
+
+        $target = Wait-ResetTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+            -Portal $script:DiscoveryPortal -RequestId "request-3"
+
+        $target.NodeAddress | Should -Be $script:DiscoveryTarget
+        Should -Invoke Update-IscsiTargetPortal -Times 2 -Exactly
+        Should -Invoke Get-IscsiTarget -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+    }
+
+    It "times out after exactly sixty checks without connecting or changing disks" {
+        Mock Get-IscsiTarget {
+            return [pscustomobject]@{ NodeAddress = "iqn.2026-08.lab.games:other" }
+        }
+        $failure = $null
+
+        try {
+            Wait-ResetTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+                -Portal $script:DiscoveryPortal -RequestId "request-4"
+        } catch {
+            $failure = $_
+        }
+
+        $failure | Should -Not -BeNullOrEmpty
+        $failure.Exception.Data["Code"] | Should -Be "TARGET_DISCOVERY_TIMEOUT"
+        Should -Invoke Update-IscsiTargetPortal -Times 60 -Exactly
+        Should -Invoke Get-IscsiTarget -Times 60 -Exactly
+        Should -Invoke Start-Sleep -Times 59 -Exactly -ParameterFilter { $Seconds -eq 1 }
+        Should -Invoke Connect-IscsiTarget -Times 0 -Exactly
+        Should -Invoke Set-Disk -Times 0 -Exactly
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "target_discovery_started"
+        }
+    }
+}
+
 Describe "Startup flow failure handling" {
     BeforeEach {
         $script:SimulationStatePath = Join-Path $TestDrive "startup-state.json"
@@ -544,10 +679,12 @@ Describe "Startup flow failure handling" {
         })
         foreach ($event in @(
             "start", "api_ready", "client_configuration_loaded", "prepared",
-            "target_connected", "disk_verified", "ready"
+            "target_discovery_started", "target_discovered", "target_connected",
+            "disk_verified", "ready"
         )) {
             $events | Should -Contain $event
         }
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
         $raw | Should -Not -Match "test-token|Authorization|Bearer"
     }
 
@@ -587,6 +724,46 @@ Describe "Startup flow failure handling" {
 
         $code | Should -Be 20
         @((Read-SimulationState).sessions).Count | Should -Be 0
+    }
+
+    It "logs discovery timeout and does not connect or mutate local disks" {
+        Mock Invoke-ResetRequest {
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+            }
+        }
+        Mock Invoke-PrepareWithRetry {
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "aaa"; drive_letter = "S"; label = "GAMES_SSD" }
+                )
+            }
+        }
+        Mock Wait-ResetTargetDiscovery {
+            throw (New-ApiException -StatusCode 0 -Code "TARGET_DISCOVERY_TIMEOUT" `
+                -Message "target was not discovered")
+        }
+        Mock Connect-ResetTarget { }
+        Mock Mount-ResetVolumes { }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath -TimeoutSeconds 2
+
+        $code | Should -Be 40
+        Should -Invoke Wait-ResetTargetDiscovery -Times 1 -Exactly
+        Should -Invoke Connect-ResetTarget -Times 0 -Exactly
+        Should -Invoke Mount-ResetVolumes -Times 0 -Exactly
+        @((Read-SimulationState).sessions).Count | Should -Be 0
+        $logPath = Join-Path $TestDrive "client.log.jsonl"
+        $raw = Get-Content -LiteralPath $logPath -Raw
+        $events = @(Get-Content -LiteralPath $logPath | ForEach-Object {
+            ($_ | ConvertFrom-Json).event
+        })
+        $events | Should -Contain "TARGET_DISCOVERY_TIMEOUT"
+        $raw | Should -Not -Match "test-token|Authorization|Bearer"
     }
 
     It "disconnects the newly-created session when NAA validation fails" {

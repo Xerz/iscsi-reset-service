@@ -156,12 +156,54 @@ function Ensure-PublisherPortal {
     }
 }
 
+function Wait-PublisherTargetDiscovery {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetIqn,
+        [Parameter(Mandatory = $true)]$Portal,
+        [int]$MaxAttempts = 60,
+        [int]$DelaySeconds = 1
+    )
+    if ($MaxAttempts -lt 1) { throw "MaxAttempts must be at least one" }
+    if ($DelaySeconds -lt 0) { throw "DelaySeconds must not be negative" }
+
+    $lastError = ""
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Update-IscsiTargetPortal `
+                -TargetPortalAddress ([string]$Portal.address) `
+                -TargetPortalPortNumber ([int]$Portal.port) | Out-Null
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+
+        try {
+            $targets = @(Get-IscsiTarget | Where-Object {
+                [string]$_.NodeAddress -eq $TargetIqn
+            })
+            if ($targets.Count -gt 0) { return $targets[0] }
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    $message = "iSCSI target was not discovered after $MaxAttempts attempts: $TargetIqn"
+    if (-not [string]::IsNullOrWhiteSpace($lastError)) {
+        $message += ". Last discovery error: $lastError"
+    }
+    throw $message
+}
+
 function Connect-PublisherTarget {
     param([Parameter(Mandatory = $true)]$Manifest)
-    Ensure-PublisherPortal -Portal $Manifest.portal
-    Update-IscsiTarget -NodeAddress ([string]$Manifest.target_iqn) -ErrorAction SilentlyContinue | Out-Null
     $sessions = @(Get-PublisherSession -TargetIqn ([string]$Manifest.target_iqn))
     if ($sessions.Count -eq 0) {
+        Ensure-PublisherPortal -Portal $Manifest.portal
+        Wait-PublisherTargetDiscovery -TargetIqn ([string]$Manifest.target_iqn) `
+            -Portal $Manifest.portal | Out-Null
         Connect-IscsiTarget `
             -NodeAddress ([string]$Manifest.target_iqn) `
             -TargetPortalAddress ([string]$Manifest.portal.address) `

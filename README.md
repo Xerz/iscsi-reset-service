@@ -677,7 +677,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 `C:\ProgramData\IscsiResetPublisher`, закрывает ACL по SID системной учётной записи и
 встроенной группы администраторов и не сохраняет сетевые учётные данные. После изменения
 конфигурации Publisher скачайте новый `publisher.json` и повторите установку до следующего
-`Disconnect`.
+`Disconnect`. При `Reconnect` скрипт обновляет discovery указанного iSCSI portal и до 60 раз
+с интервалом в одну секунду ждёт появления точного target IQN; существующий точный сеанс не
+переподключается.
 
 ## Установка игрового клиента
 
@@ -712,7 +714,9 @@ Reset API всегда используется по `https://<введённы�
 `C:\ProgramData\IscsiReset` по неизменяемым SID системной учётной записи и встроенной группы
 администраторов, затем импортирует CA, сохраняет токен, включает Microsoft iSCSI Initiator и
 создаёт задачу `iSCSI Reset and Connect` при загрузке. Подключение всегда создаётся с
-`IsPersistent=false`.
+`IsPersistent=false`. После серверной подготовки клонов клиент обновляет discovery точного
+iSCSI portal и проверяет появление своего target IQN до 60 раз с интервалом в одну секунду.
+Первая проверка выполняется сразу; повторный `/v1/prepare` во время ожидания не отправляется.
 
 Локальный журнал задачи находится в
 `C:\ProgramData\IscsiReset\logs\reset.jsonl`. Читать его нужно из повышенной Windows
@@ -863,6 +867,31 @@ session того же ПК блокирует и создание, и актив
 обнаружение основных объектов работает, сначала проверьте эту роль у
 `iscsi-reset-discovery`. Панель сохраняет последнюю картину как устаревшую и блокирует операции
 изменения; окно входа повторно показываться не должно.
+
+### `MSFT_iSCSITarget` с нужным `NodeAddress` не найден
+
+Это означает, что Reset API уже мог подготовить extents, но локальный кэш Microsoft iSCSI
+Initiator ещё не получил target из portal. Готовность HTTPS и сети сама по себе не обновляет
+iSCSI discovery. Текущий клиент после события `prepared` вызывает
+`Update-IscsiTargetPortal`, затем ждёт точный IQN до 60 проверок. В журнале появляются только
+`target_discovery_started` и `target_discovered` либо итоговый
+`TARGET_DISCOVERY_TIMEOUT`, а не строка для каждой попытки.
+
+Проверить состояние вручную можно из повышенной Windows PowerShell:
+
+```powershell
+Get-IscsiTargetPortal |
+  Where-Object {
+    $_.TargetPortalAddress -eq "10.20.40.10" -and
+    $_.TargetPortalPortNumber -eq 3260
+  } |
+  Update-IscsiTargetPortal
+
+Get-IscsiTarget | Select-Object NodeAddress, IsConnected
+```
+
+При timeout код задачи равен `40`: локальный сеанс и изменения Windows-дисков не создаются.
+Исправьте доступность portal или авторизацию точного IQN и безопасно повторите scheduled task.
 
 ### TrueNAS API не доступен по `127.0.0.1`
 

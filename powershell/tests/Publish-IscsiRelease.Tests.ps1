@@ -3,10 +3,15 @@ BeforeAll {
     . $script:PublisherScriptPath -NoMain
     foreach ($name in @(
         "Get-IscsiSession", "Get-IscsiTargetPortal", "New-IscsiTargetPortal",
-        "Disconnect-IscsiTarget", "Update-IscsiTarget"
+        "Get-IscsiTarget", "Disconnect-IscsiTarget"
     )) {
         if ($null -eq (Get-Command $name -ErrorAction SilentlyContinue)) {
             Set-Item -Path "function:$name" -Value { }
+        }
+    }
+    if ($null -eq (Get-Command Update-IscsiTargetPortal -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Update-IscsiTargetPortal" -Value {
+            param($TargetPortalAddress, $TargetPortalPortNumber)
         }
     }
     if ($null -eq (Get-Command Get-Disk -ErrorAction SilentlyContinue)) {
@@ -73,6 +78,70 @@ Describe "Publisher helper safety" {
     }
 }
 
+Describe "Publisher target discovery" {
+    BeforeEach {
+        $script:DiscoveryTarget = "iqn.2026-08.lab.games:master"
+        $script:DiscoveryPortal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+        $script:DiscoveryQueries = 0
+        $script:DiscoveryRefreshes = 0
+        Mock Update-IscsiTargetPortal { $script:DiscoveryRefreshes++ }
+        Mock Get-IscsiTarget {
+            $script:DiscoveryQueries++
+            return [pscustomobject]@{ NodeAddress = $script:DiscoveryTarget }
+        }
+        Mock Start-Sleep { }
+    }
+
+    It "returns immediately when the exact target is available" {
+        $target = Wait-PublisherTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+            -Portal $script:DiscoveryPortal
+
+        $target.NodeAddress | Should -Be $script:DiscoveryTarget
+        Should -Invoke Update-IscsiTargetPortal -Times 1 -Exactly -ParameterFilter {
+            $TargetPortalAddress -eq "10.20.40.10" -and $TargetPortalPortNumber -eq 3260
+        }
+        Should -Invoke Get-IscsiTarget -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It "ignores other targets and tolerates a transient refresh failure" {
+        Mock Update-IscsiTargetPortal {
+            $script:DiscoveryRefreshes++
+            if ($script:DiscoveryRefreshes -eq 1) { throw "transient refresh failure" }
+        }
+        Mock Get-IscsiTarget {
+            $script:DiscoveryQueries++
+            if ($script:DiscoveryQueries -lt 3) {
+                return [pscustomobject]@{ NodeAddress = "iqn.2026-08.lab.games:other" }
+            }
+            return [pscustomobject]@{ NodeAddress = $script:DiscoveryTarget }
+        }
+
+        $target = Wait-PublisherTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+            -Portal $script:DiscoveryPortal
+
+        $target.NodeAddress | Should -Be $script:DiscoveryTarget
+        Should -Invoke Update-IscsiTargetPortal -Times 3 -Exactly
+        Should -Invoke Get-IscsiTarget -Times 3 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 1 }
+    }
+
+    It "times out after exactly sixty checks" {
+        Mock Get-IscsiTarget {
+            return [pscustomobject]@{ NodeAddress = "iqn.2026-08.lab.games:other" }
+        }
+
+        {
+            Wait-PublisherTargetDiscovery -TargetIqn $script:DiscoveryTarget `
+                -Portal $script:DiscoveryPortal
+        } | Should -Throw "*not discovered after 60 attempts*"
+
+        Should -Invoke Update-IscsiTargetPortal -Times 60 -Exactly
+        Should -Invoke Get-IscsiTarget -Times 60 -Exactly
+        Should -Invoke Start-Sleep -Times 59 -Exactly -ParameterFilter { $Seconds -eq 1 }
+    }
+}
+
 Describe "Publisher local disconnect and reconnect" {
     BeforeEach {
         $script:Manifest = [pscustomobject]@{
@@ -128,7 +197,9 @@ Describe "Publisher local disconnect and reconnect" {
         Save-PublisherPending -Path $script:PendingPath -Manifest $script:Manifest
         $script:SessionChecks = 0
         Mock Ensure-PublisherPortal { }
-        Mock Update-IscsiTarget { }
+        Mock Wait-PublisherTargetDiscovery {
+            return [pscustomobject]@{ NodeAddress = $script:Manifest.target_iqn }
+        }
         Mock Connect-IscsiTarget { }
         Mock Get-PublisherSession {
             $script:SessionChecks++
@@ -162,7 +233,7 @@ Describe "Publisher local disconnect and reconnect" {
     It "uses pending state to recover a still-connected partial disconnect" {
         Save-PublisherPending -Path $script:PendingPath -Manifest $script:Manifest
         Mock Ensure-PublisherPortal { }
-        Mock Update-IscsiTarget { }
+        Mock Wait-PublisherTargetDiscovery { throw "discovery should not run" }
         Mock Connect-IscsiTarget { }
         Mock Get-PublisherSession { return @($script:Session) }
         Mock Set-Disk { }
@@ -174,7 +245,27 @@ Describe "Publisher local disconnect and reconnect" {
         Invoke-PublisherReconnect -Manifest $script:Manifest -StatePath $script:PendingPath
 
         Test-Path -LiteralPath $script:PendingPath | Should -BeFalse
+        Should -Invoke Ensure-PublisherPortal -Times 0 -Exactly
+        Should -Invoke Wait-PublisherTargetDiscovery -Times 0 -Exactly
         Should -Invoke Connect-IscsiTarget -Times 0 -Exactly
         Should -Invoke Set-Disk -Times 2 -Exactly -ParameterFilter { $IsOffline -eq $false }
+    }
+
+    It "keeps pending state and offline disks when discovery times out" {
+        Save-PublisherPending -Path $script:PendingPath -Manifest $script:Manifest
+        Mock Ensure-PublisherPortal { }
+        Mock Get-PublisherSession { return @() }
+        Mock Wait-PublisherTargetDiscovery { throw "target discovery timed out" }
+        Mock Connect-IscsiTarget { }
+        Mock Set-Disk { }
+
+        {
+            Invoke-PublisherReconnect -Manifest $script:Manifest -StatePath $script:PendingPath
+        } | Should -Throw "*target discovery timed out*"
+
+        Test-Path -LiteralPath $script:PendingPath | Should -BeTrue
+        @($script:Disks | Where-Object { -not $_.IsOffline }).Count | Should -Be 0
+        Should -Invoke Connect-IscsiTarget -Times 0 -Exactly
+        Should -Invoke Set-Disk -Times 0 -Exactly
     }
 }

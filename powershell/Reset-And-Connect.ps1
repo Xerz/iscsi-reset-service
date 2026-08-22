@@ -185,6 +185,78 @@ function Ensure-ResetPortal {
     }
 }
 
+function Wait-ResetTargetDiscovery {
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetIqn,
+        [Parameter(Mandatory = $true)]$Portal,
+        [Parameter(Mandatory = $true)][string]$RequestId,
+        [int]$MaxAttempts = 60,
+        [int]$DelaySeconds = 1
+    )
+    if ($MaxAttempts -lt 1) { throw "MaxAttempts must be at least one" }
+    if ($DelaySeconds -lt 0) { throw "DelaySeconds must not be negative" }
+
+    $startedAt = [DateTime]::UtcNow
+    Write-ResetProgress -RequestId $RequestId -Event "target_discovery_started" `
+        -Message "Waiting for the exact iSCSI target to appear" -Details @{
+            target_iqn = $TargetIqn
+            portal_address = [string]$Portal.address
+            portal_port = [int]$Portal.port
+            max_attempts = $MaxAttempts
+        }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
+        Write-ResetProgress -RequestId $RequestId -Event "target_discovered" `
+            -Message "The exact iSCSI target is available" -Details @{
+                target_iqn = $TargetIqn
+                attempts = 1
+                elapsed_seconds = 0
+            }
+        return [pscustomobject]@{ NodeAddress = $TargetIqn; Simulation = $true }
+    }
+
+    $lastError = ""
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Update-IscsiTargetPortal `
+                -TargetPortalAddress ([string]$Portal.address) `
+                -TargetPortalPortNumber ([int]$Portal.port) | Out-Null
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+
+        try {
+            $targets = @(Get-IscsiTarget | Where-Object {
+                [string]$_.NodeAddress -eq $TargetIqn
+            })
+            if ($targets.Count -gt 0) {
+                $elapsed = [int][Math]::Floor(
+                    ([DateTime]::UtcNow - $startedAt).TotalSeconds
+                )
+                Write-ResetProgress -RequestId $RequestId -Event "target_discovered" `
+                    -Message "The exact iSCSI target is available" -Details @{
+                        target_iqn = $TargetIqn
+                        attempts = $attempt
+                        elapsed_seconds = $elapsed
+                    }
+                return $targets[0]
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+
+    $message = "iSCSI target was not discovered after $MaxAttempts attempts: $TargetIqn"
+    if (-not [string]::IsNullOrWhiteSpace($lastError)) {
+        $message += ". Last discovery error: $lastError"
+    }
+    throw (New-ApiException -StatusCode 0 -Code "TARGET_DISCOVERY_TIMEOUT" -Message $message)
+}
+
 function Connect-ResetTarget {
     param(
         [Parameter(Mandatory = $true)][string]$TargetIqn,
@@ -198,9 +270,6 @@ function Connect-ResetTarget {
         Save-SimulationState $state
         return [pscustomobject]@{ TargetNodeAddress = $TargetIqn; Simulation = $true }
     }
-    Update-IscsiTarget -NodeAddress $TargetIqn -ErrorAction SilentlyContinue | Out-Null
-    $target = Get-IscsiTarget -NodeAddress $TargetIqn
-    if ($null -eq $target) { throw "iSCSI target was not discovered: $TargetIqn" }
     Connect-IscsiTarget -NodeAddress $TargetIqn `
         -TargetPortalAddress ([string]$Portal.address) `
         -TargetPortalPortNumber ([int]$Portal.port) `
@@ -639,6 +708,8 @@ function Invoke-ResetMain {
             }
         $stage = "connect"
         Ensure-ResetPortal -Portal $prepared.portal
+        Wait-ResetTargetDiscovery -TargetIqn ([string]$prepared.target_iqn) `
+            -Portal $prepared.portal -RequestId $requestId | Out-Null
         $session = Connect-ResetTarget -TargetIqn ([string]$prepared.target_iqn) -Portal $prepared.portal
         $connectedTarget = [string]$prepared.target_iqn
         Write-ResetProgress -RequestId $requestId -Event "target_connected" `
