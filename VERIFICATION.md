@@ -1,5 +1,28 @@
 # Verification record
 
+## GitHub Release v0.4.4 — 2026-08-22
+
+- Hotfix собран из commits `d72ee30` и `0aaef0e`; аннотированный tag `v0.4.4` указывает на
+  `0aaef0e68a56819311e92e570d42cc95eefef93f`.
+- Повторный branch CI run `32588611525` завершился success во всех jobs: Python/JavaScript,
+  Compose interaction и Windows PowerShell 5.1. На Windows Pester 5.7.1 выполнил **55 passed,
+  0 failed, 0 skipped** за 9.11 секунды.
+- Tag publish run `32588787809` завершил validate, повторный полный verification и publish со
+  статусом success; GitHub Release опубликован как
+  `https://github.com/Xerz/iscsi-reset-service/releases/tag/v0.4.4`.
+- Release содержит ровно семь ожидаемых assets: TrueNAS YAML, `image-digest.txt`,
+  `SHA256SUMS` и четыре операторских `.ps1`. Скачанные заново файлы прошли
+  `sha256sum --check SHA256SUMS`.
+- Скачанный workflow artifact `iscsi-reset-service-v0.4.4-truenas` содержит те же семь файлов;
+  каждый файл побайтно совпал с соответствующим GitHub Release asset, повторная checksum
+  verification прошла.
+- Bundle прошёл `docker compose config --quiet`, содержит два одинаковых image reference
+  `ghcr.io/xerz/iscsi-reset-service@sha256:5da535dffc376222d6de1e0bebf818a151b79efbd6351a885c2ccdd0248219e7`,
+  два management-IP placeholder и site-specific пути `/mnt/tank/...`.
+
+Физическая перестановка автоматически назначенных букв на реальном Windows/TrueNAS стенде
+после этого hotfix остаётся ожидающей проверки.
+
 ## Client installer и согласование drive letters v0.4.4 — 2026-08-22
 
 Client installer больше не принимает raw token в аргументах и использует well-known SID для
