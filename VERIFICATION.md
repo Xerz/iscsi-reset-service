@@ -37,9 +37,10 @@ pending state и offline-диски.
 - Локальный release-каталог содержит семь ожидаемых файлов. `sha256sum --check SHA256SUMS` и
   `docker compose -f <bundle> config --quiet` завершились успешно.
 
-Windows PowerShell 5.1 CI и физический первый запуск без зарегистрированного
-`MSFT_iSCSITarget`, включая автоматический refresh client и Publisher, остаются ожидающими
-проверки. Версия намеренно остаётся `0.4.4`; commit, tag и release в эту проверку не входили.
+Физический первый запуск без зарегистрированного `MSFT_iSCSITarget`, включая автоматический
+refresh client и Publisher, остаётся ожидающим проверки. Реализация выпускается как `v0.4.5`;
+по команде оператора локальный gate перед tag повторно не запускался, итогом выпуска считается
+только успешное завершение Python, Compose и Windows PowerShell 5.1 jobs в GitHub Actions.
 
 ## GitHub Release v0.4.4 — 2026-08-22
 
