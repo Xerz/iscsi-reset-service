@@ -25,9 +25,13 @@ SQLite и рабочая логика сервисов не менялись. И
   passed на локальном arm64 Docker host: оба application containers сообщили version `0.4.2`,
   выполнены mock stage→activate и failpoint→retry client prepare, итог —
   `Interaction suite passed`. После прогона выполнен `docker compose down --volumes`.
-- Windows PowerShell 5.1 CI для v0.4.2 ожидает отдельной команды на commit/push/tag. Скрипты в
-  этой версии не менялись; историческая локальная проверка Pester приведена ниже и не заменяет
-  новый Windows CI.
+- GitHub Actions для commit `66917b0` завершились успешно в двух workflow: Python, Compose и
+  Windows PowerShell 5.1/Pester прошли как в `main`, так и перед публикацией tag `v0.4.2`.
+- Опубликованный GitHub Release `v0.4.2` скачан повторно. Он содержит ровно семь assets;
+  `sha256sum --check SHA256SUMS` завершился `OK` для YAML, digest-файла и всех четырёх `.ps1`.
+  Release YAML прошёл `docker compose config --quiet`, содержит два одинаковых image reference
+  `ghcr.io/xerz/iscsi-reset-service@sha256:2cfbb2807bebb91f8cb39524243d94028699a8b59ff653c4a35cbd2afc79ba7f`
+  и два placeholder управляющего IP-адреса. Устаревшие Admin API artifacts отсутствуют.
 
 ### Исторические проверки v0.4.1
 
