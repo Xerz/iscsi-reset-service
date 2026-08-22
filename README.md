@@ -35,30 +35,42 @@ iSCSI Reset Service публикует согласованный набор с�
 
 ```mermaid
 flowchart TB
-    operator["Администратор"]
-    tunnel["SSH-туннель<br/>127.0.0.1:8445"]
-    management["iscsi-reset-management<br/>панель и выпуск"]
-    reset["iscsi-reset-api<br/>HTTPS 10.20.40.10:8443"]
-    config[("config.yaml<br/>и история")]
-    database[("SQLite<br/>releases.sqlite3")]
-    truenas["TrueNAS JSON-RPC<br/>управляющий IP-адрес"]
-    storage["ZFS и iSCSI<br/>снимки, клоны, extent"]
-    publisher["Publisher PC<br/>локальный PowerShell-скрипт"]
-    clients["Игровые ПК<br/>PowerShell клиент"]
+    subgraph pcs["Люди и Windows-ПК"]
+        admin["Администратор<br/>браузер и SSH"]
+        publisher["Publisher PC<br/>master-диски"]
+        client["Игровой ПК<br/>client-клоны"]
+    end
 
-    operator --> tunnel --> management
-    management -->|"чтение и запись"| config
-    management -->|"чтение и запись"| database
-    reset -->|"только чтение"| config
-    reset -->|"только чтение"| database
-    management --> truenas
-    reset --> truenas
-    truenas --> storage
-    publisher <-->|"iSCSI :3260"| storage
-    clients <-->|"iSCSI :3260"| storage
-    clients -->|"Bearer token и точный IP"| reset
-    management -.->|"publisher.json без секретов"| publisher
+    subgraph app["Custom App на TrueNAS"]
+        management["iscsi-reset-management<br/>панель, конфигурация, релизы"]
+        reset["iscsi-reset-api<br/>prepare и reset"]
+        state[("config.yaml + история<br/>releases.sqlite3")]
+    end
+
+    subgraph storage["TrueNAS"]
+        api["JSON-RPC API"]
+        zfs["ZFS<br/>master, снимки, клоны"]
+        iscsi["iSCSI<br/>portal, targets, extents, LUN"]
+    end
+
+    admin -->|"SSH-туннель<br/>127.0.0.1:8445"| management
+    admin -.->|"publisher.json"| publisher
+
+    management -->|"чтение и запись"| state
+    reset -->|"только чтение"| state
+
+    management -->|"поиск объектов<br/>stage и activate"| api
+    reset -->|"prepare и reset"| api
+    api --> zfs
+    api --> iscsi
+
+    publisher <-->|"master target :3260"| iscsi
+    client -->|"HTTPS :8443<br/>token + исходный IP"| reset
+    client <-->|"client target :3260"| iscsi
 ```
+
+Один физический ПК может выполнять роли Publisher и игрового клиента, но master target и
+client target на нём подключаются по очереди.
 
 В Custom App работают ровно два контейнера из одного образа, закреплённого неизменяемым
 идентификатором содержимого (digest):
@@ -77,14 +89,21 @@ Publisher не обращается к API сервиса. Его вспомог
 Имена томов, например `ssd` и `hdd`, — произвольные ключи конфигурации. Количество томов также
 не фиксировано. Для одного ключа связь выглядит так:
 
-```text
-publisher.volumes.ssd.dataset
-        ↓ снимок ZFS при выпуске
-SQLite: release → snapshots.ssd
-        ↓ клон для конкретного клиента
-clients.<client>.volumes.ssd.clone_parent
-        ↓ постоянная запись TrueNAS
-extent ID → target–extent association → LUN → диск Windows по NAA
+```mermaid
+flowchart TB
+    master["Master zvol"]
+    snapshot["Снимок релиза<br/>dataset@release"]
+    mapping[("SQLite mapping<br/>том → снимок")]
+    clone["Клон клиента<br/>origin = снимок релиза"]
+    clean["Снимок @clean<br/>точка отката"]
+    extent["Extent<br/>path, ID, serial, NAA"]
+    target["Target / LUN"]
+    windows["Диск Windows<br/>NAA → буква"]
+
+    master --> snapshot --> mapping --> clone
+    clone --> clean
+    clean -.->|"откат клона"| clone
+    clone --> extent --> target --> windows
 ```
 
 Например, для релиза `games-2026.08.22.1` могут появиться:
@@ -107,32 +126,24 @@ extent, LUN и связь томов. Активный релиз, неизме�
 ### Выпуск релиза
 
 ```mermaid
-flowchart TD
-    disconnect["Publisher: Disconnect<br/>диски offline, цель отключена"]
-    preflight{"Publisher точно отключён,<br/>топология и SQLite исправны?"}
-    reject["Отказ до изменений"]
-    disable["Выключить все эталонные extent<br/>и повторно проверить сеансы"]
-    reserve["Зарезервировать релиз и request ID<br/>состояние incomplete"]
-    snapshots["Создать снимки всех томов<br/>и записать прогресс"]
-    enable["Проверить полный набор<br/>и включить эталонные extent"]
-    staged["Релиз staged<br/>активный релиз не изменён"]
-    confirm{"Введено точное<br/>ACTIVATE имя-релиза?"}
-    activate["Повторная проверка<br/>и атомарная смена active release"]
-    reconnect["Publisher: Reconnect<br/>проверка NAA, диски online"]
-    fail["Безопасный отказ<br/>активный релиз не изменён,<br/>снимки не удалены"]
-    disconnected["Новый релиз active,<br/>Publisher остаётся disconnected"]
+flowchart TB
+    connected["Publisher подключён<br/>обновление master"]
+    disconnected["Publisher отключён"]
+    incomplete["Релиз incomplete"]
+    staged["Релиз staged"]
+    activeDisconnected["Новый релиз active<br/>Publisher отключён"]
 
-    disconnect --> preflight
-    preflight -->|"нет"| reject
-    preflight -->|"да"| disable --> reserve --> snapshots --> enable --> staged --> confirm
-    confirm -->|"нет"| staged
-    confirm -->|"да"| activate --> reconnect
-    disable -. "ошибка" .-> fail
-    reserve -. "ошибка" .-> fail
-    snapshots -. "ошибка" .-> fail
-    enable -. "ошибка" .-> fail
-    activate -. "ошибка после активации" .-> disconnected
-    reconnect -. "ошибка" .-> disconnected
+    connected -->|"Disconnect<br/>NAA проверены, диски offline"| disconnected
+    disconnected -->|"Создать релиз<br/>зарезервировать request ID"| incomplete
+    incomplete -->|"Снимки и mapping проверены"| staged
+    staged -->|"ACTIVATE имя_релиза"| activeDisconnected
+    activeDisconnected -->|"Reconnect<br/>manifest и NAA проверены"| connected
+
+    incomplete -.->|"Ошибка после резервирования"| incompleteResult["Остаётся incomplete<br/>прежний релиз active<br/>снимки сохраняются<br/>master extents выключены"]
+    incompleteResult -->|"«Продолжить»<br/>тот же request ID"| incomplete
+
+    activeDisconnected -.->|"Ошибка Reconnect"| reconnectResult["Остаётся active/disconnected"]
+    reconnectResult -->|"Повторить Reconnect"| activeDisconnected
 ```
 
 Активация выполняется до повторного подключения Publisher. Если `Reconnect` не удался,
@@ -143,32 +154,42 @@ flowchart TD
 ### Запуск игрового клиента
 
 ```mermaid
-flowchart TD
-    boot["Задача Windows при загрузке<br/>POST /v1/prepare"]
-    auth{"Токен, исходный IP,<br/>IQN и цель точны?"}
-    nosession{"Нет совпадающего<br/>сеанса iSCSI?"}
-    disable["Выключить весь набор extent<br/>и снова проверить сеансы"]
-    active["Прочитать активный релиз<br/>только из SQLite"]
-    clones["Создать или проверить клоны,<br/>origin, свойства и @clean"]
-    switch["Переключить пути extent,<br/>сохранив ID, serial и NAA"]
-    rollback["Откатить каждый клон к @clean"]
-    verify["Проверить цель, LUN, пути,<br/>NAA и включить весь набор"]
-    login["Ответ ready и непостоянное<br/>подключение Windows"]
-    reject["Отказ без подключения дисков"]
-    fail["Безопасный отказ<br/>все клиентские extent выключены"]
+sequenceDiagram
+    autonumber
+    participant PC as Игровой ПК
+    participant Reset as Reset API
+    participant DB as SQLite
+    participant TN as TrueNAS
 
-    boot --> auth
-    auth -->|"нет"| reject
-    auth -->|"да"| nosession
-    nosession -->|"нет"| reject
-    nosession -->|"да"| disable --> active --> clones --> switch --> rollback --> verify --> login
-    disable -. "ошибка" .-> fail
-    active -. "ошибка" .-> fail
-    clones -. "ошибка" .-> fail
-    switch -. "ошибка" .-> fail
-    rollback -. "ошибка" .-> fail
-    verify -. "ошибка" .-> fail
+    PC->>Reset: GET /v1/client<br/>token + исходный IP
+    Reset-->>PC: portal, target, LUN, NAA, буквы
+    PC->>Reset: POST /v1/prepare<br/>тот же request ID
+    Reset->>TN: Проверить target, LUN и отсутствие сеанса
+    Reset->>TN: Выключить все extents клиента
+    Reset->>TN: Повторно проверить отсутствие сеанса
+    Reset->>DB: Прочитать mapping активного релиза
+    Reset->>TN: Подготовить клоны и @clean
+    Reset->>TN: Переключить пути extents и выполнить откат
+    Reset->>TN: Проверить target, LUN, NAA и включить extents
+
+    Note over Reset,TN: Ошибка до ready → безопасный отказ<br/>extents клиента остаются выключенными
+
+    Reset-->>PC: ready: portal, target, LUN, NAA, буквы
+    PC->>TN: Непостоянное iSCSI-подключение
+    TN-->>PC: Диски target клиента
+    PC->>PC: Проверить NAA, раздел, label и буквы
+
+    alt Полный набор совпал
+        PC->>PC: Согласовать буквы внутри набора клиента
+    else Локальная проверка завершилась ошибкой
+        PC->>TN: Отключить сеанс этого запуска
+    end
 ```
+
+Reset API возвращает `ready` только после проверки полного набора клонов, путей extent, LUN и
+NAA; ошибка до этого ответа оставляет все extent клиента выключенными. После подключения
+Windows отдельно сверяет полный набор дисков по NAA, единственный раздел данных, label и буквы.
+При ошибке она отключает только сеанс, созданный текущим запуском.
 
 ## Что подготовить заранее
 
