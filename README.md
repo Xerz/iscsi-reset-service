@@ -1,31 +1,219 @@
-# iSCSI Reset Service v0.4.1
+# iSCSI Reset Service v0.4.2
 
-Сервис публикует согласованные ZFS snapshots master iSCSI LUN и перед каждым подключением
-игрового ПК переключает его постоянные extents на writable clones активного release. Все
-опасные операции выполняются fail-closed: при сомнении extents остаются выключенными, а клиент
-не получает `ready`.
+iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
+запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
+компьютер-издатель (`Publisher`) хранит и обновляет эталонные тома. Каждый игровой ПК получает
+собственные клоны и собственную цель iSCSI.
 
-## Архитектура
+Проект рассчитан на TrueNAS SCALE 25.10 и Windows PowerShell 5.1. Он не создаёт автоматически
+пулы, исходные zvol, цели iSCSI, пользователей TrueNAS или сертификаты: эти объекты оператор
+готовит один раз до установки приложения.
 
-В TrueNAS Custom App работают два контейнера из одного digest-pinned image:
+## Гарантии безопасности
 
-- `iscsi-reset-api` — HTTPS Reset API на SAN IP `:8443`, config и SQLite read-only;
-- `iscsi-reset-management` — Administration UI на `127.0.0.1:8445`, config и SQLite read-write.
+Основной принцип — безопасный отказ (`fail-closed`). Если сервис не может однозначно доказать
+состояние всей группы томов, соответствующие extent остаются выключенными, а игровой клиент не
+получает ответ `ready`.
 
-Панель открывается только через SSH-туннель. Отдельного Admin API, порта `8444`, mTLS и
-Publisher API credentials нет. Publisher использует локальный PowerShell helper, который
-проверяет NAA и отключает/подключает master target, но не обращается к сервису по сети.
+- Идентичность каждого компьютера проверяется одновременно по точному IP, IQN и цели iSCSI.
+- Диски Windows сопоставляются только по NAA, а не по номеру, размеру, букве или порядку.
+- Сначала выключается весь набор extent, затем повторно проверяются сеансы iSCSI, и только
+  после этого меняются снимки или пути.
+- Активный релиз и его соответствие томов снимкам хранятся только в SQLite; сервис не угадывает
+  их по имени или времени создания.
+- Частичная ошибка выпуска не переключает активный релиз, не удаляет снимки и оставляет
+  эталонные extent выключенными до согласования состояния.
+- Старые релизы, снимки и клоны никогда не удаляются автоматически.
+- Контейнеры работают от `10001:10001`, с корневой файловой системой только для чтения,
+  `cap_drop: ALL`, `no-new-privileges`, без `privileged`, Docker socket и `/dev/zvol`.
 
-Статическая topology хранится в `config.yaml` schema v3. Releases, immutable
-`volume → snapshot` mappings, incomplete state, active pointer и audit находятся только в
-`/state/releases.sqlite3`.
+## Как устроена система
 
-## Подготовка TrueNAS до установки App
+### Компоненты
 
-### 1. Служебные datasets
+```mermaid
+flowchart TB
+    operator["Администратор"]
+    tunnel["SSH-туннель<br/>127.0.0.1:8445"]
+    management["iscsi-reset-management<br/>панель и выпуск"]
+    reset["iscsi-reset-api<br/>HTTPS 10.20.40.10:8443"]
+    config[("config.yaml<br/>и история")]
+    database[("SQLite<br/>releases.sqlite3")]
+    truenas["TrueNAS JSON-RPC<br/>управляющий IP-адрес"]
+    storage["ZFS и iSCSI<br/>снимки, клоны, extent"]
+    publisher["Publisher PC<br/>локальный PowerShell-скрипт"]
+    clients["Игровые ПК<br/>PowerShell клиент"]
 
-Создайте parent `tank/iscsi-reset`, затем четыре дочерних **Filesystem** datasets без SMB/NFS
-shares:
+    operator --> tunnel --> management
+    management -->|"чтение и запись"| config
+    management -->|"чтение и запись"| database
+    reset -->|"только чтение"| config
+    reset -->|"только чтение"| database
+    management --> truenas
+    reset --> truenas
+    truenas --> storage
+    publisher <-->|"iSCSI :3260"| storage
+    clients <-->|"iSCSI :3260"| storage
+    clients -->|"Bearer token и точный IP"| reset
+    management -.->|"publisher.json без секретов"| publisher
+```
+
+В Custom App работают ровно два контейнера из одного образа, закреплённого неизменяемым
+идентификатором содержимого (digest):
+
+| Контейнер | Назначение | Доступ к данным | Сеть |
+|---|---|---|---|
+| `iscsi-reset-api` | Подготовка клонов игровых ПК | `config` и `state` только для чтения | HTTPS на SAN IP `:8443` |
+| `iscsi-reset-management` | Панель, настройка, наблюдение и выпуск | `config` и `state` для чтения и записи | HTTP только на `127.0.0.1:8445` через SSH-туннель |
+
+Publisher не обращается к API сервиса. Его вспомогательный PowerShell-скрипт локально отключает и подключает
+эталонную цель по скачанному из панели `publisher.json`. В этом файле нет токена, сертификата
+клиента или закрытого ключа.
+
+### Как связаны тома, снимки и клоны
+
+Имена томов, например `ssd` и `hdd`, — произвольные ключи конфигурации. Количество томов также
+не фиксировано. Для одного ключа связь выглядит так:
+
+```text
+publisher.volumes.ssd.dataset
+        ↓ снимок ZFS при выпуске
+SQLite: release → snapshots.ssd
+        ↓ клон для конкретного клиента
+clients.<client>.volumes.ssd.clone_parent
+        ↓ постоянная запись TrueNAS
+extent ID → target–extent association → LUN → диск Windows по NAA
+```
+
+Например, для релиза `games-2026.08.22.1` могут появиться:
+
+```text
+nvme/masters/games-ssd@games-2026.08.22.1
+nvme/clients/chimera/ssd__games-2026.08.22.1
+nvme/clients/chimera/ssd__games-2026.08.22.1@clean
+```
+
+Родительский набор данных для клонов (`clone parent`) — пустой Filesystem dataset, внутри
+которого сервис создаёт клиентские zvol-клоны. Он обязан находиться в том же пуле ZFS, что и
+эталонный zvol соответствующего тома. Клиент может использовать подмножество томов Publisher.
+
+Статический `config.yaml` имеет только `schema_version: 3` и описывает сеть, идентичности,
+extent, LUN и связь томов. Активный релиз, неизменяемое соответствие `volume → snapshot`,
+состояния `incomplete` и `staged`, идентификаторы повторных запросов и журнал операций находятся
+только в `/state/releases.sqlite3`. Конфигурация v2 намеренно отклоняется.
+
+### Выпуск релиза
+
+```mermaid
+flowchart TD
+    disconnect["Publisher: Disconnect<br/>диски offline, цель отключена"]
+    preflight{"Publisher точно отключён,<br/>топология и SQLite исправны?"}
+    reject["Отказ до изменений"]
+    disable["Выключить все эталонные extent<br/>и повторно проверить сеансы"]
+    reserve["Зарезервировать релиз и request ID<br/>состояние incomplete"]
+    snapshots["Создать снимки всех томов<br/>и записать прогресс"]
+    enable["Проверить полный набор<br/>и включить эталонные extent"]
+    staged["Релиз staged<br/>активный релиз не изменён"]
+    confirm{"Введено точное<br/>ACTIVATE имя-релиза?"}
+    activate["Повторная проверка<br/>и атомарная смена active release"]
+    reconnect["Publisher: Reconnect<br/>проверка NAA, диски online"]
+    fail["Безопасный отказ<br/>активный релиз не изменён,<br/>снимки не удалены"]
+    disconnected["Новый релиз active,<br/>Publisher остаётся disconnected"]
+
+    disconnect --> preflight
+    preflight -->|"нет"| reject
+    preflight -->|"да"| disable --> reserve --> snapshots --> enable --> staged --> confirm
+    confirm -->|"нет"| staged
+    confirm -->|"да"| activate --> reconnect
+    disable -. "ошибка" .-> fail
+    reserve -. "ошибка" .-> fail
+    snapshots -. "ошибка" .-> fail
+    enable -. "ошибка" .-> fail
+    activate -. "ошибка после активации" .-> disconnected
+    reconnect -. "ошибка" .-> disconnected
+```
+
+Активация выполняется до повторного подключения Publisher. Если `Reconnect` не удался,
+автоматического отката нет: новый релиз остаётся активным, а панель показывает Publisher как
+`disconnected`. Незавершённый выпуск продолжается тем же сохранённым `request ID`; другой
+идентификатор не может обойти согласование.
+
+### Запуск игрового клиента
+
+```mermaid
+flowchart TD
+    boot["Задача Windows при загрузке<br/>POST /v1/prepare"]
+    auth{"Токен, исходный IP,<br/>IQN и цель точны?"}
+    nosession{"Нет совпадающего<br/>сеанса iSCSI?"}
+    disable["Выключить весь набор extent<br/>и снова проверить сеансы"]
+    active["Прочитать активный релиз<br/>только из SQLite"]
+    clones["Создать или проверить клоны,<br/>origin, свойства и @clean"]
+    switch["Переключить пути extent,<br/>сохранив ID, serial и NAA"]
+    rollback["Откатить каждый клон к @clean"]
+    verify["Проверить цель, LUN, пути,<br/>NAA и включить весь набор"]
+    login["Ответ ready и непостоянное<br/>подключение Windows"]
+    reject["Отказ без подключения дисков"]
+    fail["Безопасный отказ<br/>все клиентские extent выключены"]
+
+    boot --> auth
+    auth -->|"нет"| reject
+    auth -->|"да"| nosession
+    nosession -->|"нет"| reject
+    nosession -->|"да"| disable --> active --> clones --> switch --> rollback --> verify --> login
+    disable -. "ошибка" .-> fail
+    active -. "ошибка" .-> fail
+    clones -. "ошибка" .-> fail
+    switch -. "ошибка" .-> fail
+    rollback -. "ошибка" .-> fail
+    verify -. "ошибка" .-> fail
+```
+
+## Что подготовить заранее
+
+Нужны TrueNAS SCALE 25.10, отдельная SAN для iSCSI, один Publisher PC и хотя бы один игровой
+ПК. На Windows должен быть доступен Windows PowerShell 5.1, а на доверенном компьютере для
+создания собственной PKI — OpenSSL 3.x.
+
+В примерах используются:
+
+| Назначение | Пример |
+|---|---|
+| SAN | `10.20.40.0/24` |
+| iSCSI portal и Reset API | `10.20.40.10` |
+| Publisher | `10.20.40.100` |
+| Игровой ПК `chimera` | `10.20.40.101` |
+| Управляющий IP-адрес TrueNAS | `192.168.3.218` |
+| Служебный пул | `tank` |
+
+Управляющий IP-адрес — адрес интерфейса TrueNAS, доступный middleware API. Это не SAN
+IP Publisher, не NAT/VIP для Publisher и не `127.0.0.1`.
+
+### Таблица топологии
+
+До создания объектов заполните таблицу для каждого логического тома и клиента:
+
+| Поле | Пример |
+|---|---|
+| Ключ тома | `ssd` |
+| Эталонный zvol | `nvme/masters/games-ssd` |
+| Extent ID / LUN Publisher | `10 / 0` |
+| IP / IQN Publisher | `10.20.40.100` / `iqn.1991-05.com.microsoft:publisher` |
+| Клиент | `chimera` |
+| Clone parent | `nvme/clients/chimera` |
+| Extent ID / LUN клиента | `1 / 0` |
+| IP / IQN клиента | `10.20.40.101` / `iqn.1991-05.com.microsoft:chimera` |
+| Буква / метка Windows | `S` / `GAMES_SSD` |
+
+IP, IQN, цель, digest токена и extent ID должны быть глобально уникальными. LUN не должен
+повторяться внутри одной цели, а буква — внутри одного клиента. Полный IQN Windows можно узнать
+командой `Get-InitiatorPort`.
+
+## Первоначальная подготовка TrueNAS
+
+### 1. Служебные наборы данных
+
+В **Datasets → Add Dataset** создайте parent `tank/iscsi-reset`, затем четыре дочерних
+Filesystem datasets без общих ресурсов SMB/NFS:
 
 ```text
 tank/iscsi-reset/config   → /mnt/tank/iscsi-reset/config
@@ -34,14 +222,15 @@ tank/iscsi-reset/secrets  → /mnt/tank/iscsi-reset/secrets
 tank/iscsi-reset/tls      → /mnt/tank/iscsi-reset/tls
 ```
 
-TrueNAS автоматически монтирует обычный dataset под `/mnt/<pool>/<dataset>`. В форме
-**Datasets → Add Dataset** достаточно выбрать `tank/iscsi-reset` как parent, задать имя и тип
-`Generic`; отдельный mountpoint вручную не нужен.
+Подходит обычный dataset с предустановкой `Generic`. TrueNAS сам монтирует его в
+`/mnt/<pool>/<dataset>`; отдельную точку монтирования создавать не нужно. Не создавайте для
+этих наборов данных сетевые общие ресурсы. Если они зашифрованы, разблокируйте их до запуска.
+Каталоги `config` и `state` включите в резервное копирование.
 
-Подготовьте права:
+Назначьте числового владельца контейнеров. Создавать пользователя `10001` в TrueNAS не нужно:
 
 ```bash
-sudo chown -R 10001:10001 /mnt/tank/iscsi-reset/config \
+sudo chown 10001:10001 /mnt/tank/iscsi-reset/config \
   /mnt/tank/iscsi-reset/state \
   /mnt/tank/iscsi-reset/secrets \
   /mnt/tank/iscsi-reset/tls
@@ -51,74 +240,145 @@ sudo chmod 0700 /mnt/tank/iscsi-reset/config \
   /mnt/tank/iscsi-reset/tls
 ```
 
-Не создавайте пустой `config.yaml`: Management UI умеет выполнить первоначальную настройку
-при полном отсутствии файла.
+Не создавайте пустые `config.yaml` и `releases.sqlite3`. Отсутствие обоих файлов является
+нормальным состоянием первой установки. Пустой файл считается повреждённым, а не начальным.
 
-### 2. Master и client datasets
+### 2. Эталонные zvol, родительские наборы клонов и начальные zvol
 
-Для каждого логического volume создайте master zvol. Для каждого клиента и pool создайте
-отдельный Filesystem clone parent. Например:
+Через **Storage → Datasets** подготовьте хранилище:
+
+1. Для каждого тома Publisher создайте эталонный zvol нужного размера, например
+   `nvme/masters/games-ssd`. Промежуточный `nvme/masters` — Filesystem dataset.
+2. Для каждого клиента и каждого используемого пула создайте пустой Filesystem dataset,
+   например `nvme/clients/chimera`. Это clone parent; готовые релизные клоны вручную не
+   создавайте.
+3. В каждом clone parent создайте начальный zvol, например
+   `nvme/clients/chimera/ssd__bootstrap`, того же размера, что эталон. Он нужен только для
+   постоянной записи extent до появления первого клона.
+4. Исключите `*/clients/*` из периодических задач снимков. Сервис сам создаёт точечные снимки
+   `@clean` и не удаляет их автоматически.
+
+Пример:
 
 ```text
-SSDGames/MainGames                         master zvol
-Sas/Games-Device/Older-Games/oldergames    master zvol
-SSDGames/clients/chimera                   clone parent filesystem
-Sas/clients/chimera                        clone parent filesystem
+SSDGames/MainGames                                      VOLUME, master
+Sas/Games-Device/Older-Games/oldergames                 VOLUME, master
+SSDGames/clients/chimera                                FILESYSTEM, clone parent
+SSDGames/clients/chimera/ssd__bootstrap                 VOLUME, bootstrap
+Sas/clients/chimera                                     FILESYSTEM, clone parent
+Sas/clients/chimera/hdd__bootstrap                      VOLUME, bootstrap
 ```
 
-Pool master zvol и соответствующего clone parent обязан совпадать. File extents, locked zvol и
-clone parents другого pool не поддерживаются.
+Эталонный zvol обязан быть `VOLUME`, clone parent — `FILESYSTEM`. Объекты должны иметь
+`locked: false`; `true` и `null` исключаются. Extent типа File и clone parent из другого пула
+не поддерживаются.
 
-### 3. iSCSI topology
+### 3. Portal, группы инициаторов, цели, extent и связи
 
-1. Создайте portal на выделенном SAN IP, например `10.20.40.10:3260`.
-2. Для Publisher создайте отдельные initiator group и target. В initiator group указывается
-   точный IQN. SAN IP Publisher с `/32` задаётся в **Authorized Networks** target group.
-3. Для каждого master zvol создайте Device/DISK extent и target–extent association с
-   фиксированным LUN.
-4. Для каждого игрового ПК создайте отдельные initiator group и target. IQN задаётся в
-   initiator group, IP `/32` — в **Authorized Networks** target group.
-5. Для каждого client volume создайте постоянный Device/DISK extent, первоначально направленный
-   на отдельный bootstrap zvol, и association. После проверки выключите client extent.
+В **Shares → Block Shares (iSCSI)** создайте:
 
-Никогда не переиспользуйте extent record между targets. Service меняет у client extent только
-`disk` и `enabled`; ID, NAA и serial должны оставаться постоянными.
+1. Один portal на выделенном SAN IP, например `10.20.40.10:3260`.
+2. Отдельную initiator group для Publisher с его точным IQN.
+3. Отдельную цель Publisher. В её **Authorized Networks** укажите точный SAN IP Publisher с
+   `/32`, например `10.20.40.100/32`, а в группе цели выберите portal и initiator group.
+4. Для каждого эталонного zvol — отдельный Device/DISK extent и association этой цели с
+   фиксированным LUN. Сохраните ID, NAA и serial.
+5. Для каждого игрового ПК — отдельные initiator group и target. В initiator group указывается
+   только IQN; поля IP там нет. В **Authorized Networks** target укажите IP ПК с `/32`.
+6. Для каждого клиентского тома — отдельный Device/DISK extent на соответствующий
+   `__bootstrap` zvol и association с нужным LUN. После проверки выключите клиентский extent.
 
-Проверьте сохранённую сеть через верхнеуровневое поле target (не внутри `groups`):
+Не переиспользуйте запись extent между целями. Сервис меняет у клиентского extent только `disk`
+и `enabled`; ID, NAA и serial сохраняются. Bootstrap zvol нельзя подключать или форматировать.
+Эталонные zvol можно один раз подключить и наполнить на Publisher после ручной сверки цели и
+NAA.
+
+Проверьте верхнеуровневое поле `target.auth_networks`. Оно не находится внутри `groups` или
+объекта initiator:
 
 ```bash
 midclt call iscsi.target.query '[["name","=","master"]]' |
   jq '.[0] | {id, name, auth_networks, groups}'
 ```
 
-Для Publisher ожидается `auth_networks: ["10.20.40.20/32"]` либо ваш фактический SAN IP с
-`/32`. Поле `groups` отдельно связывает target с portal и initiator group.
+Для примера ожидается `auth_networks: ["10.20.40.100/32"]`. Более широкая сеть `/24` не
+считается точной авторизацией Publisher.
 
-### 4. TrueNAS API credentials
+### 4. Пользователи, роли и API keys
 
-Создайте две непривилегированные local groups/users без sudo, SSH и web shell:
+Панель использует два отдельных ключа TrueNAS:
 
-| Credential | Рекомендуемый пользователь | Roles |
+| Назначение | Пользователь | Минимальные роли |
 |---|---|---|
-| Runtime mutations | `iscsi-reset-service` | `DATASET_READ`, `DATASET_WRITE`, `SNAPSHOT_READ`, `SNAPSHOT_WRITE`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_EXTENT_WRITE`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_TARGETEXTENT_READ` |
-| Management discovery | `iscsi-reset-discovery` | `DATASET_READ`, `SNAPSHOT_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_TARGETEXTENT_READ`, `SHARING_ISCSI_INITIATOR_READ` |
+| Чтение и изменения хранилища | `iscsi-reset-service` | `DATASET_READ`, `DATASET_WRITE`, `SNAPSHOT_READ`, `SNAPSHOT_WRITE`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_EXTENT_WRITE`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_TARGETEXTENT_READ` |
+| Обнаружение объектов (`discovery`) и наблюдение | `iscsi-reset-discovery` | `DATASET_READ`, `SNAPSHOT_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_TARGETEXTENT_READ`, `SHARING_ISCSI_INITIATOR_READ` |
 
-Runtime key используется Reset API и mutation-частью панели; discovery key — только формами и
-dashboard.
+Вторая учётная запись не должна иметь ни одной роли `*_WRITE`. `SNAPSHOT_READ` обязательна:
+без неё формы могут получить основные объекты, но разделы «Обзор» и «Релизы» не смогут
+проверить снимки релиза и клиентские `@clean`.
 
-`SNAPSHOT_READ` обязателен для live dashboard: панель выполняет read-only snapshot queries,
-чтобы проверить существование release snapshots и клиентских `@clean`. Без этой роли базовый
-discovery может работать, но live state вернёт
-`Live state unavailable: A management dependency is unavailable`.
+В TrueNAS 25.10 роли назначаются privilege, связанному с локальной группой. Практический
+порядок:
 
-Сохраните значения keys в:
+1. Создайте локальные группы `iscsi-reset-service` и `iscsi-reset-discovery` без SMB, sudo и
+   доступа к web shell.
+2. Узнайте внутренние `id` групп, не путайте их с Unix GID:
+
+   ```bash
+   midclt call group.query \
+     '[["group","in",["iscsi-reset-service","iscsi-reset-discovery"]]]' \
+     '{"select":["id","gid","group"]}'
+   ```
+
+3. Создайте два privilege, подставив найденные ID:
+
+   ```bash
+   midclt call privilege.create '{
+     "name": "iSCSI Reset service",
+     "local_groups": [REPLACE_SERVICE_GROUP_ID],
+     "ds_groups": [],
+     "roles": [
+       "DATASET_READ", "DATASET_WRITE", "SNAPSHOT_READ", "SNAPSHOT_WRITE",
+       "SHARING_ISCSI_GLOBAL_READ", "SHARING_ISCSI_EXTENT_READ",
+       "SHARING_ISCSI_EXTENT_WRITE", "SHARING_ISCSI_TARGET_READ",
+       "SHARING_ISCSI_TARGETEXTENT_READ"
+     ],
+     "web_shell": false
+   }'
+
+   midclt call privilege.create '{
+     "name": "iSCSI Reset discovery",
+     "local_groups": [REPLACE_DISCOVERY_GROUP_ID],
+     "ds_groups": [],
+     "roles": [
+       "DATASET_READ", "SNAPSHOT_READ", "SHARING_ISCSI_GLOBAL_READ",
+       "SHARING_ISCSI_PORTAL_READ", "SHARING_ISCSI_TARGET_READ",
+       "SHARING_ISCSI_EXTENT_READ", "SHARING_ISCSI_TARGETEXTENT_READ",
+       "SHARING_ISCSI_INITIATOR_READ"
+     ],
+     "web_shell": false
+   }'
+   ```
+
+4. Создайте одноимённых локальных пользователей с `nologin`, без sudo и password login, с
+   соответствующей основной группой.
+5. Для каждого пользователя создайте API key, задайте срок действия по своей политике и сразу
+   сохраните однажды показанное значение.
+
+Сверяйте роли с актуальными разделами официальной документации TrueNAS 25.10:
+[RBAC](https://api.truenas.com/v25.10/rbac.html) и
+[`privilege.create`](https://api.truenas.com/v25.10/api_methods_privilege.create.html).
+Окончательный минимальный набор нужно подтвердить на своей patch-версии по `TEST-PLAN.md`.
+
+Запишите только значения ключей в файлы:
 
 ```text
 /mnt/tank/iscsi-reset/secrets/truenas_api_key
 /mnt/tank/iscsi-reset/secrets/truenas_discovery_api_key
 ```
 
-Не передавайте key аргументом shell-команды. Запишите его через `sudo vi` или stdin, затем:
+Не передавайте ключ в аргументе команды и не оставляйте его в истории shell. Откройте файл
+через `sudo vi`, вставьте значение, сохраните, а затем выполните:
 
 ```bash
 sudo chown 10001:10001 /mnt/tank/iscsi-reset/secrets/truenas_api_key \
@@ -127,17 +387,32 @@ sudo chmod 0400 /mnt/tank/iscsi-reset/secrets/truenas_api_key \
   /mnt/tank/iscsi-reset/secrets/truenas_discovery_api_key
 ```
 
-### 5. Peppers и management token
+### 5. Peppers и токен панели
+
+Pepper — отдельный секрет, добавляемый при вычислении HMAC. Создайте два независимых pepper:
+один участвует в HMAC клиентских токенов, второй — токена панели. Оператору не нужно видеть
+эти значения:
 
 ```bash
 umask 077
-openssl rand -hex 32 > /mnt/tank/iscsi-reset/secrets/token_pepper
-openssl rand -hex 32 > /mnt/tank/iscsi-reset/secrets/management_token_pepper
-sudo chown 10001:10001 /mnt/tank/iscsi-reset/secrets/*
-sudo chmod 0400 /mnt/tank/iscsi-reset/secrets/*
+openssl rand -hex 32 | sudo tee \
+  /mnt/tank/iscsi-reset/secrets/token_pepper >/dev/null
+openssl rand -hex 32 | sudo tee \
+  /mnt/tank/iscsi-reset/secrets/management_token_pepper >/dev/null
+sudo chown 10001:10001 /mnt/tank/iscsi-reset/secrets/token_pepper \
+  /mnt/tank/iscsi-reset/secrets/management_token_pepper
+sudo chmod 0400 /mnt/tank/iscsi-reset/secrets/token_pepper \
+  /mnt/tank/iscsi-reset/secrets/management_token_pepper
 ```
 
-Сгенерируйте management token контейнером опубликованного image:
+Здесь используется `sudo tee`, потому что в команде `sudo openssl ... > file` перенаправление
+`>` выполняет непривилегированная shell и может завершиться `permission denied`.
+
+Если несуществующий файл раньше был указан как bind mount, Docker мог создать на его месте
+каталог. Остановите Custom App, убедитесь, что каталог пуст, удалите именно этот каталог через
+`sudo rmdir <полный-путь>`, а затем создайте обычный файл.
+
+Сгенерируйте пару для входа в панель контейнером опубликованного образа:
 
 ```bash
 docker run --rm --network none --read-only --user 10001:10001 \
@@ -147,158 +422,399 @@ docker run --rm --network none --read-only --user 10001:10001 \
   management-token generate --pepper-file /run/secrets/management_token_pepper
 ```
 
-Сохраните однажды показанный raw token только в password manager. В файл
-`secrets/management_token_digest` поместите только строку `hmac-sha256:...`, затем задайте
-`10001:10001` и `0400`. Raw token не должен попадать в YAML, history, логи или audit.
+Команда один раз выводит исходный токен и `hmac-sha256:...`. Исходный токен сохраните только в
+менеджере паролей. В
+`/mnt/tank/iscsi-reset/secrets/management_token_digest` запишите только digest, затем:
 
-### 6. TLS Reset API
+```bash
+sudo chown 10001:10001 /mnt/tank/iscsi-reset/secrets/management_token_digest
+sudo chmod 0400 /mnt/tank/iscsi-reset/secrets/management_token_digest
+```
 
-App нужны только два TLS-файла:
+Исходные токены нельзя помещать в YAML, shell history, логи, журнал операций или хранилище
+браузера.
+
+### 6. Собственная PKI для Reset API
+
+Приложению нужны только сертификат и закрытый ключ HTTPS-сервера Reset API:
 
 ```text
 /mnt/tank/iscsi-reset/tls/reset-server.crt
 /mnt/tank/iscsi-reset/tls/reset-server.key
 ```
 
-Certificate обязан иметь SAN с IP Reset API, например `IP:10.20.40.10`. Если своей PKI нет,
-на доверенном компьютере с OpenSSL 3.x можно создать отдельный CA и leaf certificate:
+Игровые ПК получают только сертификат удостоверяющего центра `reset-ca.crt`. Закрытый ключ
+удостоверяющего центра нельзя копировать ни на TrueNAS, ни на Windows. Дополнительные
+сертификаты Publisher не нужны.
+
+Если корпоративной PKI нет, выполните команды на доверенном компьютере с OpenSSL 3.x.
+Подставьте SAN IP Reset API, по которому игровые ПК действительно обращаются к сервису:
 
 ```bash
+openssl version
 umask 077
-mkdir iscsi-reset-pki && cd iscsi-reset-pki
+mkdir iscsi-reset-pki
+cd iscsi-reset-pki
+RESET_IP=10.20.40.10
 
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
   -aes-256-cbc -out reset-ca.key
-openssl req -x509 -new -sha256 -days 3650 -key reset-ca.key \
-  -out reset-ca.crt -subj "/CN=iSCSI Reset CA" \
+openssl req -x509 -new -sha256 -days 3650 \
+  -key reset-ca.key -out reset-ca.crt \
+  -subj "/CN=iSCSI Reset CA" \
   -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
   -addext "keyUsage=critical,keyCertSign,cRLSign"
 
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 \
   -out reset-server.key
-openssl req -new -sha256 -key reset-server.key -out reset-server.csr \
-  -subj "/CN=iscsi-reset" \
-  -addext "subjectAltName=IP:10.20.40.10"
-printf '%s\n' \
-  'basicConstraints=critical,CA:FALSE' \
-  'keyUsage=critical,digitalSignature,keyEncipherment' \
-  'extendedKeyUsage=serverAuth' \
-  'subjectAltName=IP:10.20.40.10' > reset-server.ext
-openssl x509 -req -sha256 -days 825 -in reset-server.csr \
+openssl req -new -sha256 \
+  -key reset-server.key -out reset-server.csr \
+  -subj "/CN=iscsi-reset-api" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth" \
+  -addext "subjectAltName=IP:${RESET_IP}"
+openssl x509 -req -sha256 -days 825 \
+  -in reset-server.csr \
   -CA reset-ca.crt -CAkey reset-ca.key -CAcreateserial \
-  -extfile reset-server.ext -out reset-server.crt
+  -copy_extensions copy -out reset-server.crt
 ```
 
-Скопируйте server certificate/key на TrueNAS, а `reset-ca.crt` — на игровые ПК. CA private key
-на TrueNAS или Windows не копируйте.
+Ключ сервера создаётся без пароля, потому что контейнер запускается без участия оператора.
+Поэтому каталог PKI и копия ключа на TrueNAS должны быть доступны только владельцу. Проверьте
+цепочку, назначение и IP:
 
 ```bash
-sudo chown 10001:10001 /mnt/tank/iscsi-reset/tls/*
-sudo chmod 0400 /mnt/tank/iscsi-reset/tls/*
+openssl verify -CAfile reset-ca.crt -purpose sslserver reset-server.crt
+openssl x509 -in reset-server.crt -noout -checkip "$RESET_IP"
+openssl x509 -in reset-server.crt -noout -subject -issuer -dates \
+  -ext subjectAltName,extendedKeyUsage
 ```
 
-## Установка и первоначальная конфигурация
+Передайте `reset-server.crt` и `reset-server.key` на TrueNAS защищённым способом, затем:
 
-1. Возьмите `truenas/custom-app.yaml` либо release bundle.
-2. Замените immutable image placeholder, все `/mnt/tank/...` paths и
-   `REPLACE_WITH_TRUENAS_MANAGEMENT_IP`. Это локальный management IP TrueNAS, например
-   `192.168.3.218`, а не NAT/VIP Publisher.
-3. Проверьте `docker compose -f <bundle> config --quiet`.
-4. Установите YAML через **Apps → Discover Apps → Custom App**.
+```bash
+sudo chown 10001:10001 /mnt/tank/iscsi-reset/tls/reset-server.crt \
+  /mnt/tank/iscsi-reset/tls/reset-server.key
+sudo chmod 0400 /mnt/tank/iscsi-reset/tls/reset-server.crt \
+  /mnt/tank/iscsi-reset/tls/reset-server.key
+```
 
-Management server внутри контейнера слушает `127.0.0.1:8445`, поэтому обычный `curl` на вашем
-компьютере без туннеля не сработает. В настройках SSH TrueNAS включите **Allow TCP Port
-Forwarding**, затем на рабочем компьютере:
+## Скачивание комплекта выпуска
+
+GitHub Release содержит ровно семь самостоятельных файлов:
+
+| Файл | Назначение |
+|---|---|
+| `iscsi-reset-service-vX.Y.Z-truenas.yaml` | Custom App с закреплённым digest образа |
+| `image-digest.txt` | Полная ссылка на опубликованный образ |
+| `SHA256SUMS` | Контрольные суммы остальных шести файлов |
+| `Install-IscsiReleasePublisher.ps1` | Установщик вспомогательного скрипта Publisher |
+| `Publish-IscsiRelease.ps1` | Локальное отключение и подключение Publisher |
+| `Install-IscsiResetClient.ps1` | Установщик игрового клиента |
+| `Reset-And-Connect.ps1` | Подготовка и непостоянное подключение игрового ПК |
+
+`publisher.json` не входит в выпуск: он привязан к редакции конкретной установки и скачивается
+из панели управления.
+
+Скачайте все семь файлов в один каталог и обязательно проверьте контрольные суммы до запуска
+YAML или PowerShell:
+
+```bash
+sha256sum --check SHA256SUMS
+```
+
+На macOS с системной утилитой `shasum`:
+
+```bash
+shasum -a 256 -c SHA256SUMS
+```
+
+Каждая из шести строк должна завершиться `OK`. Дополнительно убедитесь, что содержимое
+`image-digest.txt` совпадает с двумя полями `image:` в YAML.
+
+## Установка Custom App
+
+1. Откройте скачанный `iscsi-reset-service-vX.Y.Z-truenas.yaml`.
+2. Замените каждый путь `/mnt/tank/...` на подготовленные пути своей системы.
+3. Замените оба `REPLACE_WITH_TRUENAS_MANAGEMENT_IP` на назначенный управляющий IP-адрес TrueNAS,
+   например `192.168.3.218`. Не используйте `127.0.0.1`: внутри контейнера это сам контейнер,
+   а не TrueNAS middleware.
+4. Если SAN IP Reset API отличается от примера, замените `BIND_HOST` и проверьте SAN
+   сертификата.
+5. Проверьте YAML:
+
+   ```bash
+   docker compose -f iscsi-reset-service-vX.Y.Z-truenas.yaml config --quiet
+   ```
+
+6. В TrueNAS откройте **Apps → Discover Apps → Custom App**, выберите установку через YAML и
+   вставьте подготовленный файл.
+7. После старта убедитесь, что работают ровно два контейнера и панель не опубликована на
+   внешнем интерфейсе.
+
+Временное отключение проверки TLS между контейнером и TrueNAS разрешено шаблоном только вместе
+с `TRUENAS_TLS_INSECURE_ACK=I_ACCEPT_MITM_RISK`. Этот параметр явно признаёт риск перехвата;
+предпочтительно установить доверенную цепочку TrueNAS и включить проверку.
+
+## Первоначальная настройка через панель
+
+### SSH-туннель
+
+В **System → Services → SSH → Edit** включите **Allow TCP Port Forwarding**. Ограничьте SSH
+доверенными пользователями и ключами. На рабочем компьютере откройте туннель:
 
 ```bash
 ssh -N -L 8445:127.0.0.1:8445 <user>@<truenas-management-ip>
 ```
 
-Откройте `http://127.0.0.1:8445`, войдите management token и заполните «Сеть», «Publisher» и
-«Клиенты» только объектами из discovery. После сохранения `config.yaml` перезапустите весь
-Custom App. Hot reload и автоматического redeploy нет.
+Команда остаётся запущенной и обычно ничего не выводит. В другом терминале проверьте:
 
-Management-контейнер создаст `/state/releases.sqlite3` после старта с валидным config. Reset
-`/readyz` до первого active release закономерно возвращает `503`.
+```bash
+curl http://127.0.0.1:8445/healthz
+```
 
-## Administration dashboard
+Затем откройте `http://127.0.0.1:8445` и войдите исходным токеном панели. Digest из файла
+для входа не подходит. Сессия хранится в `HttpOnly`/`SameSite=Strict` cookie, простаивает не
+дольше 30 минут и в любом случае завершается через 8 часов.
 
-«Обзор» показывает Publisher и каждый клиент отдельно:
+Если SSH сообщает `administratively prohibited: open failed`, настройка TCP forwarding не
+включена либо старое SSH-соединение ещё не подхватило её. Сохраните настройку, при необходимости
+перезапустите SSH и откройте новое соединение.
 
-- `connected/disconnected/identity conflict` вычисляется из live TrueNAS sessions;
-- `mapped release` проверяется по extent path, ZFS origin, managed properties и `@clean`;
-- `updated` означает, что все volumes клиента mapped на active release;
-- connection status не подменяет version status.
+### Конфигурация v3
 
-«Релизы» показывает snapshots, mapped clients и managed clone dependencies. Неактивный release
-помечается «не используется mappings» только после обновления всех настроенных клиентов. Это
-кандидат для ручной проверки, а не разрешение на удаление. Service не содержит delete API и
-никогда автоматически не удаляет releases, snapshots или clones.
+Панель содержит разделы «Обзор», «Релизы», «Сеть», «Publisher», «Клиенты» и «YAML». Обнаружение
+объектов (`discovery`) использует отдельный ключ только для чтения. Portal, target, extent, LUN,
+эталонный dataset и clone parent выбираются из фактически найденных объектов TrueNAS.
 
-## Publisher PC
+Полный документированный образец находится в
+[`config/config.example.yaml`](config/config.example.yaml). Основные поля имеют такой смысл:
 
-После сохранения config и restart скачайте на «Обзоре» revision-pinned `publisher.json` и
-перенесите его на Publisher. В elevated Windows PowerShell 5.1:
+- `allowed_source_cidr` задаёт общую допустимую SAN, но не заменяет точные `/32` в
+  `target.auth_networks`;
+- `portal` содержит адрес и порт iSCSI;
+- `release_management.prefix` образует начало имени вида `games-YYYY.MM.DD.N`, а `timezone`
+  определяет календарную дату;
+- `publisher.volumes` связывает произвольный ключ тома с эталонным dataset, extent ID и LUN;
+- `clients` хранит точные IP/IQN/target, HMAC digest токена и параметры каждого тома;
+- `clone_parent` может быть общим для клиента или задан отдельно на томе; отдельное значение
+  необходимо, когда тома находятся в разных пулах.
+
+1. В «Сеть» задайте общую SAN, portal, префикс релиза и часовой пояс.
+2. В «Publisher» выберите точные target, initiator IQN и эталонные тома.
+3. В «Клиенты» добавьте каждый ПК, его IP/IQN/target, тома, буквы и метки.
+4. Для каждого клиента сгенерируйте исходный client token. Скопируйте его сразу: в YAML сохраняется
+   только HMAC digest, а исходное значение повторно не показывается.
+5. Нажмите проверку, исправьте все ошибки и сохраните конфигурацию.
+6. После записи сравните `saved revision` и `startup revision`, затем обязательно перезапустите
+   весь Custom App. Горячей перезагрузки и автоматического redeploy нет.
+
+Формы и редактор YAML используют одну черновую модель. YAML загружается безопасным
+разборщиком с запретом повторяющихся ключей и после проверки сериализуется канонически;
+комментарии и исходное форматирование не сохраняются. Сохранение защищено `base_revision`,
+файловой блокировкой, копией в `/config/history`, `fsync`, режимом `0600` и атомарной заменой.
+
+После первого запуска с валидным конфигом панель создаёт `/state/releases.sqlite3`.
+Отсутствие SQLite разрешено только при первой установке без валидного текущего конфига. До
+первой активации `GET /readyz` Reset API закономерно возвращает `503`.
+
+## Установка вспомогательного скрипта Publisher
+
+Скачайте из GitHub Release оба файла Publisher:
+
+```text
+Install-IscsiReleasePublisher.ps1
+Publish-IscsiRelease.ps1
+```
+
+После сохранения конфига и перезапуска App скачайте из панели актуальный `publisher.json`.
+Перенесите три файла на Publisher и в повышенной Windows PowerShell 5.1 выполните:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process Bypass
 ./Install-IscsiReleasePublisher.ps1 -ManifestSourcePath ./publisher.json
 ```
 
-Перед созданием release:
+Установщик копирует `publisher.json` и вспомогательный скрипт в
+`C:\ProgramData\IscsiResetPublisher`, закрывает ACL для `SYSTEM` и `Administrators` и не
+сохраняет сетевые учётные данные. После изменения
+конфигурации Publisher скачайте новый `publisher.json` и повторите установку до следующего
+`Disconnect`.
 
-```powershell
-C:\ProgramData\IscsiResetPublisher\Publish-IscsiRelease.ps1 -Action Disconnect
+## Установка игрового клиента
+
+Для игрового ПК скачайте из GitHub Release:
+
+```text
+Install-IscsiResetClient.ps1
+Reset-And-Connect.ps1
 ```
 
-Helper требует ровно одну master session, сверяет полный набор дисков по NAA, сохраняет pending
-state, переводит доказанные диски offline и отключает target. После исчезновения Publisher
-session панель разрешит «Создать релиз».
-
-Stage создаёт snapshots и оставляет release staged. Проверьте строку release и введите точное
-`ACTIVATE <release>`. Activation повторно проверяет snapshots, target/LUN, extents и отсутствие
-Publisher session, затем атомарно меняет active pointer.
-
-После activation:
+Скопируйте на него также `reset-ca.crt` и однажды показанный исходный client token этого ПК.
+В повышенной Windows PowerShell 5.1:
 
 ```powershell
-C:\ProgramData\IscsiResetPublisher\Publish-IscsiRelease.ps1 -Action Reconnect
-```
-
-Helper подключает target с `IsPersistent=false`, проверяет весь NAA-набор и только затем
-переводит диски online. Он не содержит API URL, token, PFX или client certificate.
-
-Если `Disconnect` завершился ошибкой после записи pending state, сначала устраните причину и
-выполните `-Action Reconnect` с тем же manifest. Helper сверит revision/NAA, вернёт только
-доказанные диски online и удалит pending state лишь после полной проверки.
-
-При incomplete release панель предлагает «Продолжить» и повторно использует исходный request
-ID. Частичная ошибка не меняет active release и оставляет master extents выключенными.
-
-## Игровые ПК
-
-Reset-клиент и его API-контракт не изменены:
-
-```powershell
+Set-ExecutionPolicy -Scope Process Bypass
 ./Install-IscsiResetClient.ps1 \
-  -ClientToken "<RAW_CLIENT_TOKEN>" \
-  -CaCertificatePath ./reset-ca.crt
+  -Token "<RAW_CLIENT_TOKEN>" \
+  -CaCertificatePath ./reset-ca.crt \
+  -ApiBaseUrl "https://10.20.40.10:8443"
 ```
 
-Клиент получает только portal, собственный target и
-`{lun, disk_unique_id, drive_letter, label}`. Release name, snapshot paths и чужие targets ему
-не выдаются. Login всегда `IsPersistent=false`. Скрипт не выполняет provisioning-команды и при
-ошибке отключает только session, созданную текущим запуском.
+Установщик импортирует CA, сохраняет токен с ACL только для `SYSTEM` и `Administrators`,
+включает Microsoft iSCSI Initiator и создаёт задачу `iSCSI Reset and Connect` при загрузке.
+Подключение всегда создаётся с `IsPersistent=false`.
+
+Reset API возвращает только portal, собственную цель клиента и набор
+`{lun, disk_unique_id, drive_letter, label}`. Имя релиза, пути снимков и чужие цели клиенту не
+выдаются. Скрипт не использует `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, удаление
+разделов или другие команды подготовки диска.
+
+## Ежедневная эксплуатация
+
+### Выпуск и активация
+
+1. На Publisher обновите эталонные диски и завершите все записи.
+2. Выполните:
+
+   ```powershell
+   C:\ProgramData\IscsiResetPublisher\Publish-IscsiRelease.ps1 -Action Disconnect
+   ```
+
+   Вспомогательный скрипт требует ровно один ожидаемый сеанс, сверяет полный набор дисков по
+   NAA, атомарно пишет локальное состояние ожидания, переводит только доказанные диски
+   `offline` и отключает цель.
+3. В панели обновите «Обзор». Publisher должен быть `disconnected`, а не `identity conflict`.
+4. В «Релизы» нажмите «Создать релиз». Панель повторно проверит редакцию конфигурации, SQLite,
+   топологию, отсутствие совпадающих сеансов и создаст согласованный набор снимков.
+5. После `staged` введите точное `ACTIVATE <release>` и активируйте релиз, пока Publisher всё
+   ещё отключён.
+6. На Publisher выполните:
+
+   ```powershell
+   C:\ProgramData\IscsiResetPublisher\Publish-IscsiRelease.ps1 -Action Reconnect
+   ```
+
+   Вспомогательный скрипт требует ту же редакцию и локальное состояние ожидания, подключает
+   непостоянный сеанс, сверяет полный NAA-набор и только после этого переводит диски `online`.
+
+### Обновление клиентов и старые релизы
+
+При следующей загрузке каждый игровой ПК переключится на активный релиз и откатит свой клон к
+`@clean`. В «Обзор» подключение отображается отдельно от версии:
+
+- `connected` означает точное совпадение сеанса по IP, IQN и цели;
+- `identity conflict` означает частичное совпадение и требует ручной проверки;
+- `active` означает, что все тома клиента доказанно указывают на активный релиз;
+- `outdated`, `partial` и `unprepared` описывают состояние томов независимо от подключения.
+
+Панель помечает старый релиз «кандидат для ручной очистки» только если все настроенные клиенты
+полностью перешли на активный релиз, старый релиз не `active` и не `incomplete`, а текущие
+клиентские extent на него не указывают. Отдельно показывается число зависимых клонов. Это не
+гарантия безопасного удаления: delete API и кнопки удаления отсутствуют.
+
+### Восстановление незавершённой операции
+
+Если создание снимка прервалось, релиз остаётся `incomplete`, прежний активный релиз не
+меняется, созданные снимки сохраняются, а эталонные extent остаются выключенными. Не создавайте
+новый выпуск и ничего не удаляйте вручную. Устраните причину и нажмите «Продолжить»: панель
+повторно использует сохранённый `request ID` и согласует уже созданные объекты.
+
+Если `Disconnect` остановился после записи локального состояния ожидания, устраните причину и
+выполните `-Action Reconnect` с тем же `publisher.json`. Скрипт удалит состояние ожидания только
+после полной проверки. Если активация прошла, но `Reconnect` не удался, релиз остаётся активным;
+исправьте проблему Publisher и повторите `Reconnect`, не откатывая активный релиз автоматически.
+
+## Диагностика
+
+### `Discovery unavailable`
+
+Проверьте файл `/run/secrets/truenas_discovery_api_key` внутри контейнера панели, имя
+`TRUENAS_DISCOVERY_API_USERNAME`, срок действия ключа, роли и URL API. Успешный вход в панель
+не доказывает доступность TrueNAS. После исправления нажмите повторное обновление; до успешного
+обнаружения проверка, сохранение и выпуск заблокированы.
+
+### `Live state unavailable: A management dependency is unavailable`
+
+Обычно недоступны SQLite, запросы снимков TrueNAS или не хватает `SNAPSHOT_READ`. Если
+обнаружение основных объектов работает, сначала проверьте эту роль у
+`iscsi-reset-discovery`. Панель сохраняет последнюю картину как устаревшую и блокирует операции
+изменения; окно входа повторно показываться не должно.
+
+### TrueNAS API не доступен по `127.0.0.1`
+
+Внутри контейнера `127.0.0.1` указывает на контейнер. В обоих `TRUENAS_API_URL` используйте
+назначенный интерфейсу управляющий IP-адрес TrueNAS:
+
+```text
+wss://192.168.3.218/api/current
+```
+
+Не пытайтесь добавлять `127.0.0.1` в `system.general.ui_address`: TrueNAS отклоняет адрес, не
+назначенный машине. Это также не адрес NAT, по которому Publisher обращается к другим сервисам.
+
+### `publisher target does not authorize the exact source IP /32`
+
+Проверьте `publisher.source_ip` и верхнеуровневый `auth_networks` цели. Для IP
+`10.20.40.100` требуется точная запись `10.20.40.100/32`; общая
+`allowed_source_cidr: 10.20.40.0/24` не заменяет авторизацию цели. Используйте запрос из
+раздела подготовки iSCSI.
+
+### Эталонный zvol отклоняется или список clone parent пуст
+
+Проверьте тип и вычисленное поле `locked` запросом с `properties:["keystatus"]`:
+
+```bash
+midclt call pool.dataset.query \
+  '[["id","in",[
+    "SSDGames/MainGames",
+    "Sas/Games-Device/Older-Games/oldergames",
+    "SSDGames/clients/chimera",
+    "Sas/clients/chimera"
+  ]]]' \
+  '{"extra":{
+    "flat":true,
+    "retrieve_children":false,
+    "properties":["keystatus"],
+    "retrieve_user_props":false
+  }}' |
+  jq 'map({id, type, locked, keystatus})'
+```
+
+Эталонные zvol должны быть `VOLUME` и `locked: false`; clone parents — `FILESYSTEM` и
+`locked: false`. Значения `locked: true` и `locked: null` исключаются. Для тома из пула
+`SSDGames` предлагаются clone parents только из `SSDGames`, для тома из `Sas` — только из
+`Sas`.
+
+### Ошибки прав на `secrets`, `config` или `state`
+
+Проверьте, что host paths являются файлами или каталогами ожидаемого типа, а владелец каталогов
+— `10001:10001` с режимом `0700`. Файлы ключей, peppers, digest и TLS должны принадлежать
+`10001:10001` и иметь `0400`. Панель создаёт `config.yaml`, историю и SQLite сама; каталогам
+нужна запись для UID `10001`.
+
+При повреждённой или недоступной SQLite сохранение и операции выпуска запрещены. Не создавайте
+пустую базу вручную и не удаляйте существующую для обхода ошибки. Сначала сохраните её копию и
+исследуйте причину.
+
+### `curl 127.0.0.1:8445` не подключается
+
+Проверяйте адрес на компьютере, где открыт SSH-туннель. В логе контейнера строка
+`Uvicorn running on http://127.0.0.1:8445` означает ожидаемый loopback bind в сетевом
+пространстве host TrueNAS. Если туннель не создаётся, включите **Allow TCP Port Forwarding** и
+откройте новую SSH-сессию.
 
 ## API и CLI
 
-Reset API `https://<SAN-IP>:8443`:
+Reset API на `https://<SAN-IP>:8443`:
 
-- `GET /healthz`, `GET /readyz`;
+- `GET /healthz` и `GET /readyz`;
 - `GET /v1/client`;
 - `POST /v1/validate`;
 - `POST /v1/prepare`.
 
-Same-origin Management API доступен только после SSH tunnel и cookie login:
+Same-origin Management API доступен после входа через SSH-туннель:
 
 - `POST/DELETE /v1/management/session`;
 - `GET /v1/management/status`, `/discovery`, `/config`, `/dashboard`, `/releases`;
@@ -309,34 +825,65 @@ Same-origin Management API доступен только после SSH tunnel �
 - `POST /v1/management/releases/{release}/activate`;
 - `GET /v1/management/publisher/manifest`.
 
-CLI:
+Основные команды CLI:
 
 ```text
 serve-reset
 serve-management
-config validate
-token generate <client>
-management-token generate
-releases validate|audit|list
+config validate --path /config/config.yaml
+token generate <client> --config /config/config.yaml --pepper-file <path>
+management-token generate --pepper-file <path>
+releases validate
+releases audit
+releases list
 ```
 
-## Проверка разработки
+Сервер не доверяет `X-Forwarded-For`; `proxy_headers=False`. Тестовый заголовок исходного IP
+разрешён только с mock backend и не может включаться с TrueNAS.
+
+## Разработка и проверка
+
+Минимальная локальная проверка:
 
 ```bash
 python -m pip install -e '.[test]'
 ruff check src tests
 pytest -q
 docker compose config --quiet
+```
+
+Полный сквозной стенд с mock TrueNAS:
+
+```bash
 docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation
 docker compose down --volumes
 ```
 
-На Windows PowerShell 5.1:
+Проверка PowerShell на Windows PowerShell 5.1:
 
 ```powershell
 Invoke-Pester .\powershell\tests -Output Detailed -CI
 ```
 
-Mock/Compose не доказывают работу реального TrueNAS, NTFS, certificates или Windows
-PowerShell 5.1. Физические проверки перечислены в `TEST-PLAN.md`, фактически выполненное — в
-`VERIFICATION.md`.
+Mock и Compose не доказывают работу с реальным TrueNAS, NTFS, сертификатами или Windows
+PowerShell 5.1. Физические и потенциально разрушительные проверки выполняются только на
+выделенных тестовых zvol по [TEST-PLAN.md](TEST-PLAN.md). Фактически выполненные проверки и
+оставшиеся границы перечислены в [VERIFICATION.md](VERIFICATION.md).
+
+## Выпуск версии
+
+Версия должна совпадать в `pyproject.toml` и `src/iscsi_reset_service/__init__.py`. После полного
+набора проверок создаётся аннотированный tag `vX.Y.Z`; процесс GitHub Actions собирает один
+образ, закрепляет его digest в двух сервисах YAML и публикует семь файлов. До установки комплект снова
+проверяется по `SHA256SUMS`.
+
+Порядок выпуска:
+
+```bash
+git tag -a vX.Y.Z -m "iSCSI Reset Service vX.Y.Z"
+git push origin main
+git push origin vX.Y.Z
+```
+
+После завершения CI скачайте опубликованные файлы, повторите проверку контрольных сумм и
+убедитесь в двух одинаковых `image:` с digest и отсутствии компонентов прежней архитектуры.

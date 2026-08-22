@@ -1,3 +1,5 @@
+import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,13 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_PATH = ROOT / "truenas" / "custom-app.yaml"
 VALID_DIGEST = f"sha256:{'a' * 64}"
 IMAGE_REPOSITORY = "ghcr.io/xerz/iscsi-reset-service"
+PUBLISH_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "publish.yml"
+OPERATOR_SCRIPTS = (
+    "Install-IscsiReleasePublisher.ps1",
+    "Install-IscsiResetClient.ps1",
+    "Publish-IscsiRelease.ps1",
+    "Reset-And-Connect.ps1",
+)
 
 
 def test_render_bundle_pins_all_services_and_preserves_site_placeholders() -> None:
@@ -85,3 +94,51 @@ def test_render_bundle_rejects_unexpected_placeholder_count() -> None:
             image_repository=IMAGE_REPOSITORY,
             digest=VALID_DIGEST,
         )
+
+
+def test_publish_workflow_packages_exact_operator_scripts() -> None:
+    scripts = tuple(sorted(path.name for path in (ROOT / "powershell").glob("*.ps1")))
+    workflow = PUBLISH_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert scripts == OPERATOR_SCRIPTS
+    assert "install -m 0644 powershell/*.ps1 dist/" in workflow
+    assert 'sha256sum "${BUNDLE_NAME}" image-digest.txt *.ps1 > SHA256SUMS' in workflow
+    assert workflow.count("dist/*.ps1") == 3
+    for script in OPERATOR_SCRIPTS:
+        assert script in workflow
+    assert "dist/publisher.json" not in workflow
+    assert "publisher.json" in workflow
+
+
+def test_simulated_release_directory_has_seven_checksum_assets(tmp_path: Path) -> None:
+    bundle_name = "iscsi-reset-service-v0.4.2-truenas.yaml"
+    rendered = render_truenas_bundle(
+        TEMPLATE_PATH.read_text(encoding="utf-8"),
+        image_repository=IMAGE_REPOSITORY,
+        digest=VALID_DIGEST,
+    )
+    (tmp_path / bundle_name).write_text(rendered, encoding="utf-8")
+    (tmp_path / "image-digest.txt").write_text(
+        f"{IMAGE_REPOSITORY}@{VALID_DIGEST}\n",
+        encoding="utf-8",
+    )
+    for script in OPERATOR_SCRIPTS:
+        shutil.copyfile(ROOT / "powershell" / script, tmp_path / script)
+
+    checksummed = {bundle_name, "image-digest.txt", *OPERATOR_SCRIPTS}
+    checksum_lines = []
+    for name in sorted(checksummed):
+        digest = hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        checksum_lines.append(f"{digest}  {name}")
+    (tmp_path / "SHA256SUMS").write_text(
+        "\n".join(checksum_lines) + "\n",
+        encoding="utf-8",
+    )
+    assets = checksummed | {"SHA256SUMS"}
+
+    assert {path.name for path in tmp_path.iterdir()} == assets
+    assert {
+        line.split("  ", 1)[1]
+        for line in (tmp_path / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
+    } == checksummed
+    assert len(assets) == 7

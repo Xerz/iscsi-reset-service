@@ -1,13 +1,35 @@
 # Verification record
 
-## Management UI hotfix worktree v0.4.1 — 2026-08-22
+## Документация и комплект выпуска v0.4.2 — 2026-08-22
 
-Этот worktree заменяет отдельные Configurator и Admin API одной loopback-only Management UI,
-переводит статическую конфигурацию на schema v3 и заменяет сетевой Publisher workflow локальным
-manifest-driven PowerShell helper. Основные изменения опубликованы в release `v0.4.0`; записи
-ниже дополнены операторскими результатами и пока не опубликованным hotfix `v0.4.1`.
+Эта ещё не опубликованная версия расширяет русскоязычный README и добавляет четыре
+самостоятельных операторских PowerShell-файла в комплект GitHub Release. API, schema v3,
+SQLite и рабочая логика сервисов не менялись. Исторические результаты v0.4.1 ниже сохраняются;
+результаты новых проверок v0.4.2 добавлены отдельным списком.
 
-### Автоматически и локально пройдено
+### Проверки изменений v0.4.2
+
+- `ruff check src tests` — passed.
+- `pytest -q` на локальном Python 3.12 — **116 passed**.
+- `node --check src/iscsi_reset_service/static/app.js`, `docker compose config --quiet` и
+  `git diff --check` — passed.
+- Три Mermaid-схемы из README отрендерены через `@mermaid-js/mermaid-cli` в SVG и PNG;
+  синтаксис прошёл, подписи просмотрены визуально, пересекавшиеся подписи первой схемы
+  упрощены.
+- Локальная имитация каталога выпуска содержит ровно семь файлов: YAML, `image-digest.txt`,
+  `SHA256SUMS` и четыре операторских `.ps1`. В Linux-контейнере
+  `sha256sum --check SHA256SUMS` завершился `OK` для всех шести проверяемых файлов.
+- Сгенерированный YAML прошёл `docker compose config --quiet` и содержит два одинаковых
+  digest-pinned `image`.
+- `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  passed на локальном arm64 Docker host: оба application containers сообщили version `0.4.2`,
+  выполнены mock stage→activate и failpoint→retry client prepare, итог —
+  `Interaction suite passed`. После прогона выполнен `docker compose down --volumes`.
+- Windows PowerShell 5.1 CI для v0.4.2 ожидает отдельной команды на commit/push/tag. Скрипты в
+  этой версии не менялись; историческая локальная проверка Pester приведена ниже и не заменяет
+  новый Windows CI.
+
+### Исторические проверки v0.4.1
 
 - `ruff check src tests` — passed.
 - `pytest -q` на локальном Python 3.12 — **114 passed**.

@@ -95,9 +95,10 @@ jobs:
             --image-repository "${IMAGE_REPOSITORY}" \
             --digest "${IMAGE_DIGEST}"
           printf '%s\n' "${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" > dist/image-digest.txt
+          install -m 0644 powershell/*.ps1 dist/
           docker compose -f "dist/${BUNDLE_NAME}" config --quiet
           cd dist
-          sha256sum "${BUNDLE_NAME}" image-digest.txt > SHA256SUMS
+          sha256sum "${BUNDLE_NAME}" image-digest.txt *.ps1 > SHA256SUMS
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -106,6 +107,7 @@ jobs:
             dist/${{ env.BUNDLE_NAME }}
             dist/image-digest.txt
             dist/SHA256SUMS
+            dist/*.ps1
           if-no-files-found: error
       - name: Create or update GitHub Release
         env:
@@ -114,20 +116,24 @@ jobs:
         shell: bash
         run: |
           printf '%s\n' \
-            "Container: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" \
+            "Контейнер: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" \
             "" \
-            "The attached TrueNAS YAML already uses this immutable digest." \
-            "Replace the management IP and site-specific /mnt/tank paths before installation." \
+            "Скачайте все семь приложенных файлов в один каталог и до установки обязательно выполните: sha256sum --check SHA256SUMS" \
+            "Файл ${BUNDLE_NAME} уже содержит неизменяемый digest образа; перед установкой замените management IP и пути /mnt/tank для своей системы." \
+            "image-digest.txt содержит полную ссылку на тот же образ, а SHA256SUMS проверяет YAML, digest-файл и четыре PowerShell-скрипта." \
+            "" \
+            "Для компьютера-издателя нужны Install-IscsiReleasePublisher.ps1 и Publish-IscsiRelease.ps1. Файл publisher.json не входит в релиз: скачайте его из панели управления своей установки." \
+            "Для каждого игрового ПК нужны Install-IscsiResetClient.ps1 и Reset-And-Connect.ps1." \
             > dist/release-notes.md
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \
               --title "iSCSI Reset Service ${GITHUB_REF_NAME}" \
               --notes-file dist/release-notes.md
             gh release upload "${GITHUB_REF_NAME}" \
-              "dist/${BUNDLE_NAME}" dist/image-digest.txt dist/SHA256SUMS --clobber
+              "dist/${BUNDLE_NAME}" dist/image-digest.txt dist/SHA256SUMS dist/*.ps1 --clobber
           else
             gh release create "${GITHUB_REF_NAME}" \
-              "dist/${BUNDLE_NAME}" dist/image-digest.txt dist/SHA256SUMS \
+              "dist/${BUNDLE_NAME}" dist/image-digest.txt dist/SHA256SUMS dist/*.ps1 \
               --verify-tag \
               --title "iSCSI Reset Service ${GITHUB_REF_NAME}" \
               --notes-file dist/release-notes.md

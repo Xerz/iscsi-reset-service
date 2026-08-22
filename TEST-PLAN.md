@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.1
+# Механический тест-план v0.4.2
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -120,7 +120,18 @@
 6. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
-## 7. Чек-лист результата
+## 7. Комплект GitHub Release
+
+1. Скачать семь assets: YAML, `image-digest.txt`, `SHA256SUMS` и четыре операторских `.ps1`.
+2. Убедиться, что `publisher.json` и тестовые PowerShell-файлы в выпуск не попали.
+3. Выполнить `sha256sum --check SHA256SUMS`; проверка YAML, digest-файла и всех четырёх
+   скриптов должна завершиться `OK`.
+4. Проверить YAML через `docker compose config --quiet`: в нём должны быть ровно два одинаковых
+   digest-pinned `image`, два placeholder управляющего IP-адреса TrueNAS и только два сервиса.
+5. Проверить, что workflow artifact и GitHub Release содержат одинаковый комплект файлов.
+6. На опубликованном tag дождаться Python, Compose и Windows PowerShell 5.1 CI.
+
+## 8. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
