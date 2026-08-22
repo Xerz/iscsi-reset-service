@@ -60,18 +60,12 @@
       {
         "id": 1,
         "comment": "publisher",
-        "initiators": [
-          "iqn.1991-05.com.microsoft:publisher",
-          "10.20.40.100/32"
-        ]
+        "initiators": ["iqn.1991-05.com.microsoft:publisher"]
       },
       {
         "id": 2,
         "comment": "chimera",
-        "initiators": [
-          "iqn.1991-05.com.microsoft:chimera",
-          "10.20.40.101/32"
-        ]
+        "initiators": ["iqn.1991-05.com.microsoft:chimera"]
       }
     ],
     "targets": [
@@ -81,7 +75,7 @@
         "alias": "master",
         "portal_ids": [1],
         "initiator_ids": [1],
-        "auth_networks": []
+        "auth_networks": ["10.20.40.100/32"]
       },
       {
         "id": 2,
@@ -89,7 +83,7 @@
         "alias": "chimera",
         "portal_ids": [1],
         "initiator_ids": [2],
-        "auth_networks": []
+        "auth_networks": ["10.20.40.101/32"]
       }
     ]
   }

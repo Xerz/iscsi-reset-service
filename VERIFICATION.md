@@ -1,20 +1,21 @@
 # Verification record
 
-## Management UI worktree v0.4.0 — 2026-08-22
+## Management UI hotfix worktree v0.4.1 — 2026-08-22
 
 Этот worktree заменяет отдельные Configurator и Admin API одной loopback-only Management UI,
 переводит статическую конфигурацию на schema v3 и заменяет сетевой Publisher workflow локальным
-manifest-driven PowerShell helper. Изменения ещё не опубликованы.
+manifest-driven PowerShell helper. Основные изменения опубликованы в release `v0.4.0`; записи
+ниже дополнены операторскими результатами и пока не опубликованным hotfix `v0.4.1`.
 
 ### Автоматически и локально пройдено
 
 - `ruff check src tests` — passed.
-- `pytest -q` на локальном Python 3.12 — **113 passed**.
+- `pytest -q` на локальном Python 3.12 — **114 passed**.
 - `node --check src/iscsi_reset_service/static/app.js` и `git diff --check` — passed.
 - `docker compose config --quiet` — passed.
 - `docker compose up --build --abort-on-container-exit --exit-code-from
   windows-simulation` — passed на локальном arm64 Docker host: два application containers
-  сообщили version `0.4.0`, Management выполнил mock stage→activate до Publisher reconnect,
+  сообщили version `0.4.1`, Management выполнил mock stage→activate до Publisher reconnect,
   Reset API прошёл fault→retry client prepare, suite завершился `Interaction suite passed`.
   После прогона выполнен `docker compose down --volumes`.
 - Release renderer с тестовым immutable digest и последующий `docker compose -f <bundle>
@@ -28,11 +29,11 @@ manifest-driven PowerShell helper. Изменения ещё не опублик
   banner и блокировка release action до restart. Desktop и viewport `390×844` проверены
   визуально; frontend console не содержала warnings/errors.
 
-Исторические результаты v0.3.x не считаются проверкой архитектуры v0.4.0.
+Исторические результаты v0.3.x не считаются проверкой архитектуры v0.4.x.
 
 ### Операторские данные реального TrueNAS 25.10
 
-До текущей переделки оператор подтвердил на физическом TrueNAS:
+Оператор подтвердил на физическом TrueNAS:
 
 - `pool.dataset.query` должен запрашивать `properties: ["keystatus"]`; тогда master zvol и
   filesystem clone parents возвращают вычисленное `locked: false`. Значения `true` и `null`
@@ -43,14 +44,24 @@ manifest-driven PowerShell helper. Изменения ещё не опублик
 - TrueNAS middleware не разрешил добавить `127.0.0.1` в `ui_address`, а соединение контейнера к
   `wss://127.0.0.1/api/current` отклонялось. Из контейнера нужен назначенный машине management
   IP TrueNAS; Publisher NAT/VIP для этого не используется.
+- На Management UI v0.4.0 базовый discovery начал работать с обновлённым token/key, но live
+  dashboard возвращал dependency 503 до выдачи discovery user роли `SNAPSHOT_READ`. После
+  добавления роли live state заработал. Это подтверждает, что `SNAPSHOT_READ` входит в
+  обязательный read-only набор для проверки release snapshots и `@clean`.
+- Реальный `iscsi.target.query` возвращает `auth_networks` на верхнем уровне target, отдельно
+  от `groups`. Ответ target `master` содержал `auth_networks: ["10.20.40.20/32"]`, тогда как
+  v0.4.0 ошибочно искал это поле внутри каждого group и поэтому fail-closed сообщал ложный
+  `publisher target does not authorize the exact source IP /32`. Hotfix v0.4.1 читает
+  фактическую форму TrueNAS 25.10; patched image ещё требует повторной проверки на стенде.
 
 Эти данные подтверждают discovery prerequisites, но не проверяют новый management release
 workflow.
 
 ### Обязательно ожидает физического TrueNAS/Windows стенда
 
-- Минимальные роли read-only discovery key и отдельного mutation service key на фактическом
-  patch release TrueNAS SCALE 25.10.
+- Полный least-privilege набор read-only discovery key и отдельного mutation service key на
+  фактическом patch release TrueNAS SCALE 25.10; необходимость `SNAPSHOT_READ` для discovery
+  user уже подтверждена оператором.
 - Два production containers, реальные directory mounts, POSIX lock/history/fsync и доступ к
   Management UI только через SSH tunnel.
 - Реальная классификация Publisher/client iSCSI sessions, включая partial identity conflict.

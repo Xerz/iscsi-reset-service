@@ -219,8 +219,7 @@ class TrueNASBackend(StorageBackend):
                         sorted(
                             {
                                 str(network)
-                                for group in groups
-                                for network in group.get("auth_networks", [])
+                                for network in row.get("auth_networks", [])
                             }
                         )
                     ),

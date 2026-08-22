@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -171,6 +172,29 @@ async def test_request_size_limit_does_not_echo_body(tmp_path) -> None:
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "REQUEST_TOO_LARGE"
     assert marker not in response.text
+
+
+@pytest.mark.asyncio
+async def test_discovery_failure_logs_cause_but_returns_generic_error(
+    tmp_path, caplog
+) -> None:
+    app, _ = management_app(tmp_path)
+    app.state.runtime.discovery_backend.failpoints["discover_configuration"] = 1
+    caplog.set_level(logging.ERROR, logger="iscsi_reset_service.management_api")
+
+    async with httpx.AsyncClient(transport=transport(app), base_url=ORIGIN) as client:
+        await client.post(
+            "/v1/management/session",
+            headers={"Origin": ORIGIN},
+            json={"token": LOGIN_TOKEN},
+        )
+        response = await client.get("/v1/management/discovery")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "TrueNAS discovery is unavailable"
+    assert "mock failpoint: discover_configuration" not in response.text
+    assert "mock failpoint: discover_configuration" in caplog.text
+    assert "request_id=" in caplog.text
 
 
 @pytest.mark.asyncio

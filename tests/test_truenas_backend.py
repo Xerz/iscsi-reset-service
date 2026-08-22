@@ -106,11 +106,13 @@ class DiscoveryRpc:
                     "id": 7,
                     "name": "master",
                     "alias": "Master",
+                    "auth_networks": ["10.20.40.100/32"],
                     "groups": [
                         {
                             "portal": 1,
                             "initiator": 3,
-                            "auth_networks": ["10.20.40.100/32"],
+                            "authmethod": "NONE",
+                            "auth": None,
                         }
                     ],
                 }
@@ -193,6 +195,7 @@ async def test_configuration_discovery_uses_read_only_query_methods() -> None:
     result = await backend.discover_configuration()
 
     assert result.targets[0].iqn == "iqn.2026-08.lab.games:master"
+    assert result.targets[0].auth_networks == ("10.20.40.100/32",)
     assert result.extents[0].disk == "nvme/masters/games-ssd"
     assert result.associations[0].extent_id == 10
     assert result.datasets[0].type == "VOLUME"

@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.0
+# iSCSI Reset Service v0.4.1
 
 Сервис публикует согласованные ZFS snapshots master iSCSI LUN и перед каждым подключением
 игрового ПК переключает его постоянные extents на writable clones активного release. Все
@@ -84,6 +84,16 @@ clone parents другого pool не поддерживаются.
 Никогда не переиспользуйте extent record между targets. Service меняет у client extent только
 `disk` и `enabled`; ID, NAA и serial должны оставаться постоянными.
 
+Проверьте сохранённую сеть через верхнеуровневое поле target (не внутри `groups`):
+
+```bash
+midclt call iscsi.target.query '[["name","=","master"]]' |
+  jq '.[0] | {id, name, auth_networks, groups}'
+```
+
+Для Publisher ожидается `auth_networks: ["10.20.40.20/32"]` либо ваш фактический SAN IP с
+`/32`. Поле `groups` отдельно связывает target с portal и initiator group.
+
 ### 4. TrueNAS API credentials
 
 Создайте две непривилегированные local groups/users без sudo, SSH и web shell:
@@ -91,10 +101,17 @@ clone parents другого pool не поддерживаются.
 | Credential | Рекомендуемый пользователь | Roles |
 |---|---|---|
 | Runtime mutations | `iscsi-reset-service` | `DATASET_READ`, `DATASET_WRITE`, `SNAPSHOT_READ`, `SNAPSHOT_WRITE`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_EXTENT_WRITE`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_TARGETEXTENT_READ` |
-| Management discovery | `iscsi-reset-discovery` | `DATASET_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_TARGETEXTENT_READ`, `SHARING_ISCSI_INITIATOR_READ` |
+| Management discovery | `iscsi-reset-discovery` | `DATASET_READ`, `SNAPSHOT_READ`, `SHARING_ISCSI_GLOBAL_READ`, `SHARING_ISCSI_PORTAL_READ`, `SHARING_ISCSI_TARGET_READ`, `SHARING_ISCSI_EXTENT_READ`, `SHARING_ISCSI_TARGETEXTENT_READ`, `SHARING_ISCSI_INITIATOR_READ` |
 
 Runtime key используется Reset API и mutation-частью панели; discovery key — только формами и
-dashboard. Сохраните значения keys в:
+dashboard.
+
+`SNAPSHOT_READ` обязателен для live dashboard: панель выполняет read-only snapshot queries,
+чтобы проверить существование release snapshots и клиентских `@clean`. Без этой роли базовый
+discovery может работать, но live state вернёт
+`Live state unavailable: A management dependency is unavailable`.
+
+Сохраните значения keys в:
 
 ```text
 /mnt/tank/iscsi-reset/secrets/truenas_api_key

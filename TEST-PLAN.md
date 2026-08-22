@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.0
+# Механический тест-план v0.4.1
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -14,8 +14,10 @@
    `no-new-privileges`, отсутствие privileged, Docker socket и `/dev/zvol`.
 4. Сверить publisher/client IQN с `Get-InitiatorPort`. Записать master/client extent ID, LUN,
    NAA, serial и dataset paths.
-5. Убедиться, что discovery key имеет только `DATASET_READ` и необходимые
-   `SHARING_ISCSI_*_READ` роли. Любой write JSON-RPC этим key должен отклоняться.
+5. Убедиться, что discovery key имеет `DATASET_READ`, `SNAPSHOT_READ` и необходимые
+   `SHARING_ISCSI_*_READ` роли. Проверить, что без `SNAPSHOT_READ` базовый discovery может
+   пройти, но live dashboard fail-closed отклоняется; любой write JSON-RPC этим key должен
+   отклоняться.
 6. Проверить service key отдельно: read/query и необходимые iSCSI/ZFS mutations доступны
    только ему. Оба API URL должны указывать на management IP TrueNAS, не на loopback и не на
    Publisher NAT/VIP.

@@ -163,26 +163,17 @@ def mock_state() -> dict:
                 {
                     "id": 1,
                     "comment": "publisher",
-                    "initiators": [
-                        "iqn.1991-05.com.microsoft:publisher",
-                        "10.20.40.100/32",
-                    ],
+                    "initiators": ["iqn.1991-05.com.microsoft:publisher"],
                 },
                 {
                     "id": 2,
                     "comment": "chimera",
-                    "initiators": [
-                        "iqn.1991-05.com.microsoft:chimera",
-                        "10.20.40.101/32",
-                    ],
+                    "initiators": ["iqn.1991-05.com.microsoft:chimera"],
                 },
                 {
                     "id": 3,
                     "comment": "beast",
-                    "initiators": [
-                        "iqn.1991-05.com.microsoft:beast",
-                        "10.20.40.102/32",
-                    ],
+                    "initiators": ["iqn.1991-05.com.microsoft:beast"],
                 },
             ],
             "targets": [
@@ -192,7 +183,7 @@ def mock_state() -> dict:
                     "alias": "master",
                     "portal_ids": [1],
                     "initiator_ids": [1],
-                    "auth_networks": [],
+                    "auth_networks": ["10.20.40.100/32"],
                 },
                 {
                     "id": 2,
@@ -200,7 +191,7 @@ def mock_state() -> dict:
                     "alias": "chimera",
                     "portal_ids": [1],
                     "initiator_ids": [2],
-                    "auth_networks": [],
+                    "auth_networks": ["10.20.40.101/32"],
                 },
                 {
                     "id": 3,
@@ -208,7 +199,7 @@ def mock_state() -> dict:
                     "alias": "beast",
                     "portal_ids": [1],
                     "initiator_ids": [3],
-                    "auth_networks": [],
+                    "auth_networks": ["10.20.40.102/32"],
                 },
             ],
         },

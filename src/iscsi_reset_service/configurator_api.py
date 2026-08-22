@@ -180,12 +180,19 @@ def create_management_app(runtime: ManagementRuntime) -> FastAPI:
     async def management_error_handler(
         request: Request, exc: ConfiguratorError
     ) -> JSONResponse:
-        LOGGER.warning(
-            "management_request_failed request_id=%s code=%s status=%s",
-            request.state.request_id,
-            exc.code,
-            exc.status_code,
-        )
+        values = (request.state.request_id, exc.code, exc.status_code)
+        if exc.code == "DISCOVERY_UNAVAILABLE" and exc.__cause__ is not None:
+            cause = exc.__cause__
+            LOGGER.error(
+                "management_request_failed request_id=%s code=%s status=%s",
+                *values,
+                exc_info=(type(cause), cause, cause.__traceback__),
+            )
+        else:
+            LOGGER.warning(
+                "management_request_failed request_id=%s code=%s status=%s",
+                *values,
+            )
         return _error_response(request, exc)
 
     @app.exception_handler(ServiceError)
