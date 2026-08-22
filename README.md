@@ -693,6 +693,38 @@ Reset API всегда используется по `https://<введённы�
 создаёт задачу `iSCSI Reset and Connect` при загрузке. Подключение всегда создаётся с
 `IsPersistent=false`.
 
+Локальный журнал задачи находится в
+`C:\ProgramData\IscsiReset\logs\reset.jsonl`. Читать его нужно из повышенной Windows
+PowerShell, потому что каталог доступен только системной учётной записи и администраторам:
+
+```powershell
+Get-Content C:\ProgramData\IscsiReset\logs\reset.jsonl -Tail 50 |
+  ForEach-Object { $_ | ConvertFrom-Json } |
+  Format-Table timestamp, level, event, request_id, message -Wrap
+
+Get-ScheduledTaskInfo -TaskName "iSCSI Reset and Connect" |
+  Select-Object LastRunTime, LastTaskResult
+```
+
+`LastTaskResult` равен `0` при успехе, `10` при ошибке локального запуска, `20` при отказе
+конфигурации или подготовки и `40` при ошибке подключения либо проверки дисков. Для безопасного
+ручного повтора сначала полностью отключите client target, затем выполните:
+
+```powershell
+Start-ScheduledTask -TaskName "iSCSI Reset and Connect"
+while ((Get-ScheduledTask -TaskName "iSCSI Reset and Connect").State -eq "Running") {
+  Start-Sleep -Seconds 1
+}
+Get-ScheduledTaskInfo -TaskName "iSCSI Reset and Connect" |
+  Select-Object LastRunTime, LastTaskResult
+```
+
+При первом появлении новых клонов Windows может автоматически назначить буквы не тем томам
+внутри одной iSCSI session. Клиент сначала доказывает полный набор по NAA, partition и label,
+после чего может переставить буквы только между этими дисками. Если нужная буква принадлежит
+любому внешнему диску, CD/DVD или другому неопределимому устройству, запуск завершается
+fail-closed. Скрипт проверяет существующую filesystem label, но никогда не изменяет её.
+
 Reset API возвращает только portal, собственную цель клиента и набор
 `{lun, disk_unique_id, drive_letter, label}`. Имя релиза, пути снимков и чужие цели клиенту не
 выдаются. Скрипт не использует `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, удаление

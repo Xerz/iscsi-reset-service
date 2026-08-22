@@ -1,35 +1,62 @@
 # Verification record
 
-## Безопасный интерактивный client installer v0.4.4 — 2026-08-22
+## Client installer и согласование drive letters v0.4.4 — 2026-08-22
 
-В рабочем дереве client installer больше не принимает raw token в аргументах: значение
-запрашивается через `Read-Host -AsSecureString`, а Reset API строится из проверенного SAN IPv4
-и фиксированного порта `8443`. До записи `client.token` каталог установки получает закрытый
-ACL по well-known SID `S-1-5-18` и `S-1-5-32-544`. Publisher installer использует те же SID
-вместо локализуемых английских имён. Reset API, schema v3, SQLite и runtime PowerShell-контракт
-не изменялись.
+Client installer больше не принимает raw token в аргументах и использует well-known SID для
+ACL. Текущий рабочий набор дополнительно согласует автоматически назначенные Windows буквы
+только внутри полного доказанного по NAA client-набора, ограниченно ждёт готовности
+partition/volume metadata и пишет подробный локальный JSONL без token. Reset API, schema v3,
+SQLite и параметры runtime-скрипта не изменялись.
 
-### Локальные автоматические проверки v0.4.4
+### Операторские данные реальной Windows и TrueNAS
+
+- Интерактивный installer из commit `879c28f` успешно завершился на русской Windows; скрытый
+  token и IP были приняты, scheduled task создана. Точное содержимое итогового ACL отдельно не
+  снималось.
+- При отсутствии старых клонов первый запуск создал правильные ZFS clones, extent mappings и
+  перевёл клиента `beast` на активный release в панели. После подключения Windows новая session
+  отключалась на стадии локальной проверки дисков.
+- Реальный `C:\ProgramData\IscsiReset\logs\reset.jsonl` четыре раза зафиксировал
+  `disk_validation: Drive letter E: is occupied`. Отдельный `LOCAL_SESSION_ACTIVE` был
+  намеренно вызван оператором и к дефекту не относится.
+- Последующие подключения и переход на следующий release завершались; один диск визуально
+  переподключался при автоматическом назначении букв. Проверка rollback реального клона также
+  прошла: созданный клиентский файл исчез, чистый том подключился.
+
+Это подтверждает server-side prepare/release/clone flow и локализованный installer, но ещё не
+проверяет новое автоматическое согласование конфликтующих букв из текущего рабочего дерева.
+
+### CI commit `879c28f`
+
+- Python/JavaScript и Compose interaction jobs прошли.
+- Windows PowerShell 5.1 job выполнил **34 tests successfully** и упал на одной новой ACL
+  assertion: .NET возвращает `IdentityReference` как отображаемые имена
+  `NT AUTHORITY\SYSTEM`/`BUILTIN\Administrators`, хотя правила были созданы из SID. Текущий
+  тест переводит каждую identity обратно в `SecurityIdentifier` перед сравнением; production
+  ACL-код не менялся.
+
+### Локальные автоматические проверки текущего hotfix
 
 - `ruff check .` — passed.
-- `pytest -q` — **133 passed**, включая release-bundle regression с четырьмя операторскими
-  `.ps1` и именем bundle v0.4.4.
+- `pytest -q --cov=iscsi_reset_service --cov-report=term-missing` — **133 passed**; release
+  bundle regression по-прежнему покрывает все четыре операторских `.ps1`.
+- `node --check src/iscsi_reset_service/static/app.js`,
+  `node tests/static_connection_presentations.test.mjs` и `git diff --check` — passed.
 - Все `.ps1` разобраны PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` —
   syntax passed.
-- Pester 5.7.1 в том же Linux PowerShell-контейнере — **34 passed, 1 skipped**. Проверены
-  отсутствие `Token`/`ApiBaseUrl` в параметрах установщика, masked token input, IPv4/default,
-  заголовок первого запроса, отсутствие token в scheduled-task arguments, порядок ACL до
-  записи секрета, повторяемые overwrite operations и отсутствие локализуемых ACL identities.
-  Единственный пропуск — создание реального Windows ACL из SID, недоступное на Linux.
-- `docker compose config --quiet` и `git diff --check` — passed.
+- Pester 5.7.1 в Linux PowerShell-контейнере — **53 passed, 1 skipped**. Проверены правильные,
+  свободные и переставленные `E/F`, внешний владелец, wrong/extra NAA, read-only, лишние
+  partitions, label mismatch, metadata retry/timeout, partial assignment, итоговая сверка,
+  этапы JSONL и отсутствие token. Пропущен только настоящий Windows ACL object test.
+- `docker compose config --quiet` — passed.
 - `docker compose up --build --abort-on-container-exit --exit-code-from
   windows-simulation` — passed на локальном arm64 Docker host. Оба application containers
-  сообщили version `0.4.4`; mock stage→activate и failpoint→retry client prepare завершились
-  строкой `Interaction suite passed`. После проверки выполнен `docker compose down --volumes`.
+  сообщили version `0.4.4`; итог — `Interaction suite passed`. Затем выполнен
+  `docker compose down --volumes`.
 
-Фактический masked prompt, ACL каталога/token-файла, повторная установка и создание scheduled
-task на русской Windows PowerShell 5.1 остаются ожидающими физического Windows-стенда. Commit,
-push, tag и GitHub Release в рамках этой проверки не выполнялись.
+Windows PowerShell 5.1 CI и физическая перестановка автоматически назначенных букв остаются
+ожидающими следующих отдельных шагов. Результат публикации tag и release assets фиксируется
+отдельной записью после завершения release workflow.
 
 ## Один dual-role Publisher/client ПК v0.4.3 — 2026-08-22
 

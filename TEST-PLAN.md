@@ -111,16 +111,23 @@
 1. На русской Windows PowerShell 5.1 запустить `Install-IscsiResetClient.ps1` без token в
    аргументах. Проверить скрытый ввод token, default и явно заданный `ResetApiIp`, а также ACL
    каталога и `client.token` только для SID `S-1-5-18` и `S-1-5-32-544`.
-2. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
-3. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
+2. На первом подключении новых клонов разрешить Windows автоматически переставить ожидаемые
+   буквы двух client-дисков. Запустить задачу и проверить, что скрипт по NAA распознаёт оба
+   диска, снимает конфликтующие access paths только с них, назначает конфигурационные буквы и
+   оставляет session подключённой.
+3. Занять одну желаемую букву внешним тестовым диском. Повтор должен завершиться кодом `40`,
+   отключить только созданную session и не менять букву внешнего диска. Проверить этапы и
+   сведения о дисках в `C:\ProgramData\IscsiReset\logs\reset.jsonl`.
+4. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
+5. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
    client marker — исчезнуть после проверенного rollback к `@clean`.
-4. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
+6. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
    clones не должны пересекаться.
-5. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
+7. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
    неполном release mapping, неправильном origin и сбое после mutation.
-6. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
+8. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
    должны сохраниться.
-7. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
+9. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
 ## 7. Один dual-role Publisher/client ПК

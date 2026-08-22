@@ -146,8 +146,12 @@ Describe "Installer secret and ACL regression" {
         }
 
         $acl = New-RestrictedFileSystemAcl -Directory
-        $identities = @($acl.Access | ForEach-Object { $_.IdentityReference.Value })
-        $identities | Should -Contain "S-1-5-18"
-        $identities | Should -Contain "S-1-5-32-544"
+        $identitySids = @($acl.Access | ForEach-Object {
+            $_.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+            ).Value
+        })
+        $identitySids | Should -Contain "S-1-5-18"
+        $identitySids | Should -Contain "S-1-5-32-544"
     }
 }
