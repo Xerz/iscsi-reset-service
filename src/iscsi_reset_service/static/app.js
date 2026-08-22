@@ -181,23 +181,27 @@ function renderDashboard() {
     return;
   }
   const publisher = dashboard.publisher;
+  const publisherConnection = connectionPresentation("publisher", publisher);
   const publisherErrors = publisher.errors?.length
     ? `<ul class="compact-list error-list">${publisher.errors.map((item) => `<li>${esc(item)}</li>`).join("")}</ul>`
     : '<span class="muted">Topology проверена.</span>';
   publisherNode.innerHTML = `<div class="summary-row">
-    ${statusBadge(connectionLabel(publisher.connection_status), connectionKind(publisher.connection_status))}
+    ${statusBadge(publisherConnection.label, publisherConnection.kind)}
     ${statusBadge(publisher.extents_enabled ? "Extents enabled" : "Extents disabled", publisher.extents_enabled ? "good" : "warning")}
     ${statusBadge(publisher.topology_valid ? "Topology valid" : "Topology error", publisher.topology_valid ? "good" : "error")}
   </div>${publisherErrors}`;
   $("#manifest-link").hidden = Boolean(dashboard.restart_required);
 
-  const rows = dashboard.clients.map((client) => `<div class="data-row client-status-row">
-    <strong>${esc(client.name)}</strong>
-    ${statusBadge(connectionLabel(client.connection_status), connectionKind(client.connection_status))}
-    <span class="mono">${esc(client.mapped_release || "—")}</span>
-    ${statusBadge(updateLabel(client.update_status), updateKind(client.update_status))}
-    <span class="row-detail">${esc(client.errors?.join("; ") || "OK")}</span>
-  </div>`).join("");
+  const rows = dashboard.clients.map((client) => {
+    const connection = connectionPresentation("client", client, client.name);
+    return `<div class="data-row client-status-row">
+      <strong>${esc(client.name)}</strong>
+      ${statusBadge(connection.label, connection.kind)}
+      <span class="mono">${esc(client.mapped_release || "—")}</span>
+      ${statusBadge(updateLabel(client.update_status), updateKind(client.update_status))}
+      <span class="row-detail">${esc(client.errors?.join("; ") || "OK")}</span>
+    </div>`;
+  }).join("");
   clientsNode.innerHTML = `<div class="data-header client-status-row"><span>ПК</span><span>Подключение</span><span>Mapped release</span><span>Версия</span><span>Проверка</span></div>${rows || '<p class="empty-state">Нет клиентов.</p>'}`;
   const updated = dashboard.clients.filter((item) => item.update_status === "updated").length;
   $("#clients-summary").textContent = `${updated}/${dashboard.clients.length} на active`;
@@ -256,6 +260,43 @@ function connectionLabel(value) {
 
 function connectionKind(value) {
   return value === "connected" ? "good" : (value === "disconnected" ? "neutral" : "error");
+}
+
+function connectionPresentation(role, observed, clientName = null) {
+  const fallback = {
+    label: connectionLabel(observed.connection_status),
+    kind: connectionKind(observed.connection_status),
+  };
+  if (observed.connection_status !== "conflict" || observed.matching_sessions?.length !== 1) {
+    return fallback;
+  }
+
+  const session = observed.matching_sessions[0];
+  const sameSession = (candidate) => (
+    candidate?.matching_sessions?.length === 1
+    && ["initiator_addr", "initiator_iqn", "target_iqn"].every((field) => (
+      String(candidate.matching_sessions[0][field]).toLowerCase()
+      === String(session[field]).toLowerCase()
+    ))
+  );
+  let activeRole;
+  if (role === "publisher") {
+    const connectedClients = (state.dashboard?.clients || []).filter((client) => (
+      client.connection_status === "connected" && sameSession(client)
+    ));
+    if (connectedClients.length !== 1) return fallback;
+    activeRole = `клиента «${connectedClients[0].name}»`;
+  } else {
+    const publisher = state.dashboard?.publisher;
+    if (!clientName || publisher?.connection_status !== "connected" || !sameSession(publisher)) {
+      return fallback;
+    }
+    activeRole = "Publisher";
+  }
+  return {
+    label: `на общем ПК активна роль ${activeRole} · ${session.target_iqn}`,
+    kind: "warning",
+  };
 }
 
 function updateLabel(value) {

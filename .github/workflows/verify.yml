@@ -19,6 +19,8 @@ jobs:
       - run: pip install -e '.[test]'
       - run: ruff check .
       - run: pytest -q --cov=iscsi_reset_service --cov-report=term-missing
+      - run: node --check src/iscsi_reset_service/static/app.js
+      - run: node tests/static_connection_presentations.test.mjs
 
   powershell-51:
     runs-on: windows-latest

@@ -134,6 +134,57 @@ async def test_publisher_session_blocks_before_extent_mutation(
 
 
 @pytest.mark.asyncio
+async def test_dual_role_client_session_blocks_stage_before_extent_mutation(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    client = dual_role_config.clients["chimera"]
+    dual_role_backend.sessions.append(
+        SessionState(
+            initiator_iqn=client.initiator_iqn,
+            initiator_addr=str(client.source_ip),
+            target_iqn=client.target_iqn,
+        )
+    )
+
+    with pytest.raises(PublisherSessionActiveError):
+        await ReleaseManager(
+            dual_role_config, dual_role_backend, release_store
+        ).stage("dual-role-blocked", "192.168.1.101")
+
+    assert dual_role_backend.extents[10].enabled is True
+    assert dual_role_backend.extents[11].enabled is True
+    assert not any(
+        call.startswith("update_extent") for call in dual_role_backend.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_dual_role_client_session_blocks_activation(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    manager = ReleaseManager(dual_role_config, dual_role_backend, release_store)
+    staged = await manager.stage("dual-role-stage", "192.168.1.101")
+    client = dual_role_config.clients["chimera"]
+    dual_role_backend.sessions.append(
+        SessionState(
+            initiator_iqn=client.initiator_iqn,
+            initiator_addr=str(client.source_ip),
+            target_iqn=client.target_iqn,
+        )
+    )
+
+    with pytest.raises(PublisherSessionActiveError):
+        await manager.activate(
+            staged.release,
+            f"ACTIVATE {staged.release}",
+            "dual-role-activate",
+            "192.168.1.101",
+        )
+
+    assert release_store.active_release().name != staged.release
+
+
+@pytest.mark.asyncio
 async def test_partial_snapshot_failure_is_fail_closed_and_same_request_recovers(
     service_config, backend, release_store
 ) -> None:

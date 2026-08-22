@@ -5,7 +5,14 @@ import logging
 
 import httpx
 import pytest
-from conftest import PEPPER, config_dict, mock_state, seed_release
+from conftest import (
+    PEPPER,
+    config_dict,
+    dual_role_config_dict,
+    dual_role_mock_state,
+    mock_state,
+    seed_release,
+)
 
 from iscsi_reset_service.backends.mock import MockBackend
 from iscsi_reset_service.config import ServiceConfig, dump_config
@@ -25,15 +32,17 @@ MANAGEMENT_PEPPER = b"management-test-pepper-is-at-least-thirty-two-bytes"
 ORIGIN = "http://127.0.0.1"
 
 
-def management_app(tmp_path):
-    config = ServiceConfig.model_validate(config_dict())
+def management_app(tmp_path, *, dual_role: bool = False):
+    config = ServiceConfig.model_validate(
+        dual_role_config_dict() if dual_role else config_dict()
+    )
     config_path = tmp_path / "config" / "config.yaml"
     config_path.parent.mkdir()
     config_path.write_text(dump_config(config), encoding="utf-8")
     store = ReleaseStore(tmp_path / "state" / "releases.sqlite3")
     store.initialize()
     seed_release(store, config)
-    backend = MockBackend(mock_state())
+    backend = MockBackend(dual_role_mock_state() if dual_role else mock_state())
     repository = ConfigRepository(config_path, store.path, backend)
     runtime = ManagementRuntime(
         discovery_backend=backend,
@@ -303,6 +312,38 @@ async def test_activation_blocks_unexpected_publisher_reconnect(tmp_path) -> Non
 
     assert activated.status_code == 409
     assert activated.json()["error"]["code"] == "PUBLISHER_SESSION_ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_activation_reports_dual_role_client_target(tmp_path) -> None:
+    app, _ = management_app(tmp_path, dual_role=True)
+    async with httpx.AsyncClient(transport=transport(app), base_url=ORIGIN) as client:
+        login = await client.post(
+            "/v1/management/session",
+            headers={"Origin": ORIGIN},
+            json={"token": LOGIN_TOKEN},
+        )
+        headers = {"Origin": ORIGIN, "X-CSRF-Token": login.json()["csrf_token"]}
+        staged = await client.post("/v1/management/releases/stage", headers=headers)
+        release_name = staged.json()["release"]
+        config = app.state.runtime.config
+        shared_client = config.clients[config.shared_publisher_client]
+        app.state.runtime.discovery_backend.sessions.append(
+            SessionState(
+                initiator_iqn=shared_client.initiator_iqn,
+                initiator_addr=str(shared_client.source_ip),
+                target_iqn=shared_client.target_iqn,
+            )
+        )
+        activated = await client.post(
+            f"/v1/management/releases/{release_name}/activate",
+            headers=headers,
+            json={"confirmation": f"ACTIVATE {release_name}"},
+        )
+
+    assert activated.status_code == 409
+    assert activated.json()["error"]["code"] == "PUBLISHER_SESSION_ACTIVE"
+    assert shared_client.target_iqn in activated.json()["error"]["message"]
 
 
 @pytest.mark.asyncio

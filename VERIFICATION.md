@@ -1,5 +1,38 @@
 # Verification record
 
+## Один dual-role Publisher/client ПК v0.4.3 — 2026-08-22
+
+В рабочем дереве schema v3 разрешает ровно одному client повторять полную пару
+`publisher.source_ip + publisher.initiator_iqn` при обязательной отдельной target. Частичные
+совпадения и второй shared client отклоняются. Контракты Reset API, SQLite и PowerShell не
+изменялись. Commit, push, tag и GitHub Release для `v0.4.3` не выполнялись.
+
+### Локальные автоматические проверки v0.4.3
+
+- `ruff check .` — passed.
+- `pytest -q` на локальном Python 3.12 — **133 passed**. Покрыты schema, независимая проверка
+  обеих target, неправильные и отсутствующие точные IQN/`/32`, сохранение config, блокировка
+  client prepare при master session, блокировка stage/activation при client session, точная
+  причина отказа activation и разрешение операций после отключения.
+- `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — passed. Ожидаемая активная вторая
+  роль отображается предупреждением с target IQN, неизвестное частичное совпадение остаётся
+  красным `identity conflict`.
+- `docker compose config --quiet` и `git diff --check` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host. Оба application containers
+  сообщили version `0.4.3`; mock stage→activate и failpoint→retry client prepare завершились
+  строкой `Interaction suite passed`. После проверки выполнен `docker compose down --volumes`.
+- Локальная имитация выпуска содержит ровно семь файлов для `v0.4.3`.
+  `sha256sum --check SHA256SUMS` завершился `OK` для YAML, digest-файла и четырёх `.ps1`, а
+  сгенерированный YAML прошёл `docker compose config --quiet`.
+
+Windows PowerShell-файлы не изменялись. Windows PowerShell 5.1/Pester CI для commit/tag
+`v0.4.3` ещё не запускался, поскольку публикация оставлена до отдельной команды пользователя.
+Фактическое переключение одного Windows ПК между master и client target, классификация реальных
+сеансов TrueNAS и повторное разрешение stage/activation после полного отключения остаются
+ожидающими физического стенда.
+
 ## Документация и комплект выпуска v0.4.2 — 2026-08-22
 
 Эта ещё не опубликованная версия расширяет русскоязычный README и добавляет четыре
@@ -91,6 +124,8 @@ workflow.
 - Два production containers, реальные directory mounts, POSIX lock/history/fsync и доступ к
   Management UI только через SSH tunnel.
 - Реальная классификация Publisher/client iSCSI sessions, включая partial identity conflict.
+- Dual-role Windows ПК: взаимоисключающее подключение master/client target, понятные role
+  warnings и fail-closed блокировка prepare/stage/activation до полного отключения другой роли.
 - Dashboard mapping по extent path, managed ZFS properties, origin snapshot и `@clean`.
 - Publisher helper `Disconnect`/`Reconnect` на Windows PowerShell 5.1: exact NAA, offline,
   pending recovery, непостоянная session и безопасный online.

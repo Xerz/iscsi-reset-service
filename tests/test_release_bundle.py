@@ -111,7 +111,7 @@ def test_publish_workflow_packages_exact_operator_scripts() -> None:
 
 
 def test_simulated_release_directory_has_seven_checksum_assets(tmp_path: Path) -> None:
-    bundle_name = "iscsi-reset-service-v0.4.2-truenas.yaml"
+    bundle_name = "iscsi-reset-service-v0.4.3-truenas.yaml"
     rendered = render_truenas_bundle(
         TEMPLATE_PATH.read_text(encoding="utf-8"),
         image_repository=IMAGE_REPOSITORY,

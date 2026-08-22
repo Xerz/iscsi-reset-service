@@ -321,6 +321,41 @@ async def test_any_matching_session_identity_blocks_reset(
 
 
 @pytest.mark.asyncio
+async def test_dual_role_master_session_blocks_client_prepare_before_mutation(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    publisher = dual_role_config.publisher
+    dual_role_backend.sessions.append(
+        SessionState(
+            initiator_iqn=publisher.initiator_iqn,
+            initiator_addr=str(publisher.source_ip),
+            target_iqn=publisher.target_iqn,
+        )
+    )
+
+    with pytest.raises(SessionActiveError):
+        await ResetCoordinator(
+            dual_role_config, dual_role_backend, release_store
+        ).prepare("chimera")
+
+    assert not any(call.startswith("update_extent") for call in dual_role_backend.calls)
+
+
+@pytest.mark.asyncio
+async def test_dual_role_client_prepare_is_allowed_after_master_disconnect(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    result = await ResetCoordinator(
+        dual_role_config, dual_role_backend, release_store
+    ).prepare("chimera")
+
+    assert result.status == "ready"
+    assert result.target_iqn == dual_role_config.clients["chimera"].target_iqn
+    assert dual_role_backend.extents[1].enabled is True
+    assert dual_role_backend.extents[2].enabled is True
+
+
+@pytest.mark.asyncio
 async def test_extent_serial_change_is_fail_closed(
     service_config, backend, release_store, monkeypatch
 ) -> None:

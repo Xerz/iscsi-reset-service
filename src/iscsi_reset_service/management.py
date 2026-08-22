@@ -84,7 +84,10 @@ class ManagementInspector:
         if publisher["connection_status"] == "connected":
             reasons.append("Publisher is connected")
         elif publisher["connection_status"] == "conflict":
-            reasons.append("Publisher session identity conflict")
+            shared_role_reason = _shared_client_session_reason(self.config, publisher)
+            reasons.append(
+                shared_role_reason or "Publisher session identity conflict"
+            )
         reasons.extend(publisher["errors"])
         if not extents_ready and incomplete is None:
             reasons.append("publisher extents are disabled")
@@ -348,6 +351,28 @@ def _connection_status(
         if exact:
             return "connected", matching
     return "conflict", matching
+
+
+def _shared_client_session_reason(
+    config: ServiceConfig,
+    publisher: dict[str, Any],
+) -> str | None:
+    client_name = config.shared_publisher_client
+    matching = publisher["matching_sessions"]
+    if client_name is None or len(matching) != 1:
+        return None
+    client = config.clients[client_name]
+    session = matching[0]
+    if (
+        session["initiator_addr"] == str(config.publisher.source_ip)
+        and session["initiator_iqn"].lower() == config.publisher.initiator_iqn
+        and session["target_iqn"].lower() == client.target_iqn
+    ):
+        return (
+            f"Shared-role client session is active: {client_name} "
+            f"({client.target_iqn})"
+        )
+    return None
 
 
 def _publisher_discovery_errors(

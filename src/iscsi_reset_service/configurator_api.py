@@ -421,10 +421,12 @@ def create_management_app(runtime: ManagementRuntime) -> FastAPI:
                     409, "RESTART_REQUIRED", "Restart Custom App before release operations"
                 )
             if publisher["connection_status"] != "disconnected":
+                reasons = state["release_action"]["reasons"]
                 raise ConfiguratorError(
                     409,
                     "PUBLISHER_SESSION_ACTIVE",
-                    "Publisher must remain disconnected during activation",
+                    "; ".join(reasons)
+                    or "Publisher must remain disconnected during activation",
                 )
             if not publisher["topology_valid"] or not publisher["extents_enabled"]:
                 raise ConfiguratorError(

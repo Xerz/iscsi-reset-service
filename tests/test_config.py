@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 
 import pytest
-from conftest import config_dict
+from conftest import config_dict, dual_role_config_dict
 from pydantic import ValidationError
 
 from iscsi_reset_service.config import ServiceConfig, load_config
@@ -48,10 +48,38 @@ def test_duplicate_client_identity_is_rejected(field: str, value: str) -> None:
         ServiceConfig.model_validate(raw)
 
 
-def test_publisher_identity_cannot_match_client() -> None:
+def test_one_client_may_share_full_publisher_identity_pair() -> None:
+    config = ServiceConfig.model_validate(dual_role_config_dict())
+
+    assert config.shared_publisher_client == "chimera"
+    assert config.clients["chimera"].source_ip == config.publisher.source_ip
+    assert config.clients["chimera"].initiator_iqn == config.publisher.initiator_iqn
+    assert config.clients["chimera"].target_iqn != config.publisher.target_iqn
+
+
+@pytest.mark.parametrize("field", ["source_ip", "initiator_iqn"])
+def test_client_cannot_partially_match_publisher_identity(field: str) -> None:
     raw = config_dict()
-    raw["publisher"]["source_ip"] = raw["clients"]["chimera"]["source_ip"]
-    with pytest.raises(ValidationError, match="duplicate source_ip"):
+    raw["clients"]["chimera"][field] = raw["publisher"][field]
+
+    with pytest.raises(ValidationError, match="must match both publisher"):
+        ServiceConfig.model_validate(raw)
+
+
+def test_second_client_cannot_share_publisher_identity_pair() -> None:
+    raw = dual_role_config_dict()
+    raw["clients"]["beast"]["source_ip"] = raw["publisher"]["source_ip"]
+    raw["clients"]["beast"]["initiator_iqn"] = raw["publisher"]["initiator_iqn"]
+
+    with pytest.raises(ValidationError, match="only one client may share publisher"):
+        ServiceConfig.model_validate(raw)
+
+
+def test_shared_client_still_requires_distinct_target() -> None:
+    raw = dual_role_config_dict()
+    raw["clients"]["chimera"]["target_iqn"] = raw["publisher"]["target_iqn"]
+
+    with pytest.raises(ValidationError, match="duplicate target_iqn"):
         ServiceConfig.model_validate(raw)
 
 

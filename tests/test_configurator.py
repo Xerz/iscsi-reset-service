@@ -5,7 +5,13 @@ import os
 import stat
 
 import pytest
-from conftest import config_dict, mock_state, seed_release
+from conftest import (
+    config_dict,
+    dual_role_config_dict,
+    dual_role_mock_state,
+    mock_state,
+    seed_release,
+)
 
 from iscsi_reset_service.backends.mock import MockBackend
 from iscsi_reset_service.config import ServiceConfig, dump_config, parse_config_yaml
@@ -69,6 +75,73 @@ async def test_repository_validates_live_topology_and_canonicalizes(tmp_path) ->
     assert result.config.revision == config.revision
     assert result.warnings == []
     assert result.yaml.startswith("schema_version: 3\n")
+
+
+@pytest.mark.asyncio
+async def test_dual_role_targets_are_validated_independently_and_can_be_saved(
+    tmp_path,
+) -> None:
+    config = ServiceConfig.model_validate(dual_role_config_dict())
+    backend = MockBackend(dual_role_mock_state())
+    discovery = await backend.discover_configuration()
+
+    assert validate_live_topology(config, discovery) == []
+
+    repository = ConfigRepository(
+        tmp_path / "config" / "config.yaml",
+        tmp_path / "state" / "releases.sqlite3",
+        backend,
+    )
+    saved = await repository.save_yaml(dump_config(config), None)
+
+    assert saved.saved_revision == config.revision
+    assert repository.read().config == config
+
+
+@pytest.mark.parametrize(
+    "identity_error",
+    ["network", "missing_network", "initiator", "missing_initiator"],
+)
+@pytest.mark.asyncio
+async def test_dual_role_client_target_still_requires_exact_authorization(
+    identity_error: str,
+) -> None:
+    config = ServiceConfig.model_validate(dual_role_config_dict())
+    state = dual_role_mock_state()
+    if identity_error in {"network", "missing_network"}:
+        state["discovery"]["targets"][1]["auth_networks"] = (
+            ["10.20.40.0/24"] if identity_error == "network" else []
+        )
+        expected = "exact source IP /32"
+    else:
+        state["discovery"]["initiator_groups"][1]["initiators"] = (
+            ["iqn.1991-05.com.microsoft:wrong"]
+            if identity_error == "initiator"
+            else []
+        )
+        expected = "initiator IQN is not authorized"
+
+    with pytest.raises(ConfiguratorError, match=expected):
+        validate_live_topology(
+            config,
+            await MockBackend(state).discover_configuration(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_dual_role_client_target_still_requires_its_own_associations() -> None:
+    config = ServiceConfig.model_validate(dual_role_config_dict())
+    state = dual_role_mock_state()
+    state["target_luns"][config.clients["chimera"].target_iqn] = [
+        {"extent_id": 10, "lun": 0},
+        {"extent_id": 11, "lun": 1},
+    ]
+
+    with pytest.raises(ConfiguratorError, match="extent/LUN set"):
+        validate_live_topology(
+            config,
+            await MockBackend(state).discover_configuration(),
+        )
 
 
 @pytest.mark.asyncio

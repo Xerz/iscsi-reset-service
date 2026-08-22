@@ -90,6 +90,59 @@ async def test_partial_session_identity_is_a_conflict(
 
     assert result["publisher"]["connection_status"] == "conflict"
     assert result["release_action"]["can_stage"] is False
+    assert result["release_action"]["reasons"] == [
+        "Publisher session identity conflict"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dual_role_client_session_is_an_expected_blocking_conflict(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    client = dual_role_config.clients["chimera"]
+    dual_role_backend.sessions.append(
+        SessionState(
+            initiator_iqn=client.initiator_iqn,
+            initiator_addr=str(client.source_ip),
+            target_iqn=client.target_iqn,
+        )
+    )
+
+    result = await ManagementInspector(
+        dual_role_config, dual_role_backend, release_store
+    ).dashboard(saved_revision=dual_role_config.revision, restart_required=False)
+    chimera = next(item for item in result["clients"] if item["name"] == "chimera")
+
+    assert result["publisher"]["connection_status"] == "conflict"
+    assert chimera["connection_status"] == "connected"
+    assert result["release_action"]["can_stage"] is False
+    assert result["release_action"]["reasons"] == [
+        f"Shared-role client session is active: chimera ({client.target_iqn})"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dual_role_master_session_conflicts_with_client_view(
+    dual_role_config, dual_role_backend, release_store
+) -> None:
+    publisher = dual_role_config.publisher
+    dual_role_backend.sessions.append(
+        SessionState(
+            initiator_iqn=publisher.initiator_iqn,
+            initiator_addr=str(publisher.source_ip),
+            target_iqn=publisher.target_iqn,
+        )
+    )
+
+    result = await ManagementInspector(
+        dual_role_config, dual_role_backend, release_store
+    ).dashboard(saved_revision=dual_role_config.revision, restart_required=False)
+    chimera = next(item for item in result["clients"] if item["name"] == "chimera")
+
+    assert result["publisher"]["connection_status"] == "connected"
+    assert chimera["connection_status"] == "conflict"
+    assert result["release_action"]["can_stage"] is False
+    assert result["release_action"]["reasons"] == ["Publisher is connected"]
 
 
 @pytest.mark.asyncio

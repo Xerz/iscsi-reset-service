@@ -46,8 +46,9 @@ README и примеры должны меняться в том же набор
   дисков в Python, API, PowerShell либо тестовых helper-функциях.
 - Клиент может использовать подмножество publisher volumes.
 - Pool master dataset и соответствующего client clone обязан совпадать.
-- IP, IQN, target, token digest и extent ID должны быть глобально уникальны; LUN и буквы
-  проверяются в предусмотренной схемой области.
+- Target, token digest и extent ID должны быть глобально уникальны. Ровно один client может
+  повторять у Publisher только полную пару `source_ip + initiator_iqn`; частичное совпадение и
+  второй такой client запрещены. LUN и буквы проверяются в предусмотренной схемой области.
 
 ### Динамическое состояние
 
@@ -88,6 +89,9 @@ README и примеры должны меняться в том же набор
 9. Включать LUN только после полной сверки paths, NAA, LUN и enabled state.
 10. Возвращать `ready` только после проверки всего набора.
 
+Для dual-role Publisher/client активная master session совпадает с client по IP/IQN и поэтому
+обязана блокировать prepare до любых mutations.
+
 Reset API не сообщает release name, snapshot paths или чужой target. Его успешный ответ содержит
 только portal, собственный target и `{lun, disk_unique_id, drive_letter, label}`.
 
@@ -109,6 +113,9 @@ Reset API не сообщает release name, snapshot paths или чужой t
 Частичная ошибка не меняет active release, не удаляет snapshots и оставляет master extents
 выключенными. Другой request ID не может обойти `incomplete`; исходный request ID продолжает
 reconciliation. Activation требует точную строку `ACTIVATE <release>`.
+
+Для dual-role Publisher/client session его отдельного client target совпадает с Publisher по
+IP/IQN и обязана блокировать как stage, так и activation.
 
 ### Windows PowerShell
 

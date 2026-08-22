@@ -477,7 +477,6 @@ def _validate_target_identity(
     target: TargetState,
     initiator_groups: dict[int, Any],
 ) -> list[str]:
-    warnings: list[str] = []
     entries = [
         entry
         for group_id in target.initiator_ids
@@ -486,22 +485,18 @@ def _validate_target_identity(
     iqns = {entry.lower() for entry in entries if IQN_RE.fullmatch(entry)}
     networks = [*target.auth_networks]
     networks.extend(entry for entry in entries if not IQN_RE.fullmatch(entry))
-    if iqns and initiator_iqn not in iqns:
+    if initiator_iqn not in iqns:
         _conflict(f"{name} initiator IQN is not authorized by its target")
-    if not iqns:
-        warnings.append(f"{name} target does not restrict an exact initiator IQN")
     parsed_networks = []
     for value in networks:
         try:
             parsed_networks.append(ipaddress.ip_network(value, strict=False))
         except ValueError:
             continue
-    address = ipaddress.ip_address(source_ip)
-    if parsed_networks and not any(address in network for network in parsed_networks):
-        _conflict(f"{name} source IP is not authorized by its target")
-    if not parsed_networks:
-        warnings.append(f"{name} target does not restrict an exact source network")
-    return warnings
+    expected_network = ipaddress.ip_network(f"{source_ip}/32")
+    if expected_network not in parsed_networks:
+        _conflict(f"{name} target does not authorize the exact source IP /32")
+    return []
 
 
 def _eligible_extent(name: str, extent_id: int, extents: dict[int, Any]) -> Any:

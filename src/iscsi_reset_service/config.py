@@ -214,9 +214,27 @@ class ServiceConfig(StrictModel):
         if not self.clients:
             raise ValueError("at least one client is required")
 
+        shared_publisher_clients: list[str] = []
+        for client_name, client in self.clients.items():
+            matches_publisher_ip = client.source_ip == self.publisher.source_ip
+            matches_publisher_iqn = (
+                client.initiator_iqn == self.publisher.initiator_iqn
+            )
+            if matches_publisher_ip != matches_publisher_iqn:
+                raise ValueError(
+                    f"client {client_name} must match both publisher source_ip and "
+                    "initiator_iqn, or neither"
+                )
+            if matches_publisher_ip:
+                shared_publisher_clients.append(client_name)
+        if len(shared_publisher_clients) > 1:
+            raise ValueError(
+                "only one client may share publisher source_ip and initiator_iqn"
+            )
+
         seen: dict[str, set[object]] = {
-            "source_ip": {self.publisher.source_ip},
-            "initiator_iqn": {self.publisher.initiator_iqn},
+            "source_ip": set(),
+            "initiator_iqn": set(),
             "target_iqn": {self.publisher.target_iqn},
             "token_digest": set(),
             "extent_id": {volume.extent_id for volume in self.publisher.volumes.values()},
@@ -268,6 +286,16 @@ class ServiceConfig(StrictModel):
     @property
     def network(self) -> ipaddress.IPv4Network:
         return ipaddress.ip_network(self.allowed_source_cidr, strict=True)
+
+    @property
+    def shared_publisher_client(self) -> str | None:
+        for client_name, client in self.clients.items():
+            if (
+                client.source_ip == self.publisher.source_ip
+                and client.initiator_iqn == self.publisher.initiator_iqn
+            ):
+                return client_name
+        return None
 
     @property
     def revision(self) -> str:

@@ -82,6 +82,15 @@ def config_dict() -> dict:
     }
 
 
+def dual_role_config_dict() -> dict:
+    raw = config_dict()
+    raw["clients"]["chimera"]["source_ip"] = raw["publisher"]["source_ip"]
+    raw["clients"]["chimera"]["initiator_iqn"] = raw["publisher"][
+        "initiator_iqn"
+    ]
+    return raw
+
+
 def mock_state() -> dict:
     return {
         "snapshots": [
@@ -206,6 +215,15 @@ def mock_state() -> dict:
     }
 
 
+def dual_role_mock_state() -> dict:
+    state = mock_state()
+    publisher_ip = state["discovery"]["targets"][0]["auth_networks"][0]
+    publisher_iqn = state["discovery"]["initiator_groups"][0]["initiators"][0]
+    state["discovery"]["initiator_groups"][1]["initiators"] = [publisher_iqn]
+    state["discovery"]["targets"][1]["auth_networks"] = [publisher_ip]
+    return state
+
+
 def seed_release(store: ReleaseStore, config: ServiceConfig, name: str = ACTIVE_RELEASE) -> None:
     store.reserve(name, f"seed-{name}")
     for volume_name in config.publisher.volumes:
@@ -221,6 +239,16 @@ def seed_release(store: ReleaseStore, config: ServiceConfig, name: str = ACTIVE_
 @pytest.fixture
 def service_config() -> ServiceConfig:
     return ServiceConfig.model_validate(config_dict())
+
+
+@pytest.fixture
+def dual_role_config() -> ServiceConfig:
+    return ServiceConfig.model_validate(dual_role_config_dict())
+
+
+@pytest.fixture
+def dual_role_backend() -> MockBackend:
+    return MockBackend(copy.deepcopy(dual_role_mock_state()))
 
 
 @pytest.fixture

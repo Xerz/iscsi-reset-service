@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.2
+# Механический тест-план v0.4.3
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -120,7 +120,23 @@
 6. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
-## 7. Комплект GitHub Release
+## 7. Один dual-role Publisher/client ПК
+
+1. Настроить один клиент с той же полной парой SAN IP/IQN, что у Publisher, но с отдельными
+   client target, extent и associations. Убедиться, что обе target имеют точный IQN и тот же
+   `/32`, а панель сохраняет конфигурацию.
+2. Подключить master target. В карточке клиента должно появиться предупреждение об активной
+   роли Publisher с точным target IQN; client prepare обязан завершиться до любых mutations.
+3. Полностью отключить master target и запустить client prepare. Должна подключиться только
+   client target с клонами.
+4. Пока client target подключена, проверить предупреждение у Publisher с именем клиента и
+   target IQN. Stage и activation обязаны быть заблокированы до любых mutations.
+5. Полностью отключить client target и убедиться, что stage/activation снова разрешаются при
+   выполнении остальных условий. Затем подключить master target отдельно.
+6. Проверить частичное совпадение только IP, только IQN и постороннюю target: это должна быть
+   красная ошибка `identity conflict`, а не ожидаемое предупреждение о другой роли.
+
+## 8. Комплект GitHub Release
 
 1. Скачать семь assets: YAML, `image-digest.txt`, `SHA256SUMS` и четыре операторских `.ps1`.
 2. Убедиться, что `publisher.json` и тестовые PowerShell-файлы в выпуск не попали.
@@ -131,7 +147,7 @@
 5. Проверить, что workflow artifact и GitHub Release содержат одинаковый комплект файлов.
 6. На опубликованном tag дождаться Python, Compose и Windows PowerShell 5.1 CI.
 
-## 8. Чек-лист результата
+## 9. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
@@ -146,6 +162,7 @@
 | Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |
 | Publisher Reconnect | Same revision, nonpersistent, exact NAA |  | ☐ |
 | Client dashboard | Session отдельно от mapped release |  | ☐ |
+| Dual-role ПК | Только одна активная роль, обе стороны fail-closed |  | ☐ |
 | Unused criterion | Только кандидат, dependencies показаны |  | ☐ |
 | Client reset | Полный доказанный набор LUN |  | ☐ |
 | Lost SQLite/API | Fail-closed и stale dashboard |  | ☐ |
