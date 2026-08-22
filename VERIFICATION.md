@@ -1,5 +1,36 @@
 # Verification record
 
+## Безопасный интерактивный client installer v0.4.4 — 2026-08-22
+
+В рабочем дереве client installer больше не принимает raw token в аргументах: значение
+запрашивается через `Read-Host -AsSecureString`, а Reset API строится из проверенного SAN IPv4
+и фиксированного порта `8443`. До записи `client.token` каталог установки получает закрытый
+ACL по well-known SID `S-1-5-18` и `S-1-5-32-544`. Publisher installer использует те же SID
+вместо локализуемых английских имён. Reset API, schema v3, SQLite и runtime PowerShell-контракт
+не изменялись.
+
+### Локальные автоматические проверки v0.4.4
+
+- `ruff check .` — passed.
+- `pytest -q` — **133 passed**, включая release-bundle regression с четырьмя операторскими
+  `.ps1` и именем bundle v0.4.4.
+- Все `.ps1` разобраны PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` —
+  syntax passed.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **34 passed, 1 skipped**. Проверены
+  отсутствие `Token`/`ApiBaseUrl` в параметрах установщика, masked token input, IPv4/default,
+  заголовок первого запроса, отсутствие token в scheduled-task arguments, порядок ACL до
+  записи секрета, повторяемые overwrite operations и отсутствие локализуемых ACL identities.
+  Единственный пропуск — создание реального Windows ACL из SID, недоступное на Linux.
+- `docker compose config --quiet` и `git diff --check` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host. Оба application containers
+  сообщили version `0.4.4`; mock stage→activate и failpoint→retry client prepare завершились
+  строкой `Interaction suite passed`. После проверки выполнен `docker compose down --volumes`.
+
+Фактический masked prompt, ACL каталога/token-файла, повторная установка и создание scheduled
+task на русской Windows PowerShell 5.1 остаются ожидающими физического Windows-стенда. Commit,
+push, tag и GitHub Release в рамках этой проверки не выполнялись.
+
 ## Один dual-role Publisher/client ПК v0.4.3 — 2026-08-22
 
 В рабочем дереве schema v3 разрешает ровно одному client повторять полную пару

@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.3
+# Механический тест-план v0.4.4
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -108,16 +108,19 @@
 
 ## 6. Client reset и сохранность состояния
 
-1. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
-2. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
+1. На русской Windows PowerShell 5.1 запустить `Install-IscsiResetClient.ps1` без token в
+   аргументах. Проверить скрытый ввод token, default и явно заданный `ResetApiIp`, а также ACL
+   каталога и `client.token` только для SID `S-1-5-18` и `S-1-5-32-544`.
+2. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
+3. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
    client marker — исчезнуть после проверенного rollback к `@clean`.
-3. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
+4. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
    clones не должны пересекаться.
-4. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
+5. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
    неполном release mapping, неправильном origin и сбое после mutation.
-5. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
+6. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
    должны сохраниться.
-6. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
+7. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
 ## 7. Один dual-role Publisher/client ПК

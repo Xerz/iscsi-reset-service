@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.3
+# iSCSI Reset Service v0.4.4
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -653,8 +653,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 Установщик копирует `publisher.json` и вспомогательный скрипт в
-`C:\ProgramData\IscsiResetPublisher`, закрывает ACL для `SYSTEM` и `Administrators` и не
-сохраняет сетевые учётные данные. После изменения
+`C:\ProgramData\IscsiResetPublisher`, закрывает ACL по SID системной учётной записи и
+встроенной группы администраторов и не сохраняет сетевые учётные данные. После изменения
 конфигурации Publisher скачайте новый `publisher.json` и повторите установку до следующего
 `Disconnect`.
 
@@ -667,20 +667,31 @@ Install-IscsiResetClient.ps1
 Reset-And-Connect.ps1
 ```
 
-Скопируйте на него также `reset-ca.crt` и однажды показанный исходный client token этого ПК.
-В повышенной Windows PowerShell 5.1:
+Скопируйте на него также `reset-ca.crt`. Один раз показанный исходный client token не
+подставляйте в командную строку: установщик запросит его скрыто, поэтому значение не попадёт в
+историю PowerShell. В повышенной Windows PowerShell 5.1:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
-./Install-IscsiResetClient.ps1 \
-  -Token "<RAW_CLIENT_TOKEN>" \
-  -CaCertificatePath ./reset-ca.crt \
-  -ApiBaseUrl "https://10.20.40.10:8443"
+./Install-IscsiResetClient.ps1 -CaCertificatePath ./reset-ca.crt
 ```
 
-Установщик импортирует CA, сохраняет токен с ACL только для `SYSTEM` и `Administrators`,
-включает Microsoft iSCSI Initiator и создаёт задачу `iSCSI Reset and Connect` при загрузке.
-Подключение всегда создаётся с `IsPersistent=false`.
+На приглашении `Reset API IP [10.20.40.10]` нажмите Enter для указанного адреса либо введите
+другой SAN IPv4. Затем вставьте токен в приглашение `Client token`: ввод маскируется. Если IP
+заранее известен, его можно передать без секрета в истории:
+
+```powershell
+./Install-IscsiResetClient.ps1 `
+  -CaCertificatePath ./reset-ca.crt `
+  -ResetApiIp 10.20.40.10
+```
+
+Reset API всегда используется по `https://<введённый-IP>:8443`; hostname и IPv6 установщик
+отклоняет. Установщик сначала закрывает ACL каталога
+`C:\ProgramData\IscsiReset` по неизменяемым SID системной учётной записи и встроенной группы
+администраторов, затем импортирует CA, сохраняет токен, включает Microsoft iSCSI Initiator и
+создаёт задачу `iSCSI Reset and Connect` при загрузке. Подключение всегда создаётся с
+`IsPersistent=false`.
 
 Reset API возвращает только portal, собственную цель клиента и набор
 `{lun, disk_unique_id, drive_letter, label}`. Имя релиза, пути снимков и чужие цели клиенту не
@@ -765,6 +776,26 @@ session того же ПК блокирует и создание, и актив
 исправьте проблему Publisher и повторите `Reconnect`, не откатывая активный релиз автоматически.
 
 ## Диагностика
+
+### Старый client installer завершился с `IdentityNotMappedException`
+
+Версия до `0.4.4` назначала ACL по английским именам локальных учётных записей и могла
+остановиться на русской Windows уже после записи `C:\ProgramData\IscsiReset\client.token`.
+Считайте переданный в аргументе и сохранённый в истории raw token раскрытым: создайте для
+клиента новый token в панели, сохраните конфигурацию и перезапустите Custom App. Затем скачайте
+оба клиентских `.ps1` из актуального GitHub Release и повторно запустите установщик без
+`-Token`. Он до записи нового токена закроет ACL существующего каталога, перезапишет файлы и
+завершит установку; вручную удалять каталог не нужно.
+
+Проверить итоговый ACL можно из повышенной Windows PowerShell:
+
+```powershell
+(Get-Acl C:\ProgramData\IscsiReset\client.token).Access |
+  Select-Object IdentityReference, FileSystemRights, AccessControlType
+```
+
+Должны остаться только системная учётная запись (`S-1-5-18`) и встроенная группа
+администраторов (`S-1-5-32-544`) с `FullControl`.
 
 ### `Discovery unavailable`
 

@@ -33,10 +33,10 @@ Copy-Item -LiteralPath $PublisherScriptPath -Destination $installedScript -Force
 
 & icacls.exe $InstallDirectory /inheritance:r | Out-Null
 & icacls.exe $InstallDirectory `
-    /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" | Out-Null
+    /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
 foreach ($path in @($configPath, $installedScript)) {
     & icacls.exe $path /inheritance:r | Out-Null
-    & icacls.exe $path /grant:r "SYSTEM:F" "Administrators:F" | Out-Null
+    & icacls.exe $path /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
 }
 
 Write-Host "Publisher helper installed: $installedScript"

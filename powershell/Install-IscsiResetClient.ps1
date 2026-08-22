@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$Token,
     [Parameter(Mandatory = $true)][string]$CaCertificatePath,
-    [string]$ApiBaseUrl = "https://10.20.40.10:8443",
+    [string]$ResetApiIp,
     [string]$InstallRoot = "C:\ProgramData\IscsiReset",
     [string]$ClientScriptPath = (Join-Path $PSScriptRoot "Reset-And-Connect.ps1")
 )
@@ -10,56 +9,183 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$principal = New-Object Security.Principal.WindowsPrincipal($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw "Run this installer from an elevated Windows PowerShell 5.1 prompt"
+function Resolve-ResetApiAddress {
+    param([AllowEmptyString()][string]$Address)
+
+    $candidate = $Address
+    if ([string]::IsNullOrWhiteSpace($candidate)) {
+        $candidate = Read-Host "Reset API IP [10.20.40.10]"
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            $candidate = "10.20.40.10"
+        }
+    }
+    $candidate = $candidate.Trim()
+
+    $parsed = $null
+    $isIp = [System.Net.IPAddress]::TryParse($candidate, [ref]$parsed)
+    if (-not $isIp -or
+        $parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $parsed.ToString() -ne $candidate) {
+        throw "ResetApiIp must be a canonical IPv4 address"
+    }
+
+    return [pscustomobject]@{
+        Ip = $candidate
+        BaseUrl = "https://${candidate}:8443"
+    }
 }
-if (-not $ApiBaseUrl.StartsWith("https://")) { throw "ApiBaseUrl must use HTTPS" }
-if (-not (Test-Path -LiteralPath $ClientScriptPath)) { throw "Client script not found" }
-if (-not (Test-Path -LiteralPath $CaCertificatePath)) { throw "CA certificate not found" }
 
-New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $InstallRoot "logs") -Force | Out-Null
-$installedScript = Join-Path $InstallRoot "Reset-And-Connect.ps1"
-$tokenPath = Join-Path $InstallRoot "client.token"
-Copy-Item -LiteralPath $ClientScriptPath -Destination $installedScript -Force
-[System.IO.File]::WriteAllText($tokenPath, $Token, (New-Object System.Text.UTF8Encoding($false)))
+function Read-ClientToken {
+    $secureToken = Read-Host "Client token" -AsSecureString
+    $pointer = [IntPtr]::Zero
+    try {
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+        $plainText = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
+        if ([string]::IsNullOrWhiteSpace($plainText)) {
+            throw "Client token must not be empty"
+        }
+        return [pscustomobject]@{
+            PlainText = $plainText
+            SecureString = $secureToken
+        }
+    }
+    catch {
+        $secureToken.Dispose()
+        throw
+    }
+    finally {
+        if ($pointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
+        }
+    }
+}
 
-$acl = New-Object System.Security.AccessControl.FileSecurity
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($account in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) {
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $account,
-        "FullControl",
-        "Allow"
+function New-RestrictedFileSystemAcl {
+    param([switch]$Directory)
+
+    if ($Directory) {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    }
+    else {
+        $acl = New-Object System.Security.AccessControl.FileSecurity
+    }
+    $acl.SetAccessRuleProtection($true, $false)
+
+    foreach ($sidValue in @("S-1-5-18", "S-1-5-32-544")) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidValue)
+        if ($Directory) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid,
+                "FullControl",
+                "ContainerInherit, ObjectInherit",
+                "None",
+                "Allow"
+            )
+        }
+        else {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid,
+                "FullControl",
+                "Allow"
+            )
+        }
+        $acl.AddAccessRule($rule)
+    }
+    return $acl
+}
+
+function New-ClientRequestHeaders {
+    param([Parameter(Mandatory = $true)][string]$ClientToken)
+
+    return @{
+        Authorization = "Bearer $ClientToken"
+        "X-Request-ID" = [Guid]::NewGuid().ToString("D")
+    }
+}
+
+function New-ResetScheduledTaskArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][string]$ClientTokenPath
     )
-    $acl.AddAccessRule($rule)
-}
-Set-Acl -LiteralPath $tokenPath -AclObject $acl
 
-Import-Certificate -FilePath $CaCertificatePath -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
-Set-Service -Name MSiSCSI -StartupType Automatic
-Start-Service -Name MSiSCSI
-
-$headers = @{ Authorization = "Bearer $Token"; "X-Request-ID" = [Guid]::NewGuid().ToString("D") }
-$client = Invoke-RestMethod -Method GET -Uri "$ApiBaseUrl/v1/client" -Headers $headers -TimeoutSec 30
-foreach ($session in @(Get-IscsiSession | Where-Object {
-    $_.TargetNodeAddress -eq [string]$client.target_iqn -and $_.IsPersistent
-})) {
-    Unregister-IscsiSession -SessionIdentifier $session.SessionIdentifier
+    return "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass " +
+        "-File `"$ScriptPath`" -ApiBaseUrl `"$BaseUrl`" " +
+        "-TokenPath `"$ClientTokenPath`""
 }
 
-$powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installedScript`" -ApiBaseUrl `"$ApiBaseUrl`" -TokenPath `"$tokenPath`""
-$action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$trigger.Delay = "PT15S"
-$principalTask = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $action -Trigger $trigger `
-    -Principal $principalTask -Settings $settings -Force | Out-Null
+function Invoke-IscsiResetClientInstall {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Run this installer from an elevated Windows PowerShell 5.1 prompt"
+    }
+    if (-not (Test-Path -LiteralPath $ClientScriptPath)) { throw "Client script not found" }
+    if (-not (Test-Path -LiteralPath $CaCertificatePath)) { throw "CA certificate not found" }
 
-Write-Host "Installed iSCSI reset client. Reboot to run the first reset and non-persistent login."
+    $api = Resolve-ResetApiAddress -Address $ResetApiIp
+    $tokenInput = Read-ClientToken
+    $token = $tokenInput.PlainText
+    $secureToken = $tokenInput.SecureString
+    $headers = $null
+    try {
+        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+        Set-Acl -LiteralPath $InstallRoot -AclObject (New-RestrictedFileSystemAcl -Directory)
+        New-Item -ItemType Directory -Path (Join-Path $InstallRoot "logs") -Force | Out-Null
 
+        $installedScript = Join-Path $InstallRoot "Reset-And-Connect.ps1"
+        $tokenPath = Join-Path $InstallRoot "client.token"
+        Copy-Item -LiteralPath $ClientScriptPath -Destination $installedScript -Force
+        Set-Acl -LiteralPath $installedScript -AclObject (New-RestrictedFileSystemAcl)
+        [System.IO.File]::WriteAllText(
+            $tokenPath,
+            $token,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        Set-Acl -LiteralPath $tokenPath -AclObject (New-RestrictedFileSystemAcl)
+
+        Import-Certificate -FilePath $CaCertificatePath `
+            -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
+        Set-Service -Name MSiSCSI -StartupType Automatic
+        Start-Service -Name MSiSCSI
+
+        $headers = New-ClientRequestHeaders -ClientToken $token
+        $client = Invoke-RestMethod -Method GET -Uri "$($api.BaseUrl)/v1/client" `
+            -Headers $headers -TimeoutSec 30
+        foreach ($session in @(Get-IscsiSession | Where-Object {
+            $_.TargetNodeAddress -eq [string]$client.target_iqn -and $_.IsPersistent
+        })) {
+            Unregister-IscsiSession -SessionIdentifier $session.SessionIdentifier
+        }
+
+        $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $arguments = New-ResetScheduledTaskArguments -ScriptPath $installedScript `
+            -BaseUrl $api.BaseUrl -ClientTokenPath $tokenPath
+        $action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $trigger.Delay = "PT15S"
+        $principalTask = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
+            -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $action `
+            -Trigger $trigger -Principal $principalTask -Settings $settings -Force | Out-Null
+
+        Write-Host "Installed iSCSI reset client for Reset API $($api.Ip):8443."
+        Write-Host "Reboot to run the first reset and non-persistent login."
+    }
+    finally {
+        $headers = $null
+        $token = $null
+        $tokenInput = $null
+        if ($null -ne $secureToken) {
+            $secureToken.Dispose()
+            $secureToken = $null
+        }
+    }
+}
+
+if ($MyInvocation.InvocationName -ne ".") {
+    Invoke-IscsiResetClientInstall
+}
