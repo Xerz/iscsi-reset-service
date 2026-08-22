@@ -5,7 +5,7 @@
 В рабочем дереве schema v3 разрешает ровно одному client повторять полную пару
 `publisher.source_ip + publisher.initiator_iqn` при обязательной отдельной target. Частичные
 совпадения и второй shared client отклоняются. Контракты Reset API, SQLite и PowerShell не
-изменялись. Commit, push, tag и GitHub Release для `v0.4.3` не выполнялись.
+изменялись. Изменения выпущены аннотированным tag `v0.4.3` из commit `c6b0f8b`.
 
 ### Локальные автоматические проверки v0.4.3
 
@@ -27,8 +27,15 @@
   `sha256sum --check SHA256SUMS` завершился `OK` для YAML, digest-файла и четырёх `.ps1`, а
   сгенерированный YAML прошёл `docker compose config --quiet`.
 
-Windows PowerShell-файлы не изменялись. Windows PowerShell 5.1/Pester CI для commit/tag
-`v0.4.3` ещё не запускался, поскольку публикация оставлена до отдельной команды пользователя.
+- CI ветки `main` для commit `c6b0f8b` завершился успешно: Python/JavaScript, Compose interaction
+  и Windows PowerShell 5.1/Pester прошли. Publish workflow для tag `v0.4.3` повторно выполнил
+  тот же gate, собрал linux/amd64 image, создал provenance attestation и GitHub Release.
+- Опубликованный GitHub Release `v0.4.3` скачан повторно. Он содержит ровно семь assets;
+  `sha256sum --check SHA256SUMS` завершился `OK` для YAML, digest-файла и четырёх `.ps1`.
+  Release YAML прошёл `docker compose config --quiet`, содержит два одинаковых image reference
+  `ghcr.io/xerz/iscsi-reset-service@sha256:30f7ac8a891145bd728031b21f82f0d188ad3186e77aac013958a4b3ffc21e7e`,
+  два placeholder управляющего IP-адреса и не содержит старых Admin API artifacts.
+
 Фактическое переключение одного Windows ПК между master и client target, классификация реальных
 сеансов TrueNAS и повторное разрешение stage/activation после полного отключения остаются
 ожидающими физического стенда.
