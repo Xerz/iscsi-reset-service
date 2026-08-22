@@ -1,6 +1,14 @@
 BeforeAll {
     $script:ClientScriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) "Reset-And-Connect.ps1"
     . $script:ClientScriptPath -NoMain
+    function Get-TestSingleDiskNumber {
+        param([Parameter(Mandatory = $true)]$Value)
+        $numbers = @($Value)
+        if ($numbers.Count -ne 1) {
+            throw "Expected exactly one mocked disk number"
+        }
+        return [int]$numbers[0]
+    }
     if ($null -eq (Get-Command Set-Disk -ErrorAction SilentlyContinue)) {
         Set-Item -Path "function:Set-Disk" -Value { param($Number, $IsOffline) }
     }
@@ -142,6 +150,10 @@ Describe "Simulation disk isolation" {
 }
 
 Describe "Windows drive-letter reconciliation" {
+    It "normalizes the UInt32 array shape used by the real Windows Storage cmdlets" {
+        Get-TestSingleDiskNumber -Value ([uint32[]]@(10)) | Should -Be 10
+    }
+
     BeforeEach {
         $script:SimulationStatePath = ""
         $script:ExpectedVolumes = @(
@@ -161,7 +173,8 @@ Describe "Windows drive-letter reconciliation" {
 
         Mock Set-Disk { }
         Mock Get-Partition {
-            return $script:Partitions[[int]$DiskNumber]
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            return $script:Partitions[$number]
         }
         Mock Get-ResetPartitionVolumes {
             return [pscustomobject]@{
@@ -193,10 +206,12 @@ Describe "Windows drive-letter reconciliation" {
             return @()
         }
         Mock Remove-PartitionAccessPath {
-            $script:Partitions[[int]$DiskNumber].DriveLetter = $null
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            $script:Partitions[$number].DriveLetter = $null
         }
         Mock Set-Partition {
-            $script:Partitions[[int]$DiskNumber].DriveLetter = [string]$NewDriveLetter
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            $script:Partitions[$number].DriveLetter = [string]$NewDriveLetter
         }
     }
 
@@ -309,13 +324,14 @@ Describe "Windows drive-letter reconciliation" {
 
         $script:SessionDisks[0].IsReadOnly = $false
         Mock Get-Partition {
-            if ($DiskNumber -eq 10) {
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            if ($number -eq 10) {
                 return @(
                     [pscustomobject]@{ DiskNumber = 10; PartitionNumber = 1; Type = "Basic"; DriveLetter = "E" },
                     [pscustomobject]@{ DiskNumber = 10; PartitionNumber = 2; Type = "Basic"; DriveLetter = $null }
                 )
             }
-            return $script:Partitions[[int]$DiskNumber]
+            return $script:Partitions[$number]
         }
         { Mount-ResetVolumes -ExpectedVolumes $script:ExpectedVolumes -Disks $script:SessionDisks } |
             Should -Throw "*exactly one data partition*"
@@ -345,7 +361,8 @@ Describe "Windows drive-letter reconciliation" {
         Mock Get-Partition {
             $script:PartitionReads++
             if ($script:PartitionReads -eq 1) { return @() }
-            return $script:Partitions[[int]$DiskNumber]
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            return $script:Partitions[$number]
         }
 
         Mount-ResetVolumes -ExpectedVolumes $script:ExpectedVolumes -Disks $script:SessionDisks
@@ -374,8 +391,9 @@ Describe "Windows drive-letter reconciliation" {
         $script:Partitions[10].DriveLetter = "F"
         $script:Partitions[11].DriveLetter = "E"
         Mock Set-Partition {
-            if ($DiskNumber -eq 11) { throw "injected assignment failure" }
-            $script:Partitions[[int]$DiskNumber].DriveLetter = [string]$NewDriveLetter
+            $number = Get-TestSingleDiskNumber -Value $DiskNumber
+            if ($number -eq 11) { throw "injected assignment failure" }
+            $script:Partitions[$number].DriveLetter = [string]$NewDriveLetter
         }
 
         { Mount-ResetVolumes -ExpectedVolumes $script:ExpectedVolumes -Disks $script:SessionDisks } |

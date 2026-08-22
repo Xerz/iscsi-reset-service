@@ -35,6 +35,17 @@ SQLite и параметры runtime-скрипта не изменялись.
   тест переводит каждую identity обратно в `SecurityIdentifier` перед сравнением; production
   ACL-код не менялся.
 
+### CI commit `d72ee30`
+
+- Python/JavaScript и Compose interaction jobs прошли.
+- Windows PowerShell 5.1 подтвердил исправление ACL assertion, но обнаружил вторую разницу
+  тестовой среды: настоящий `Get-Partition` объявляет `DiskNumber` как `UInt32[]`, поэтому
+  Pester передавал mock-функциям одноэлементный массив вместо scalar из Linux-заглушки.
+- До выполнения letter logic успели пройти **45 tests**, а девять Windows reconciliation tests
+  завершились одним и тем же test-only преобразованием `UInt32[]` в `Int32`; production-код в
+  этих падениях не участвовал. Текущие mocks явно требуют ровно один disk number и извлекают
+  его первый элемент.
+
 ### Локальные автоматические проверки текущего hotfix
 
 - `ruff check .` — passed.
@@ -44,7 +55,7 @@ SQLite и параметры runtime-скрипта не изменялись.
   `node tests/static_connection_presentations.test.mjs` и `git diff --check` — passed.
 - Все `.ps1` разобраны PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` —
   syntax passed.
-- Pester 5.7.1 в Linux PowerShell-контейнере — **53 passed, 1 skipped**. Проверены правильные,
+- Pester 5.7.1 в Linux PowerShell-контейнере — **54 passed, 1 skipped**. Проверены правильные,
   свободные и переставленные `E/F`, внешний владелец, wrong/extra NAA, read-only, лишние
   partitions, label mismatch, metadata retry/timeout, partial assignment, итоговая сверка,
   этапы JSONL и отсутствие token. Пропущен только настоящий Windows ACL object test.
