@@ -881,15 +881,18 @@ Describe "Epic Games client manifest validation and transaction" {
             [Parameter(Mandatory = $true)][string]$ConfigRevision,
             [Parameter(Mandatory = $true)][string]$AppName,
             [Parameter(Mandatory = $true)][string]$Guid,
-            [string[]]$InstallTags = @("default")
+            [string[]]$InstallTags = @("default"),
+            [switch]$OmitComponent
         )
         $installLocation = Join-Path $VolumeRoot $AppName
         $egstore = Join-Path $installLocation ".egstore"
         New-Item -ItemType Directory -Path $egstore -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $installLocation "$AppName.exe") -Value "exe"
         [IO.File]::WriteAllBytes((Join-Path $egstore "$Guid.manifest"), [byte[]](1, 2, 3))
-        @{ AppName = $AppName } | ConvertTo-Json | Set-Content `
-            -LiteralPath (Join-Path $egstore "$Guid.mancpn")
+        if (-not $OmitComponent) {
+            @{ AppName = $AppName } | ConvertTo-Json | Set-Content `
+                -LiteralPath (Join-Path $egstore "$Guid.mancpn")
+        }
         $bytes = New-ClientTestItemBytes -AppName $AppName -Guid $Guid `
             -InstallLocation $installLocation -InstallTags $InstallTags
         $bundle = [ordered]@{
@@ -926,14 +929,16 @@ Describe "Epic Games client manifest validation and transaction" {
     }
 
     It "validates Fortnite install tags and accepts an empty bundle" {
+        $fortniteId = "6CBCB32C02D40E72A7D7C61F8AB8A4A"
         $bundlePath = New-ClientTestBundle -VolumeRoot $script:EgsClientRoot `
             -VolumeName "ssd" -ConfigRevision "rev-1" -AppName "Fortnite" `
-            -Guid "44444444444444444444444444444444" `
-            -InstallTags @("chunk0", "chunk10", "chunk10optional")
+            -Guid $fortniteId -InstallTags @("chunk0", "chunk10", "chunk10optional") `
+            -OmitComponent
 
         $items = @(Read-ClientEgsBundle -Path $bundlePath -ConfigRevision "rev-1" `
             -VolumeName "ssd" -VolumeRoot $script:EgsClientRoot)
         $items.Count | Should -Be 1
+        $items[0].InstallationGuid | Should -Be $fortniteId
         $payload = [Text.Encoding]::UTF8.GetString($items[0].Bytes) | ConvertFrom-Json
         @($payload.InstallTags) -join "," | Should -Be "chunk0,chunk10,chunk10optional"
 
@@ -948,7 +953,7 @@ Describe "Epic Games client manifest validation and transaction" {
             -VolumeName "ssd" -VolumeRoot $script:EgsClientRoot).Count | Should -Be 0
     }
 
-    It "rejects bad revision, hash, GUID, and volume path" {
+    It "rejects bad revision, hash, installation identifier, and volume path" {
         $bundlePath = New-ClientTestBundle -VolumeRoot $script:EgsClientRoot `
             -VolumeName "ssd" -ConfigRevision "rev-1" -AppName "Fortnite" `
             -Guid "55555555555555555555555555555555"
@@ -965,6 +970,29 @@ Describe "Epic Games client manifest validation and transaction" {
             Read-ClientEgsBundle -Path $bundlePath -ConfigRevision "rev-1" `
                 -VolumeName "ssd" -VolumeRoot $script:EgsClientRoot
         } | Should -Throw "*hash verification failed*"
+
+        $invalidIdPath = New-ClientTestBundle -VolumeRoot $script:EgsClientRoot `
+            -VolumeName "ssd" -ConfigRevision "rev-1" -AppName "Fortnite" `
+            -Guid "55555555555555555555555555555555"
+        $invalidIdBundle = Get-Content -LiteralPath $invalidIdPath -Raw | ConvertFrom-Json
+        $invalidItemBytes = [Convert]::FromBase64String(
+            [string]$invalidIdBundle.manifests[0].payload_base64
+        )
+        $invalidItem = [Text.Encoding]::UTF8.GetString($invalidItemBytes) | ConvertFrom-Json
+        $invalidItem.InstallationGuid = "unsafe-id"
+        $invalidItemBytes = [Text.Encoding]::UTF8.GetBytes(
+            ($invalidItem | ConvertTo-Json -Depth 8)
+        )
+        $invalidIdBundle.manifests[0].installation_guid = "unsafe-id"
+        $invalidIdBundle.manifests[0].sha256 = Get-EgsSha256Hex $invalidItemBytes
+        $invalidIdBundle.manifests[0].payload_base64 = [Convert]::ToBase64String(
+            $invalidItemBytes
+        )
+        $invalidIdBundle | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $invalidIdPath
+        {
+            Read-ClientEgsBundle -Path $invalidIdPath -ConfigRevision "rev-1" `
+                -VolumeName "ssd" -VolumeRoot $script:EgsClientRoot
+        } | Should -Throw "*invalid Epic installation identifier*"
 
         $otherRoot = Join-Path $TestDrive "other-volume"
         New-Item -ItemType Directory -Path $otherRoot -Force | Out-Null

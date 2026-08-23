@@ -152,23 +152,26 @@
    должен существовать `.iscsi-reset\egs-manifests.v1.json`; третий bundle должен иметь пустой
    `manifests`. SHA-256/Base64 обязаны воспроизводить точные исходные `.item`, включая разные
    `InstallTags` GTA/Fortnite.
-4. Поочерёдно подменить на копии стенда GUID, install path, hash, `config_revision`,
-   `volume_name`, `.egstore\<GUID>.manifest/.mancpn` и executable. Publisher должен отказать до
-   pending/offline/disconnect; client — вернуть `40`, не записать `ready` и отключить только
-   созданную этим запуском session.
-5. Проверить локальный unmanaged `.item` с тем же `AppName` и постороннюю локальную EGS-игру.
+4. Проверить EGS-authored 31- и 32-символьные hex `InstallationGuid`; точные `.item` и
+   `.egstore\<InstallationGuid>.manifest` должны приниматься. Отсутствующий у Fortnite
+   `.mancpn` допустим, но существующий `.mancpn` обязан быть валидным JSON с тем же `AppName`.
+5. Поочерёдно подменить на копии стенда installation ID, install path, hash,
+   `config_revision`, `volume_name`, обязательный `.manifest`, существующий `.mancpn` и
+   executable. Publisher должен отказать до pending/offline/disconnect; client — вернуть `40`,
+   не записать `ready` и отключить только созданную этим запуском session.
+6. Проверить локальный unmanaged `.item` с тем же `AppName` и постороннюю локальную EGS-игру.
    Конфликт должен дать безопасный отказ; посторонняя игра и её bytes должны сохраниться.
    Удаление игры из нового bundle должно удалить только точную запись из
    `egs-managed-apps.v1.json`.
-6. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
+7. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
    согласовать весь набор заново. На клиенте имитировать отказ после первой замены `.item`:
    проверенный rollback должен восстановить все bytes и managed-state, а следующий запуск —
    успешно завершить транзакцию. При искусственно неполном rollback журнал должен сохраниться.
-7. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
+8. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
    актуальном release EGS должен показать `Launch`. На старом release он должен показать
    `Update`, а не `Install`; Auto Update сетевых игр должен быть отключён штатным переключателем
    EGS, и загрузка не должна начаться автоматически.
-8. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
+9. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
    загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
    `InstallTags`/компонентами, а не реконструкцией `.item`.
 

@@ -5,17 +5,30 @@
 В рабочем дереве добавлена локальная opt-in синхронизация точных Epic Games `.item` между
 Publisher и клиентом. Schema v3, Reset/Management API, SQLite и TrueNAS backend не менялись.
 
+### Операторские данные реального EGS Publisher
+
+- Реальный `Disconnect` остановился до pending/offline/disconnect на первоначальной проверке
+  Fortnite `InstallationGuid` как ровно 32 hex-символов. Диски остались подключены, то есть
+  fail-closed порядок mutations подтвердился.
+- EGS-authored `.item` имел точное имя `6CBCB32C02D40E72A7D7C61F8AB8A4A.item` и такое же
+  31-символьное значение `InstallationGuid`. Непустой `<InstallationGuid>.manifest`
+  присутствовал, а точный `<InstallationGuid>.mancpn` отсутствовал.
+- Эти данные опровергают две первоначальные гипотезы формата: фиксированную длину 32 и
+  обязательность `.mancpn` для каждой игры. Hotfix принимает безопасный hex ID длиной 16–64,
+  сохраняет точное совпадение `.item`/`.manifest` и строго проверяет `.mancpn`, когда он есть.
+
 ### Локальные автоматические проверки
 
 - PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — syntax passed для всех
   production и test `.ps1`.
 - Pester 5.7.1 в том же Linux PowerShell-контейнере — **76 passed, 0 failed, 1 skipped** из 77.
   Покрыты Enabled/Disabled, graceful/forced EGS close, GTA/Fortnite с разными `InstallTags`,
-  три произвольных тома и пустой bundle, неверные GUID/path/hash/config revision, unmanaged
+  наблюдавшийся 31-символьный Fortnite ID без `.mancpn`, 32-символьный ID с `.mancpn`, три
+  произвольных тома и пустой bundle, неверные ID/path/hash/config revision, unmanaged
   `AppName`, сохранение посторонней игры, частичная запись, rollback и успешный retry. Пропущен
   существующий Windows-only ACL object test.
 - `ruff check src tests` — passed.
-- `pytest -q` — **133 passed** за 1.88 секунды.
+- `pytest -q` — **133 passed** за 1.91 секунды.
 - `docker compose config --quiet` — passed.
 - `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
   passed на локальном arm64 Docker host: оба сервиса сообщили version `0.4.6`, итог —

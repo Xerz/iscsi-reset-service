@@ -277,18 +277,22 @@ Describe "Publisher Epic Games manifest bundles" {
                 [Parameter(Mandatory = $true)][string]$AppName,
                 [Parameter(Mandatory = $true)][string]$Guid,
                 [Parameter(Mandatory = $true)][string]$VolumeRoot,
-                [Parameter(Mandatory = $true)][string[]]$InstallTags
+                [Parameter(Mandatory = $true)][string[]]$InstallTags,
+                [switch]$OmitComponent
             )
             $installLocation = Join-Path $VolumeRoot $AppName
             $egstore = Join-Path $installLocation ".egstore"
             New-Item -ItemType Directory -Path $egstore -Force | Out-Null
             Set-Content -LiteralPath (Join-Path $installLocation "$AppName.exe") -Value "exe"
             [IO.File]::WriteAllBytes((Join-Path $egstore "$Guid.manifest"), [byte[]](1, 2, 3))
-            @{
-                AppName = $AppName
-                CatalogItemId = "catalog-$AppName"
-                CatalogNamespace = "namespace-$AppName"
-            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $egstore "$Guid.mancpn")
+            if (-not $OmitComponent) {
+                @{
+                    AppName = $AppName
+                    CatalogItemId = "catalog-$AppName"
+                    CatalogNamespace = "namespace-$AppName"
+                } | ConvertTo-Json | Set-Content `
+                    -LiteralPath (Join-Path $egstore "$Guid.mancpn")
+            }
             $item = [ordered]@{
                 AppName = $AppName
                 AppVersionString = "build-$AppName"
@@ -326,13 +330,15 @@ Describe "Publisher Epic Games manifest bundles" {
     }
 
     It "writes exact GTA and Fortnite manifests to arbitrary three-volume bundles" {
+        $fortniteId = "6CBCB32C02D40E72A7D7C61F8AB8A4A"
         New-PublisherTestEgsItem -AppName "GTA5" `
             -Guid "11111111111111111111111111111111" `
             -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
         New-PublisherTestEgsItem -AppName "Fortnite" `
-            -Guid "22222222222222222222222222222222" `
+            -Guid $fortniteId `
             -VolumeRoot $script:EgsMappings[1].RootPath `
-            -InstallTags @("chunk0", "chunk10", "chunk10optional") | Out-Null
+            -InstallTags @("chunk0", "chunk10", "chunk10optional") `
+            -OmitComponent | Out-Null
 
         Export-PublisherEgsBundles -Manifest $script:EgsManifest `
             -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
@@ -349,10 +355,11 @@ Describe "Publisher Epic Games manifest bundles" {
         @($bonus.manifests).Count | Should -Be 0
         $fortniteBytes = [Convert]::FromBase64String($hdd.manifests[0].payload_base64)
         $fortnite = [Text.Encoding]::UTF8.GetString($fortniteBytes) | ConvertFrom-Json
+        $fortnite.InstallationGuid | Should -Be $fortniteId
         @($fortnite.InstallTags) | Should -Be @("chunk0", "chunk10", "chunk10optional")
     }
 
-    It "rejects a bad GUID before writing any volume bundle" {
+    It "rejects an unsafe installation identifier before writing any volume bundle" {
         New-PublisherTestEgsItem -AppName "Fortnite" `
             -Guid "33333333333333333333333333333333" `
             -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("chunk0") | Out-Null
@@ -364,7 +371,7 @@ Describe "Publisher Epic Games manifest bundles" {
         {
             Export-PublisherEgsBundles -Manifest $script:EgsManifest `
                 -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
-        } | Should -Throw "*invalid Epic installation GUID*"
+        } | Should -Throw "*invalid Epic installation identifier*"
 
         foreach ($mapping in $script:EgsMappings) {
             Test-Path -LiteralPath (Join-Path $mapping.RootPath `

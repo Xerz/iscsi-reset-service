@@ -133,6 +133,11 @@ function Get-RequiredEgsString {
     return $value
 }
 
+function Test-EgsInstallationId {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    return $Value -match "^[0-9A-Fa-f]{16,64}$"
+}
+
 function Stop-EgsLauncherProcesses {
     param([int]$GraceSeconds = 15)
     $names = @("EpicGamesLauncher", "EpicWebHelper")
@@ -796,8 +801,8 @@ function Assert-ClientEgsItem {
     )
     $appName = Get-RequiredEgsString -Item $Item -Name "AppName"
     $guid = Get-RequiredEgsString -Item $Item -Name "InstallationGuid"
-    if ($guid -notmatch "^[0-9A-Fa-f]{32}$") {
-        throw "$appName has an invalid Epic installation GUID"
+    if (-not (Test-EgsInstallationId $guid)) {
+        throw "$appName has an invalid Epic installation identifier"
     }
     if ($appName -ne [string]$Entry.app_name -or
         $guid -ne [string]$Entry.installation_guid) {
@@ -834,16 +839,17 @@ function Assert-ClientEgsItem {
 
     $binaryManifest = Join-Path $egstore "$guid.manifest"
     $component = Join-Path $egstore "$guid.mancpn"
-    if (-not (Test-Path -LiteralPath $binaryManifest -PathType Leaf) -or
-        -not (Test-Path -LiteralPath $component -PathType Leaf)) {
-        throw "$appName .egstore metadata is incomplete"
+    if (-not (Test-Path -LiteralPath $binaryManifest -PathType Leaf)) {
+        throw "$appName .egstore binary manifest is missing"
     }
     if ((Get-Item -LiteralPath $binaryManifest).Length -le 0) {
         throw "$appName binary manifest is empty"
     }
-    $componentData = Get-Content -LiteralPath $component -Raw | ConvertFrom-Json
-    if ([string]$componentData.AppName -ne $appName) {
-        throw "$appName .mancpn AppName does not match"
+    if (Test-Path -LiteralPath $component -PathType Leaf) {
+        $componentData = Get-Content -LiteralPath $component -Raw | ConvertFrom-Json
+        if ([string]$componentData.AppName -ne $appName) {
+            throw "$appName .mancpn AppName does not match"
+        }
     }
 
     if ($Item.PSObject.Properties.Name -contains "LaunchExecutable" -and
@@ -950,7 +956,7 @@ function Read-ClientEgsManagedState {
         $guid = [string]$entry.installation_guid
         $sha256 = [string]$entry.sha256
         if ([string]::IsNullOrWhiteSpace($appName) -or $seen.ContainsKey($appName) -or
-            $guid -notmatch "^[0-9A-Fa-f]{32}$" -or $sha256 -notmatch "^[0-9A-Fa-f]{64}$") {
+            -not (Test-EgsInstallationId $guid) -or $sha256 -notmatch "^[0-9A-Fa-f]{64}$") {
             throw "Epic Games managed state contains an invalid or duplicate AppName"
         }
         $seen[$appName] = $true

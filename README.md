@@ -785,8 +785,11 @@ Reset API возвращает только portal, собственную це�
 
 При `Disconnect` Publisher сначала закрывает `EpicGamesLauncher`, ждёт до 15 секунд и
 принудительно завершает оставшиеся `EpicGamesLauncher`/`EpicWebHelper`. После точной сверки
-master-дисков по NAA helper проверяет `AppName`, GUID, build, `InstallTags`, абсолютные пути,
-`.egstore` metadata и executable. На каждом томе, в том числе без EGS-игр, атомарно создаётся
+master-дисков по NAA helper проверяет `AppName`, непрозрачный hex `InstallationGuid`, build,
+`InstallTags`, абсолютные пути, `.egstore` metadata и executable. Идентификатор не приводится к
+стандартному GUID: EGS может создать 31-символьное значение. Имя `.item` и обязательного
+непустого `.manifest` должно точно совпадать с ним; `.mancpn` проверяется, если EGS его создал.
+На каждом томе, в том числе без EGS-игр, атомарно создаётся
 `X:\.iscsi-reset\egs-manifests.v1.json`. Bundle содержит редакцию конфигурации, логическое имя
 тома, SHA-256 и Base64 точных байтов каждого `.item`. Ошибка записи или повторного чтения не
 создаёт publisher pending state, не переводит диски offline и не отключает target.
