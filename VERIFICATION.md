@@ -51,10 +51,13 @@ backend, managed-state v1 и `egs-sync.json` не менялись.
   windows-simulation` — passed на локальном arm64 Docker host. Оба сервиса сообщили version
   `0.4.8`, итог — `Interaction suite passed`. Затем выполнен `docker compose down --volumes`;
   контейнеры, сеть и три тестовых volume удалены.
+- [CI run `32654190032`](https://github.com/Xerz/iscsi-reset-service/actions/runs/32654190032)
+  для commit `a32c09f` прошёл во всех трёх jobs: Python/JavaScript, Compose interaction и
+  настоящий Windows PowerShell 5.1 завершились успешно. Pester 5.7.1 на Windows выполнил
+  **96 passed, 0 failed, 0 skipped** за 13.17 секунды.
 
 ### Ожидает Windows/TrueNAS стенда
 
-- Windows PowerShell 5.1/Pester 5.7.1 CI для текущего commit;
 - реальный Publisher `Disconnect` с тремя полными регистрациями и создание нового v2 release;
 - чистый EGS client с тремя `.item`, managed-state, тремя записями `LauncherInstalled.dat` и
   последовательностью registration sync → manifest sync ready → ready до запуска EGS;
