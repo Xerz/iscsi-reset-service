@@ -6,6 +6,36 @@ BeforeAll {
 }
 
 Describe "iSCSI reset client installer inputs" {
+    It "does not evaluate PSScriptRoot from a parameter default" {
+        $powerShellRoot = Split-Path $script:InstallerPath -Parent
+        $paths = @(
+            $script:InstallerPath,
+            (Join-Path $powerShellRoot "Install-IscsiReleasePublisher.ps1"),
+            (Join-Path $powerShellRoot "Reset-And-Connect.ps1"),
+            (Join-Path $powerShellRoot "Publish-IscsiRelease.ps1")
+        )
+
+        foreach ($path in $paths) {
+            $parseErrors = $null
+            $tokens = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile(
+                $path,
+                [ref]$tokens,
+                [ref]$parseErrors
+            )
+            $parseErrors.Count | Should -Be 0
+            $parameters = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.ParameterAst]
+            }, $true))
+            foreach ($parameter in $parameters) {
+                if ($null -ne $parameter.DefaultValue) {
+                    $parameter.DefaultValue.Extent.Text | Should -Not -Match '\$PSScriptRoot'
+                }
+            }
+        }
+    }
+
     It "does not accept a raw token or full API URL as parameters" {
         $parseErrors = $null
         $tokens = $null

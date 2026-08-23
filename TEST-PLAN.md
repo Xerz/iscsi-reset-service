@@ -147,31 +147,35 @@
 2. Повторно установить оба helper с `-EpicGamesManifestSync Enabled`. Проверить защищённые
    `egs-sync.json`; при `Disabled` Publisher не должен создавать bundle, а клиент — закрывать
    EGS или менять локальные `.item`/managed-state.
-3. Открыть реальный EGS и выполнить Publisher `Disconnect`. Проверить graceful close до 15
+3. Запустить установленные client и Publisher helper отдельным `powershell.exe -File` без
+   явного `-EgsSyncConfigPath`. Оба должны загрузиться без parameter-binding ошибки и выбрать
+   соседний `egs-sync.json`. Повторить с явным произвольным безопасным путём и убедиться, что
+   override не заменяется default-значением.
+4. Открыть реальный EGS и выполнить Publisher `Disconnect`. Проверить graceful close до 15
    секунд и forced close оставшихся `EpicGamesLauncher`/`EpicWebHelper`. На каждом master-томе
    должен существовать `.iscsi-reset\egs-manifests.v1.json`; третий bundle должен иметь пустой
    `manifests`. SHA-256/Base64 обязаны воспроизводить точные исходные `.item`, включая разные
    `InstallTags` GTA/Fortnite.
-4. Проверить EGS-authored 31- и 32-символьные hex `InstallationGuid`; точные `.item` и
+5. Проверить EGS-authored 31- и 32-символьные hex `InstallationGuid`; точные `.item` и
    `.egstore\<InstallationGuid>.manifest` должны приниматься. Отсутствующий у Fortnite
    `.mancpn` допустим, но существующий `.mancpn` обязан быть валидным JSON с тем же `AppName`.
-5. Поочерёдно подменить на копии стенда installation ID, install path, hash,
+6. Поочерёдно подменить на копии стенда installation ID, install path, hash,
    `config_revision`, `volume_name`, обязательный `.manifest`, существующий `.mancpn` и
    executable. Publisher должен отказать до pending/offline/disconnect; client — вернуть `40`,
    не записать `ready` и отключить только созданную этим запуском session.
-6. Проверить локальный unmanaged `.item` с тем же `AppName` и постороннюю локальную EGS-игру.
+7. Проверить локальный unmanaged `.item` с тем же `AppName` и постороннюю локальную EGS-игру.
    Конфликт должен дать безопасный отказ; посторонняя игра и её bytes должны сохраниться.
    Удаление игры из нового bundle должно удалить только точную запись из
    `egs-managed-apps.v1.json`.
-7. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
+8. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
    согласовать весь набор заново. На клиенте имитировать отказ после первой замены `.item`:
    проверенный rollback должен восстановить все bytes и managed-state, а следующий запуск —
    успешно завершить транзакцию. При искусственно неполном rollback журнал должен сохраниться.
-8. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
+9. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
    актуальном release EGS должен показать `Launch`. На старом release он должен показать
    `Update`, а не `Install`; Auto Update сетевых игр должен быть отключён штатным переключателем
    EGS, и загрузка не должна начаться автоматически.
-9. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
+10. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
    загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
    `InstallTags`/компонентами, а не реконструкцией `.item`.
 

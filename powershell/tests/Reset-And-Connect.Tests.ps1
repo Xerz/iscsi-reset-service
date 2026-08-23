@@ -58,6 +58,23 @@ BeforeAll {
 }
 
 Describe "Reset-And-Connect safety helpers" {
+    It "resolves the default EGS config beside the script and preserves an override" {
+        Resolve-EgsSyncConfigPath -Path "" | Should -Be (
+            Join-Path (Split-Path $script:ClientScriptPath -Parent) "egs-sync.json"
+        )
+        Resolve-EgsSyncConfigPath -Path "D:\custom\egs-sync.json" |
+            Should -Be "D:\custom\egs-sync.json"
+    }
+
+    It "starts through a child PowerShell process without an explicit EGS config path" {
+        $powerShell = (Get-Process -Id $PID).Path
+        $output = @(& $powerShell -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File $script:ClientScriptPath -NoMain 2>&1)
+        $exitCode = $LASTEXITCODE
+
+        $exitCode | Should -Be 0 -Because ($output -join [Environment]::NewLine)
+    }
+
     It "normalizes only case, whitespace, and an optional 0x prefix" {
         Normalize-DiskId " 0x65 89CF " | Should -Be "6589cf"
         Normalize-DiskId "EUI.001" | Should -Be "eui.001"

@@ -34,18 +34,32 @@ Publisher и клиентом. Schema v3, Reset/Management API, SQLite и TrueNA
   настоящий Windows PowerShell 5.1 с Pester 5.7.1 выполнил **77 passed, 0 failed, 0 skipped**,
   включая обе прежние Publisher ошибки и client managed-state assertion.
 
+### Windows PowerShell 5.1 parameter default regression
+
+- На реальном игровом ПК прямой запуск установленного `Reset-And-Connect.ps1` через
+  `powershell.exe -File` без `-EgsSyncConfigPath` завершился при parameter binding: выражение
+  `Join-Path $PSScriptRoot "egs-sync.json"` получило пустой `Path`. Ошибка произошла до main,
+  логирования, iSCSI login и disk mutations.
+- Hotfix убирает `$PSScriptRoot` из default-выражений client/Publisher runtime helper и обоих
+  installer. Соседний `egs-sync.json` либо companion script вычисляется после `param`; явные
+  `-EgsSyncConfigPath`, `-ClientScriptPath` и `-PublisherScriptPath` сохраняются без изменений.
+  До установки hotfix client можно запустить с явным
+  `-EgsSyncConfigPath "C:\ProgramData\IscsiReset\egs-sync.json"`.
+
 ### Локальные автоматические проверки
 
 - PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — syntax passed для всех
   production и test `.ps1`.
-- Pester 5.7.1 в том же Linux PowerShell-контейнере — **76 passed, 0 failed, 1 skipped** из 77.
-  Покрыты Enabled/Disabled, graceful/forced EGS close, GTA/Fortnite с разными `InstallTags`,
-  BOM-prefixed 31-символьный Fortnite ID без `.mancpn`, 32-символьный ID с `.mancpn`, три
-  произвольных тома и пустой bundle, неверные ID/path/hash/config revision, unmanaged
-  `AppName`, сохранение BOM-prefixed посторонней игры, частичная запись, rollback и успешный
-  retry. Пропущен существующий Windows-only ACL object test.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **81 passed, 0 failed, 1 skipped** из 82.
+  Покрыты запуск обоих runtime helper отдельным `pwsh -File` без явного EGS config path,
+  отсутствие `$PSScriptRoot` во всех parameter defaults, default/override path, Enabled/Disabled,
+  graceful/forced EGS close, GTA/Fortnite с разными `InstallTags`, BOM-prefixed 31-символьный
+  Fortnite ID без `.mancpn`, 32-символьный ID с `.mancpn`, три произвольных тома и пустой
+  bundle, неверные ID/path/hash/config revision, unmanaged `AppName`, сохранение BOM-prefixed
+  посторонней игры, частичная запись, rollback и успешный retry. Пропущен существующий
+  Windows-only ACL object test.
 - `ruff check src tests` — passed.
-- `pytest -q` — **133 passed** за 1.91 секунды.
+- `pytest -q` — **133 passed** за 2.03 секунды.
 - `docker compose config --quiet` — passed.
 - `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
   passed на локальном arm64 Docker host: оба сервиса сообщили version `0.4.6`, итог —

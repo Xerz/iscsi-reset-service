@@ -2,12 +2,15 @@
 param(
     [Parameter(Mandatory = $true)][string]$ManifestSourcePath,
     [string]$InstallDirectory = "C:\ProgramData\IscsiResetPublisher",
-    [string]$PublisherScriptPath = "$PSScriptRoot\Publish-IscsiRelease.ps1",
+    [string]$PublisherScriptPath = "",
     [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($PublisherScriptPath)) {
+    $PublisherScriptPath = Join-Path $PSScriptRoot "Publish-IscsiRelease.ps1"
+}
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)

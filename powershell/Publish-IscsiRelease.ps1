@@ -3,7 +3,7 @@ param(
     [ValidateSet("Disconnect", "Reconnect")][string]$Action = "Disconnect",
     [string]$ManifestPath = "C:\ProgramData\IscsiResetPublisher\publisher.json",
     [string]$PendingPath = "C:\ProgramData\IscsiResetPublisher\publisher.pending.json",
-    [string]$EgsSyncConfigPath = (Join-Path $PSScriptRoot "egs-sync.json"),
+    [string]$EgsSyncConfigPath = "",
     [string]$EgsManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests",
     [switch]$PassThruExitCode,
     [switch]$NoMain
@@ -11,6 +11,17 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+$script:DefaultPublisherEgsSyncConfigPath = Join-Path $PSScriptRoot "egs-sync.json"
+
+function Resolve-PublisherEgsSyncConfigPath {
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $script:DefaultPublisherEgsSyncConfigPath
+    }
+    return $Path
+}
+
+$EgsSyncConfigPath = Resolve-PublisherEgsSyncConfigPath -Path $EgsSyncConfigPath
 
 function Normalize-PublisherDiskId {
     param([Parameter(Mandatory = $true)][string]$Value)

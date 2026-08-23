@@ -2,7 +2,7 @@
 param(
     [string]$ApiBaseUrl = "https://10.20.40.10:8443",
     [string]$TokenPath = "C:\ProgramData\IscsiReset\client.token",
-    [string]$EgsSyncConfigPath = (Join-Path $PSScriptRoot "egs-sync.json"),
+    [string]$EgsSyncConfigPath = "",
     [int]$WaitTimeoutSeconds = 120,
     [string]$SimulationStatePath = "",
     [string]$SimulationSourceIp = "",
@@ -13,6 +13,17 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+$script:DefaultEgsSyncConfigPath = Join-Path $PSScriptRoot "egs-sync.json"
+
+function Resolve-EgsSyncConfigPath {
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $script:DefaultEgsSyncConfigPath
+    }
+    return $Path
+}
+
+$EgsSyncConfigPath = Resolve-EgsSyncConfigPath -Path $EgsSyncConfigPath
 
 function Write-ResetLog {
     param(
@@ -1345,9 +1356,10 @@ function Invoke-ResetMain {
     param(
         [string]$BaseUrl,
         [string]$ClientTokenPath,
-        [string]$SyncConfigPath = (Join-Path $PSScriptRoot "egs-sync.json"),
+        [string]$SyncConfigPath = "",
         [int]$TimeoutSeconds
     )
+    $SyncConfigPath = Resolve-EgsSyncConfigPath -Path $SyncConfigPath
     $requestId = [Guid]::NewGuid().ToString("D")
     $connectedTarget = ""
     $stage = "startup"

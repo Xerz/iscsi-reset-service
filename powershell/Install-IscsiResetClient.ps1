@@ -3,12 +3,15 @@ param(
     [Parameter(Mandatory = $true)][string]$CaCertificatePath,
     [string]$ResetApiIp,
     [string]$InstallRoot = "C:\ProgramData\IscsiReset",
-    [string]$ClientScriptPath = (Join-Path $PSScriptRoot "Reset-And-Connect.ps1"),
+    [string]$ClientScriptPath = "",
     [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($ClientScriptPath)) {
+    $ClientScriptPath = Join-Path $PSScriptRoot "Reset-And-Connect.ps1"
+}
 
 function Resolve-ResetApiAddress {
     param([AllowEmptyString()][string]$Address)
