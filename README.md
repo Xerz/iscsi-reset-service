@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.7
+# iSCSI Reset Service v0.4.8
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -790,14 +790,27 @@ master-дисков по NAA helper проверяет `AppName`, непрозр
 стандартному GUID: EGS может создать 31-символьное значение. Имя `.item` и обязательного
 непустого `.manifest` должно точно совпадать с ним; `.mancpn` проверяется, если EGS его создал.
 На каждом томе, в том числе без EGS-игр, атомарно создаётся
-`X:\.iscsi-reset\egs-manifests.v1.json`. Bundle содержит редакцию конфигурации, логическое имя
-тома, SHA-256 и Base64 точных байтов каждого `.item`. Ошибка записи или повторного чтения не
-создаёт publisher pending state, не переводит диски offline и не отключает target.
+`X:\.iscsi-reset\egs-manifests.v2.json`. Bundle содержит редакцию конфигурации, логическое имя
+тома, SHA-256 и Base64 точных байтов каждого `.item`, hashes связанного `.manifest` и
+опционального `.mancpn`, а также безопасную регистрацию из Publisher
+`LauncherInstalled.dat`. В неё входят только `InstallLocation`, `NamespaceId`, `ItemId`,
+`ArtifactId`, `AppVersion` и `AppName`: весь файл Publisher, неизвестные поля и данные других
+игр не копируются. Путь к исходному файлу можно переопределить параметром Publisher helper
+`-EgsLauncherInstalledPath`.
+
+Отсутствующий, повреждённый, дублированный либо несовпадающий Publisher
+`LauncherInstalled.dat` не блокирует выпуск: соответствующая игра получает item-only fallback
+и явное предупреждение. Так же только предупреждаются `bIsIncompleteInstall`,
+`bNeedsValidation` и непустые `.egstore\bps`/`Pending`; точный Epic-authored `.item` не
+исправляется helper автоматически. Ошибка записи или повторного чтения полного v2-набора не
+создаёт publisher pending state, не переводит диски offline и не отключает target. После
+проверки всех v2 bundle удаляются только созданные helper старые v1 bundle; частичная ошибка
+останавливает Disconnect и согласуется повторным запуском.
 
 На клиенте синхронизация выполняется только после проверки iSCSI-дисков и назначения букв, но
 до локального события `ready`. Helper закрывает EGS, требует bundle для каждого подключённого
 тома и сверяет его с редакцией Reset API, именем тома, фактическими путями и `.egstore`
-metadata. Затем он транзакционно меняет `.item` в
+metadata и hashes. Затем он транзакционно меняет `.item` в
 `C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests` и ведёт защищённый
 `C:\ProgramData\IscsiReset\egs-managed-apps.v1.json`. При включённом режиме AppName из
 проверенных bundle авторитетны: на первом запуске helper принимает существующую регистрацию
@@ -807,21 +820,25 @@ metadata. Затем он транзакционно меняет `.item` в
 managed-state; игровые каталоги и их содержимое никогда не удаляются. Посторонние AppName
 сохраняются.
 
-Локальный `LauncherInstalled.dat` не копируется с Publisher и новые недокументированные записи
-в нём не синтезируются. Если он существует, helper сохраняет точную резервную копию, оставляет
-неизвестные поля и посторонние игры, сохраняет не более одной записи управляемого AppName с
-совпадающими сетевым путём и версией и удаляет только несовпадающие/дублирующиеся регистрации.
-EGS может восстановить запись из установленного `.item` при следующем запуске. Внутренний
-transaction journal v2 восстанавливает `.item`, managed-state и `LauncherInstalled.dat`;
-оставшийся journal v1 от v0.4.6 также поддерживается.
+Локальный `LauncherInstalled.dat` не заменяется файлом Publisher. Для каждого AppName с полной
+Publisher-регистрацией helper удаляет конфликтующие локальные записи и оставляет одну запись из
+шести разрешённых полей. При чистой установке EGS отсутствующий файл создаётся как минимальный
+`InstallationList`. Посторонние локальные приложения и неизвестные top-level поля существующего
+файла сохраняются. При item-only fallback helper сохраняет одну уже совпадающую локальную запись,
+но не синтезирует новую. Точная исходная копия локального файла входит в transaction journal v2;
+rollback удаляет и впервые созданный файл. Оставшийся journal v1 от v0.4.6 также поддерживается.
 
 Коллизия, где целевой GUID-файл принадлежит другому AppName, повреждённый локальный JSON,
 ошибка проверки или неполный rollback завершается кодом `40`, не пишет `ready` и отключает
-только iSCSI-session текущего запуска. Успешный takeover пишет
-`egs_registration_takeover`, затем `egs_manifest_sync_ready` и только после этого `ready`.
+только iSCSI-session текущего запуска. Успешная синхронизация пишет
+`egs_launcher_registration_sync` с безопасными счётчиками, затем `egs_manifest_sync_ready` и
+только после этого `ready`; при takeover перед ними также появляется
+`egs_registration_takeover`.
 
-Версия v1 требует одинаковых букв и полных путей игр на Publisher и клиентах. Она не копирует
-Publisher `LauncherInstalled.dat`, LocalAppData, webcache, настройки аккаунта или авторизацию.
+Версия v2 требует одинаковых букв и полных путей игр на Publisher и клиентах. Client helper
+0.4.8 намеренно отклоняет release только с bundle v1 кодом `40`; после обновления требуется новый
+release. Механизм не копирует целиком Publisher `LauncherInstalled.dat`, LocalAppData, webcache,
+настройки аккаунта, авторизацию, EOS/service state или неизвестные поля игровых регистраций.
 Все ПК должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite
 build, ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
 `InstallTags` и [выбранных компонентов Fortnite](https://www.epicgames.com/help/c-202300000001636/c-202300000001690/a202300000015197?lang=en-US).
@@ -946,6 +963,18 @@ session того же ПК блокирует и создание, и актив
 bundle и оставляет игровые файлы прежней локальной установки нетронутыми. В успешном журнале
 при takeover ожидаются подряд `egs_registration_takeover`, `egs_manifest_sync_ready` и
 `ready`.
+
+### После чистой установки EGS игра показывает «Продолжить»
+
+Client helper v0.4.7 переносил `.item`, но при отсутствующем локальном
+`LauncherInstalled.dat` не создавал EGS-регистрацию. На реальном клиенте после полной
+переустановки Launcher это дало `Launch` только для GTA V Enhanced, тогда как GTA V и Fortnite
+показали «Продолжить» и пытались начать полную загрузку. Установите helpers 0.4.8 на Publisher
+и клиент, выполните новый `Disconnect` и создайте новый release с bundle v2: старый v1 release
+намеренно не принимается. До запуска EGS в журнале должны идти
+`egs_launcher_registration_sync` → `egs_manifest_sync_ready` → `ready`; ненулевой
+`item_only_fallback_count` или `incomplete_warning_count` означает, что распознавание конкретной
+игры по-прежнему не гарантировано.
 
 ### `Live state unavailable: A management dependency is unavailable`
 

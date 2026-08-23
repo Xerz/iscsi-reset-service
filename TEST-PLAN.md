@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.7
+# Механический тест-план v0.4.8
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -140,7 +140,8 @@
 
 ## 7. Epic Games manifest sync
 
-1. На выделенном Publisher с реальным EGS установить GTA и Fortnite на разные master-тома,
+1. На выделенном Publisher с реальным EGS установить GTA V, Fortnite и GTA V Enhanced,
+   распределив их по разным master-томам,
    выбрав для Fortnite отличающийся набор компонентов/текстур. Добавить третий произвольно
    названный том без EGS-игр. Буквы и полные пути на Publisher и тестовом клиенте должны
    совпадать.
@@ -153,38 +154,53 @@
    override не заменяется default-значением.
 4. Открыть реальный EGS и выполнить Publisher `Disconnect`. Проверить graceful close до 15
    секунд и forced close оставшихся `EpicGamesLauncher`/`EpicWebHelper`. На каждом master-томе
-   должен существовать `.iscsi-reset\egs-manifests.v1.json`; третий bundle должен иметь пустой
-   `manifests`. SHA-256/Base64 обязаны воспроизводить точные исходные `.item`, включая разные
-   `InstallTags` GTA/Fortnite.
+   должен существовать `.iscsi-reset\egs-manifests.v2.json`; старый helper-generated v1 bundle
+   должен отсутствовать, а третий v2 bundle — иметь пустой `manifests`. SHA-256/Base64 обязаны
+   воспроизводить точные исходные `.item`; hashes `.manifest`/`.mancpn` должны совпасть, а полная
+   Publisher-регистрация каждой игры — содержать только шесть разрешённых полей.
 5. Проверить EGS-authored 31- и 32-символьные hex `InstallationGuid`; точные `.item` и
    `.egstore\<InstallationGuid>.manifest` должны приниматься. Отсутствующий у Fortnite
    `.mancpn` допустим, но существующий `.mancpn` обязан быть валидным JSON с тем же `AppName`.
-6. Поочерёдно подменить на копии стенда installation ID, install path, hash,
-   `config_revision`, `volume_name`, обязательный `.manifest`, существующий `.mancpn` и
-   executable. Publisher должен отказать до pending/offline/disconnect; client — вернуть `40`,
-   не записать `ready` и отключить только созданную этим запуском session.
-7. Проверить первый reset с unmanaged Fortnite того же GUID/пути/build, но изменённым EGS
+6. Поочерёдно подменить на копии стенда installation ID, install path, hashes `.item`,
+   `.manifest` и `.mancpn`, `config_revision`, `volume_name`, обязательный `.manifest`,
+   существующий `.mancpn` и executable. Publisher должен отказать до
+   pending/offline/disconnect; client — вернуть `40`, не записать `ready` и отключить только
+   созданную этим запуском session.
+7. Удалить EGS с клиента, установить Launcher заново, не начинать загрузки и выполнить reset.
+   До запуска EGS должны существовать три точных `.item`, managed-state и минимальный
+   `LauncherInstalled.dat` с GTA V, Fortnite и GTA V Enhanced. Ожидаемый порядок:
+   `egs_launcher_registration_sync` → `egs_manifest_sync_ready` → `ready`; все три игры должны
+   показать `Launch`.
+8. Проверить первый reset с unmanaged Fortnite того же GUID/пути/build, но изменённым EGS
    полем `BaseURLs`. Helper должен архивировать исходные bytes, записать точный bundle,
    создать managed-state и завершить последовательностью `egs_registration_takeover` →
-   `egs_manifest_sync_ready` → `ready`.
-8. Повторить с локальным Fortnite на системном диске, другим GUID и несовпадающими/дублированными
+   `egs_launcher_registration_sync` → `egs_manifest_sync_ready` → `ready`.
+9. Повторить с локальным Fortnite на системном диске, другим GUID и несовпадающими/дублированными
    записями `LauncherInstalled.dat`. Helper должен сохранить точные резервные копии под
    `egs-displaced-registrations`, удалить только старую регистрацию, оставить каталог и marker
    локальной игры, одну совпадающую сетевую запись и все посторонние приложения/поля.
-   Отсутствующий `LauncherInstalled.dat` допустим; повреждённый JSON и целевой GUID-файл другого
-   AppName должны дать код `40` до `ready`.
-9. Удаление управляемой игры из нового bundle должно удалить только её прежний managed `.item`;
+   Повреждённый локальный JSON и целевой GUID-файл другого AppName должны дать код `40` до
+   `ready`.
+10. Удалить или повредить Publisher `LauncherInstalled.dat`, создать дубли и несовпадающие
+   path/version. `Disconnect` должен продолжиться с предупреждением, bundle — получить
+   `launcher_registration: null`, а клиент — ненулевой `item_only_fallback_count` без создания
+   новой записи. Повторить с incomplete-флагами и непустыми `bps`/`Pending`: выпуск разрешён,
+   но `incomplete_warning_count` ненулевой.
+11. Удаление управляемой игры из нового bundle должно удалить только её прежний managed `.item`;
    посторонняя локальная EGS-игра и её bytes должны сохраниться.
-10. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
-   согласовать весь набор заново. На клиенте имитировать отказ после первой замены `.item`:
+12. Имитировать отказ после первой записи v2 bundle и после удаления первого v1 bundle
+   Publisher. Повторный `Disconnect` должен согласовать весь набор заново. На клиенте
+   имитировать отказ после первой замены `.item` и после создания нового `LauncherInstalled.dat`:
    проверенный rollback должен восстановить все bytes, managed-state и `LauncherInstalled.dat`,
    а следующий запуск — успешно завершить транзакцию. Отдельно восстановить оставшийся journal
    v1 от v0.4.6; при искусственно неполном rollback журнал должен сохраниться.
-11. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
+13. Активировать старый release только с v1: client 0.4.8 должен вернуть `40`, не записать
+   `ready` и отключить только session текущего запуска.
+14. Выполнить полный Publisher → stage → activate → client workflow для трёх игр. На
    актуальном release EGS должен показать `Launch`. На старом release он должен показать
    `Update`, а не `Install`; Auto Update сетевых игр должен быть отключён штатным переключателем
    EGS, и загрузка не должна начаться автоматически.
-12. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
+15. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
    загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
    `InstallTags`/компонентами, а не реконструкцией `.item`.
 

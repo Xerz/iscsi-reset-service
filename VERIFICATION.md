@@ -1,5 +1,69 @@
 # Verification record
 
+## Epic Games registration bundle v2 v0.4.8 — 2026-08-23
+
+Publisher и client helpers теперь синхронизируют bundle schema 2. Помимо точных байтов `.item`,
+bundle связывает release с hashes `.egstore\<InstallationGuid>.manifest` и опционального
+`.mancpn`, а также переносит нормализованную регистрацию конкретной игры из шести разрешённых
+полей Publisher `LauncherInstalled.dat`. Schema v3, Reset/Management API, SQLite, TrueNAS
+backend, managed-state v1 и `egs-sync.json` не менялись.
+
+### Операторские данные реального EGS client 0.4.7
+
+- После полной деинсталляции EGS, чистой установки Launcher, перезагрузки и client reset только
+  GTA V Enhanced появилась как готовая к запуску. GTA V и Fortnite показали «Продолжить», а
+  нажатие начинало повторную загрузку.
+- Это реальное наблюдение не доказывает внутреннюю причину поведения EGS, но показывает, что
+  точных `.item` и находящейся в iSCSI snapshot `.egstore` недостаточно для воспроизводимого
+  результата после чистой установки Launcher. В v0.4.7 helper не создавал отсутствующие
+  игровые записи `LauncherInstalled.dat`.
+
+### Реализация и локальные автоматические проверки
+
+- Publisher извлекает только `InstallLocation`, `NamespaceId`, `ItemId`, `ArtifactId`,
+  `AppVersion` и `AppName` из единственной записи с совпадающими AppName, путём и версией.
+  Отсутствующий, повреждённый, дублированный или несовпадающий launcher-файл даёт
+  `launcher_registration: null` и item-only fallback, но не блокирует Disconnect.
+- `bIsIncompleteInstall`, `bNeedsValidation` и непустые `.egstore\bps`/`Pending` сохраняются как
+  коды предупреждений. После атомарной записи и повторной проверки полного v2-набора Publisher
+  удаляет только helper-generated v1 bundle; частичная ошибка остаётся до
+  pending/offline/disconnect и согласуется retry.
+- Client принимает только bundle v2, проверяет hashes `.item`, `.manifest` и `.mancpn`, а затем
+  в существующей транзакции обновляет `.item`, managed-state и локальный
+  `LauncherInstalled.dat`. При чистой установке создаётся минимальный `InstallationList`; при
+  merge сохраняются посторонние игры и неизвестные top-level поля. Item-only fallback не
+  синтезирует новую игровую запись. Rollback восстанавливает точные исходные bytes и удаляет
+  впервые созданный launcher-файл.
+- PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — passed для всех
+  production и test `.ps1`.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **95 passed, 0 failed, 1 skipped** из 96
+  за 11.21 секунды. Покрыты три игры и произвольные три тома, полный registration import,
+  item-only fallback, incomplete warnings, v1 rejection, hash failures, сохранение посторонних
+  данных, clean-EGS creation, rollback после `.item`, launcher и managed-state mutations,
+  journal v1 recovery, Publisher partial write/v1 removal, retry и порядок событий
+  `egs_launcher_registration_sync` → `egs_manifest_sync_ready` → `ready`. Пропущен только
+  существующий Windows-only ACL object test.
+- `ruff check .` — passed; `pytest -q --cov=iscsi_reset_service --cov-report=term-missing` —
+  **133 passed**, total coverage 79%, за 3.66 секунды. JavaScript syntax/static presentation
+  tests — passed.
+- `docker compose config --quiet` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host. Оба сервиса сообщили version
+  `0.4.8`, итог — `Interaction suite passed`. Затем выполнен `docker compose down --volumes`;
+  контейнеры, сеть и три тестовых volume удалены.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Windows PowerShell 5.1/Pester 5.7.1 CI для текущего commit;
+- реальный Publisher `Disconnect` с тремя полными регистрациями и создание нового v2 release;
+- чистый EGS client с тремя `.item`, managed-state, тремя записями `LauncherInstalled.dat` и
+  последовательностью registration sync → manifest sync ready → ready до запуска EGS;
+- `Launch` для GTA V, Fortnite и GTA V Enhanced без повторной полной загрузки при совпадающем
+  build; старый v1 release должен fail-closed завершиться кодом `40`;
+- реальные incomplete-warning/item-only fallback и точный rollback на Windows/NTFS. Если при
+  полной v2-регистрации остаётся «Продолжить», следующим отдельным этапом исследуются launcher
+  logs и game-specific metadata без слепого переноса webcache, аккаунта или авторизации.
+
 ## Epic Games first-run takeover v0.4.7 — 2026-08-23
 
 `EpicGamesManifestSync Enabled` теперь авторитетно переключает уже зарегистрированный AppName

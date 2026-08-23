@@ -328,6 +328,32 @@ Describe "Publisher Epic Games manifest bundles" {
             [IO.File]::WriteAllBytes($path, $bytes)
             return $path
         }
+
+        function New-PublisherTestLauncherEntry {
+            param(
+                [Parameter(Mandatory = $true)][string]$AppName,
+                [Parameter(Mandatory = $true)][string]$VolumeRoot,
+                [string]$Version = ""
+            )
+            if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "build-$AppName" }
+            return [ordered]@{
+                InstallLocation = (Join-Path $VolumeRoot $AppName)
+                NamespaceId = "namespace-$AppName"
+                ItemId = "item-$AppName"
+                ArtifactId = "artifact-$AppName"
+                AppVersion = $Version
+                AppName = $AppName
+            }
+        }
+
+        function Set-PublisherTestLauncherInstalled {
+            param(
+                [Parameter(Mandatory = $true)][string]$Path,
+                [Parameter(Mandatory = $true)]$InstallationList
+            )
+            [ordered]@{ InstallationList = @($InstallationList) } |
+                ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path
+        }
     }
 
     BeforeEach {
@@ -335,6 +361,9 @@ Describe "Publisher Epic Games manifest bundles" {
         Remove-Item -LiteralPath $script:EgsManifestDirectory -Recurse -Force `
             -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
+        $script:EgsLauncherInstalledPath = Join-Path $TestDrive "LauncherInstalled.dat"
+        Remove-Item -LiteralPath $script:EgsLauncherInstalledPath -Force `
+            -ErrorAction SilentlyContinue
         $script:EgsMappings = @(
             [pscustomobject]@{ Name = "ssd"; RootPath = (Join-Path $TestDrive "ssd"); Disk = $null },
             [pscustomobject]@{ Name = "hdd"; RootPath = (Join-Path $TestDrive "hdd"); Disk = $null },
@@ -350,28 +379,47 @@ Describe "Publisher Epic Games manifest bundles" {
         }
     }
 
-    It "writes exact GTA and Fortnite manifests to arbitrary three-volume bundles" {
+    It "writes exact manifests and safe registrations for three games and volumes" {
         $fortniteId = "6CBCB32C02D40E72A7D7C61F8AB8A4A"
         New-PublisherTestEgsItem -AppName "GTA5" `
             -Guid "11111111111111111111111111111111" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        New-PublisherTestEgsItem -AppName "GTA5Enhanced" `
+            -Guid "22222222222222222222222222222222" `
             -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
         New-PublisherTestEgsItem -AppName "Fortnite" `
             -Guid $fortniteId `
             -VolumeRoot $script:EgsMappings[1].RootPath `
             -InstallTags @("chunk0", "chunk10", "chunk10optional") `
             -Utf8Bom -OmitComponent | Out-Null
+        Set-PublisherTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @(
+                New-PublisherTestLauncherEntry -AppName "GTA5" `
+                    -VolumeRoot $script:EgsMappings[0].RootPath
+                New-PublisherTestLauncherEntry -AppName "GTA5Enhanced" `
+                    -VolumeRoot $script:EgsMappings[0].RootPath
+                New-PublisherTestLauncherEntry -AppName "Fortnite" `
+                    -VolumeRoot $script:EgsMappings[1].RootPath
+            )
+        foreach ($mapping in $script:EgsMappings) {
+            $metadata = Join-Path $mapping.RootPath ".iscsi-reset"
+            New-Item -ItemType Directory -Path $metadata -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $metadata "egs-manifests.v1.json") `
+                -Value "legacy"
+        }
 
         Export-PublisherEgsBundles -Manifest $script:EgsManifest `
-            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory `
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath
 
         $ssd = Get-Content -LiteralPath (Join-Path $script:EgsMappings[0].RootPath `
-            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+            ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json
         $hdd = Get-Content -LiteralPath (Join-Path $script:EgsMappings[1].RootPath `
-            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+            ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json
         $bonus = Get-Content -LiteralPath (Join-Path $script:EgsMappings[2].RootPath `
-            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+            ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json
 
-        @($ssd.manifests).Count | Should -Be 1
+        @($ssd.manifests).Count | Should -Be 2
         @($hdd.manifests).Count | Should -Be 1
         @($bonus.manifests).Count | Should -Be 0
         $fortniteBytes = [Convert]::FromBase64String($hdd.manifests[0].payload_base64)
@@ -379,6 +427,91 @@ Describe "Publisher Epic Games manifest bundles" {
         $fortnite = ConvertFrom-EgsJsonBytes -Bytes $fortniteBytes
         $fortnite.InstallationGuid | Should -Be $fortniteId
         @($fortnite.InstallTags) | Should -Be @("chunk0", "chunk10", "chunk10optional")
+        $hdd.manifests[0].launcher_registration.app_name | Should -Be "Fortnite"
+        $hdd.manifests[0].launcher_registration.PSObject.Properties.Name |
+            Sort-Object | Should -Be @(
+                "app_name", "app_version", "artifact_id", "install_location", "item_id",
+                "namespace_id"
+            )
+        $hdd.manifests[0].binary_manifest_sha256 | Should -Match "^[0-9a-f]{64}$"
+        $hdd.manifests[0].mancpn_sha256 | Should -BeNullOrEmpty
+        foreach ($mapping in $script:EgsMappings) {
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v1.json") | Should -BeFalse
+        }
+    }
+
+    It "uses item-only fallback for missing, duplicate, and mismatched registrations" {
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "10101010101010101010101010101010" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        New-PublisherTestEgsItem -AppName "Fortnite" `
+            -Guid "20202020202020202020202020202020" `
+            -VolumeRoot $script:EgsMappings[1].RootPath -InstallTags @("chunk0") | Out-Null
+        New-PublisherTestEgsItem -AppName "GTA5Enhanced" `
+            -Guid "30303030303030303030303030303030" `
+            -VolumeRoot $script:EgsMappings[1].RootPath -InstallTags @("default") | Out-Null
+        Set-PublisherTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @(
+                New-PublisherTestLauncherEntry -AppName "Fortnite" `
+                    -VolumeRoot $script:EgsMappings[1].RootPath
+                New-PublisherTestLauncherEntry -AppName "Fortnite" `
+                    -VolumeRoot $script:EgsMappings[1].RootPath
+                New-PublisherTestLauncherEntry -AppName "GTA5Enhanced" `
+                    -VolumeRoot $script:EgsMappings[1].RootPath -Version "wrong-build"
+            )
+
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory `
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath
+
+        $entries = @($script:EgsMappings | ForEach-Object {
+            (Get-Content -LiteralPath (Join-Path $_.RootPath `
+                ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json).manifests
+        })
+        $entries.Count | Should -Be 3
+        @($entries | Where-Object { $null -ne $_.launcher_registration }).Count |
+            Should -Be 0
+    }
+
+    It "warns but exports exact incomplete installation state" {
+        $guid = "40404040404040404040404040404040"
+        $itemPath = New-PublisherTestEgsItem -AppName "Fortnite" -Guid $guid `
+            -VolumeRoot $script:EgsMappings[1].RootPath -InstallTags @("chunk0")
+        $item = Get-Content -LiteralPath $itemPath -Raw | ConvertFrom-Json
+        $item | Add-Member -NotePropertyName bIsIncompleteInstall -NotePropertyValue $true
+        $item | Add-Member -NotePropertyName bNeedsValidation -NotePropertyValue $true
+        $item | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $itemPath
+        $egstore = Join-Path (Join-Path $script:EgsMappings[1].RootPath "Fortnite") ".egstore"
+        New-Item -ItemType Directory -Path (Join-Path $egstore "bps") -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $egstore "Pending") -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $egstore "bps/staging.dat") -Value "pending"
+        Set-Content -LiteralPath (Join-Path $egstore "Pending/chunk.dat") -Value "pending"
+
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory `
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath
+
+        $bundle = Get-Content -LiteralPath (Join-Path $script:EgsMappings[1].RootPath `
+            ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json
+        @($bundle.manifests[0].state_warnings | Sort-Object) | Should -Be @(
+            "bps_nonempty", "item_incomplete", "item_needs_validation", "pending_nonempty"
+        )
+    }
+
+    It "treats an invalid LauncherInstalled.dat as item-only fallback" {
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "50505050505050505050505050505050" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        Set-Content -LiteralPath $script:EgsLauncherInstalledPath -Value "not-json"
+
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory `
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath
+
+        $bundle = Get-Content -LiteralPath (Join-Path $script:EgsMappings[0].RootPath `
+            ".iscsi-reset/egs-manifests.v2.json") -Raw | ConvertFrom-Json
+        $bundle.manifests[0].launcher_registration | Should -BeNullOrEmpty
     }
 
     It "rejects an unsafe installation identifier before writing any volume bundle" {
@@ -397,7 +530,7 @@ Describe "Publisher Epic Games manifest bundles" {
 
         foreach ($mapping in $script:EgsMappings) {
             Test-Path -LiteralPath (Join-Path $mapping.RootPath `
-                ".iscsi-reset/egs-manifests.v1.json") | Should -BeFalse
+                ".iscsi-reset/egs-manifests.v2.json") | Should -BeFalse
         }
     }
 
@@ -425,7 +558,7 @@ Describe "Publisher Epic Games manifest bundles" {
                 -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
         } | Should -Throw "*after first bundle write*"
         Test-Path -LiteralPath (Join-Path $script:EgsMappings[0].RootPath `
-            ".iscsi-reset/egs-manifests.v1.json") | Should -BeTrue
+            ".iscsi-reset/egs-manifests.v2.json") | Should -BeTrue
 
         $script:InjectPublisherBundleFailure = $false
         Export-PublisherEgsBundles -Manifest $script:EgsManifest `
@@ -433,8 +566,50 @@ Describe "Publisher Epic Games manifest bundles" {
 
         foreach ($mapping in $script:EgsMappings) {
             Assert-PublisherEgsBundle -Path (Join-Path $mapping.RootPath `
-                ".iscsi-reset/egs-manifests.v1.json") `
-                -ConfigRevision $script:EgsManifest.config_revision -VolumeName $mapping.Name
+                ".iscsi-reset/egs-manifests.v2.json") `
+                -ConfigRevision $script:EgsManifest.config_revision -VolumeName $mapping.Name `
+                -VolumeRoot $mapping.RootPath
+        }
+    }
+
+    It "reconciles every volume after partial legacy bundle removal" {
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "60606060606060606060606060606060" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        foreach ($mapping in $script:EgsMappings) {
+            $metadata = Join-Path $mapping.RootPath ".iscsi-reset"
+            New-Item -ItemType Directory -Path $metadata -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $metadata "egs-manifests.v1.json") `
+                -Value "legacy"
+        }
+        $script:RealLegacyBundleRemover = ${function:Remove-PublisherEgsLegacyBundle}
+        $script:LegacyRemovalCount = 0
+        $script:InjectLegacyRemovalFailure = $true
+        Mock Remove-PublisherEgsLegacyBundle {
+            $script:LegacyRemovalCount++
+            if ($script:InjectLegacyRemovalFailure -and $script:LegacyRemovalCount -eq 2) {
+                throw "injected after first legacy removal"
+            }
+            & $script:RealLegacyBundleRemover -Path $Path
+        }
+
+        {
+            Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+                -VolumeMappings $script:EgsMappings `
+                -ManifestDirectory $script:EgsManifestDirectory
+        } | Should -Throw "*after first legacy removal*"
+        foreach ($mapping in $script:EgsMappings) {
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v2.json") | Should -BeTrue
+        }
+
+        $script:InjectLegacyRemovalFailure = $false
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings `
+            -ManifestDirectory $script:EgsManifestDirectory
+        foreach ($mapping in $script:EgsMappings) {
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v1.json") | Should -BeFalse
         }
     }
 
