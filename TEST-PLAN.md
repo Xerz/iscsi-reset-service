@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.9
+# Механический тест-план v0.4.10
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -137,6 +137,11 @@
    должны сохраниться.
 10. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
+11. После ошибки, возникшей уже после нового login, задержать исчезновение exact client session
+    на несколько секунд. Helper должен ждать до 15 секунд и при необходимости один раз повторить
+    disconnect только для точного target IQN. Проверить `target_disconnected_after_error` лишь
+    после подтверждённого исчезновения; постоянно остающаяся session должна дать
+    `target_disconnect_failed` без optimistic `ready`.
 
 ## 7. Epic Games manifest sync
 
@@ -207,16 +212,19 @@
 16. В режиме `Aggressive` проверить Publisher snapshot всего
     `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точных bytes полного
     `LauncherInstalled.dat`: anchor — первый том manifest, ZIP/index находятся только на нём,
-    а `egs-manifests.v3.json` на каждом из трёх томов содержит один ordered volume set и
-    совпадающие hashes/размеры. V1/v2 helper bundles должны быть удалены только после полной
-    проверки v3-набора.
+    а `egs-manifests.v3.json` на каждом из трёх томов содержит один сохранённый ordered volume
+    set и совпадающие hashes/размеры. На клиенте тот же case-sensitive набор должен приниматься
+    при обратном порядке LUN/JSON; локальный системный `C:` в сравнении не участвует. V1/v2
+    helper bundles должны быть удалены только после полной проверки v3-набора.
 17. Добавить неизвестные файлы/JSON-поля, разные attributes и UTC timestamps; проверить точное
     восстановление на клиенте без Publisher ACL/SID. Поочерёдно внедрить reparse point,
     traversal, различающийся только регистром collision, более 100 000 файлов, более 1 GiB
     суммарно и файл более 512 MiB: операция должна fail-closed завершиться до `ready`.
-18. Подключить клиент только с подмножеством томов и активировать v2 release при aggressive
-    config. Оба случая должны вернуть `40`, отключить только созданную session и не менять
-    локальный ProgramData. Полный v3-набор должен дать
+18. Подключить клиент только с подмножеством томов, добавить лишний, пустой, дублированный и
+    отличающийся только регистром logical volume, а также указать anchor отсутствующего тома.
+    Каждый случай должен вернуть `40`, отключить только созданную session и не менять локальный
+    ProgramData. Отдельно активировать v2 release при aggressive config с тем же ожиданием.
+    Полный v3-набор в любом порядке должен дать
     `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
 19. Имитировать сбой Publisher после записи ZIP, index, первого v3 bundle и удаления первого
     v1/v2 bundle; pending/offline/disconnect запрещены, retry согласует весь набор. На клиенте

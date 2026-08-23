@@ -55,6 +55,11 @@ BeforeAll {
             )
         }
     }
+    if ($null -eq (Get-Command Disconnect-IscsiTarget -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Disconnect-IscsiTarget" -Value {
+            param($NodeAddress, $Confirm, $ErrorAction)
+        }
+    }
 }
 
 Describe "Reset-And-Connect safety helpers" {
@@ -625,6 +630,146 @@ Describe "Windows iSCSI target discovery" {
     }
 }
 
+Describe "Aggressive iSCSI volume-set validation" {
+    It "accepts the same two case-sensitive names in reverse LUN order" {
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "ssd") `
+                -ClientNames @("ssd", "older")
+        } | Should -Not -Throw
+    }
+
+    It "uses only Reset API iSCSI volume names and does not add the local C drive" {
+        $preparedVolumes = @(
+            [pscustomobject]@{ name = "ssd"; drive_letter = "E" },
+            [pscustomobject]@{ name = "older"; drive_letter = "D" }
+        )
+        $localSystemDisk = [pscustomobject]@{
+            name = "windows-system"
+            drive_letter = "C"
+            target_iqn = "local"
+        }
+        $clientNames = @($preparedVolumes | ForEach-Object { [string]$_.name })
+
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "ssd") `
+                -ClientNames $clientNames
+        } | Should -Not -Throw
+        $localSystemDisk.drive_letter | Should -Be "C"
+        $clientNames | Should -Not -Contain $localSystemDisk.name
+    }
+
+    It "rejects a missing volume and reports only safe counts" {
+        $failure = $null
+        try {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "ssd") `
+                -ClientNames @("ssd")
+        } catch { $failure = $_ }
+
+        $failure.Exception.Message | Should -BeLike `
+            "*publisher_count=2, client_count=1*"
+        $failure.Exception.Message | Should -Not -Match "older|ssd"
+    }
+
+    It "rejects extra, empty, duplicate, and case-mismatched volume names" {
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "ssd") `
+                -ClientNames @("older", "ssd", "extra")
+        } | Should -Throw "*volume set mismatch*"
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "") `
+                -ClientNames @("older", "ssd")
+        } | Should -Throw "*volume set mismatch*"
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "older") `
+                -ClientNames @("older", "ssd")
+        } | Should -Throw "*volume set mismatch*"
+        {
+            Assert-ClientEgsExactVolumeNameSet -PublisherNames @("older", "SSD") `
+                -ClientNames @("older", "ssd")
+        } | Should -Throw "*volume set mismatch*"
+    }
+
+    It "rejects an anchor that is absent from the mounted iSCSI set" {
+        $roots = @(
+            [pscustomobject]@{ Name = "ssd"; Root = "E:\" },
+            [pscustomobject]@{ Name = "older"; Root = "D:\" }
+        )
+
+        {
+            Resolve-ClientEgsAggressiveAnchorRoot -AnchorVolume "system" `
+                -VolumeRoots $roots
+        } | Should -Throw "*anchor is not a mounted iSCSI volume*"
+        {
+            Resolve-ClientEgsAggressiveAnchorRoot -AnchorVolume "SSD" `
+                -VolumeRoots $roots
+        } | Should -Throw "*anchor is not a mounted iSCSI volume*"
+        Resolve-ClientEgsAggressiveAnchorRoot -AnchorVolume "ssd" `
+            -VolumeRoots $roots | Should -Be "E:\"
+    }
+}
+
+Describe "iSCSI failure cleanup" {
+    BeforeEach {
+        $script:SimulationStatePath = ""
+        $script:CleanupTarget = "iqn.2026-08.lab.games:chimera"
+        $script:CleanupQueries = 0
+        $script:CleanupDisconnects = 0
+        Mock Start-Sleep { }
+        Mock Disconnect-IscsiTarget { $script:CleanupDisconnects++ }
+    }
+
+    It "waits for delayed Windows session removal before reporting success" {
+        Mock Get-ResetSessions {
+            $script:CleanupQueries++
+            if ($script:CleanupQueries -lt 3) {
+                return [pscustomobject]@{ TargetNodeAddress = $script:CleanupTarget }
+            }
+            return @()
+        }
+
+        Disconnect-ResetTarget -TargetIqn $script:CleanupTarget -MaxAttempts 4 `
+            -RetryAttempt 4 -DelayMilliseconds 0
+
+        Should -Invoke Disconnect-IscsiTarget -Times 1 -Exactly -ParameterFilter {
+            $NodeAddress -ceq $script:CleanupTarget
+        }
+        Should -Invoke Get-ResetSessions -Times 3 -Exactly -ParameterFilter {
+            $TargetIqn -ceq $script:CleanupTarget
+        }
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+    }
+
+    It "retries the exact target once when Windows keeps the session briefly" {
+        Mock Get-ResetSessions {
+            if ($script:CleanupDisconnects -lt 2) {
+                return [pscustomobject]@{ TargetNodeAddress = $script:CleanupTarget }
+            }
+            return @()
+        }
+
+        Disconnect-ResetTarget -TargetIqn $script:CleanupTarget -MaxAttempts 4 `
+            -RetryAttempt 3 -DelayMilliseconds 0
+
+        Should -Invoke Disconnect-IscsiTarget -Times 2 -Exactly -ParameterFilter {
+            $NodeAddress -ceq $script:CleanupTarget
+        }
+    }
+
+    It "fails closed when the exact target session never disappears" {
+        Mock Get-ResetSessions {
+            return [pscustomobject]@{ TargetNodeAddress = $script:CleanupTarget }
+        }
+
+        {
+            Disconnect-ResetTarget -TargetIqn $script:CleanupTarget -MaxAttempts 4 `
+                -RetryAttempt 3 -DelayMilliseconds 0
+        } | Should -Throw "*session remained connected*"
+        Should -Invoke Disconnect-IscsiTarget -Times 2 -Exactly -ParameterFilter {
+            $NodeAddress -ceq $script:CleanupTarget
+        }
+    }
+}
+
 Describe "Startup flow failure handling" {
     BeforeEach {
         $script:SimulationStatePath = Join-Path $TestDrive "startup-state.json"
@@ -814,6 +959,40 @@ Describe "Startup flow failure handling" {
         $state = Read-SimulationState
         @($state.sessions).Count | Should -Be 0
         ($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter | Should -Be "C"
+        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { ($_ | ConvertFrom-Json).event })
+        $events | Should -Contain "target_disconnected_after_error"
+        $events | Should -Not -Contain "target_disconnect_failed"
+    }
+
+    It "keeps the failure fail-closed when the created session cannot be removed" {
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Disconnect-ResetTarget { throw "persistent session" }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath -TimeoutSeconds 2
+
+        $code | Should -Be 40
+        @((Read-SimulationState).sessions).Count | Should -Be 1
+        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { ($_ | ConvertFrom-Json).event })
+        $events | Should -Contain "target_disconnect_failed"
+        $events | Should -Not -Contain "target_disconnected_after_error"
     }
 
     It "disconnects the newly-created session when enabled EGS sync fails" {

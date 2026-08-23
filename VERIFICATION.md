@@ -1,5 +1,50 @@
 # Verification record
 
+## Epic Games iSCSI volume-order и cleanup hotfix v0.4.10 — 2026-08-23
+
+### Операторские данные реального клиента v0.4.9
+
+- Reset API подготовил ровно два client volume. Windows успешно проверила два iSCSI-диска с
+  буквами `E:` и `D:`, после чего aggressive sync завершился до изменения ProgramData ошибкой
+  `Epic Games aggressive sync requires the exact Publisher volume set`.
+- В том же запуске немедленная проверка после `Disconnect-IscsiTarget` записала
+  `target_disconnect_failed`. Это не доказывает, что Windows окончательно не удалила session:
+  v0.4.9 не ожидал асинхронного исчезновения объекта.
+- Проверка исходного кода локализовала volume-set отказ до order-sensitive сравнения двух
+  JSON-массивов. Локальный системный `C:` не поступает из Reset API и не входит в Publisher v3
+  topology; существующий v3 release совместим с hotfix.
+
+### Реализация и быстрые локальные проверки
+
+- Client сравнивает `publisher_volume_names` и имена `prepared.volumes` как точные
+  case-sensitive множества. Обратный порядок LUN/букв/JSON принимается; отсутствующий, лишний,
+  пустой, дублированный и отличающийся регистром том отклоняется с безопасными количествами без
+  имён или путей. Anchor разрешается только exact-match на подключённом iSCSI-томе.
+- Publisher flow и bundle schema v3 не менялись: ordered-массив и детерминированный anchor
+  сохраняются. ProgramData snapshot, journal v3, API/schema v3, SQLite и backend не менялись.
+- Cleanup обращается только к exact target IQN, выполняет до 16 проверок с 15 паузами по одной
+  секунде и один ограниченный повтор disconnect после пяти секунд. Успешное событие пишется
+  только после подтверждённого отсутствия session; постоянная session сохраняет
+  `target_disconnect_failed` и общий fail-closed код.
+- PowerShell parser закреплённого `mcr.microsoft.com/powershell` прошёл для всех production и
+  test `.ps1`.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **110 passed, 0 failed, 1 skipped** из 111
+  за 12.01 секунды. Новые тесты покрывают обратный порядок двух томов, исключение локального
+  `C:`, missing/extra/empty/duplicate/case mismatch, отсутствующий anchor, задержанное удаление
+  session, ограниченный retry, постоянную session и оба diagnostic event. Пропущен только
+  существующий Windows-only ACL object test.
+- По согласованному быстрому профилю локальные Ruff, Pytest и Compose не запускались. Push в
+  `main` не ожидает GitHub CI; tag и GitHub Release не создаются.
+
+### Ожидает Windows/TrueNAS стенда
+
+- удалить оставшуюся exact client session, обновить только client helper и повторить reset на
+  существующем v3 release без нового Publisher Disconnect/stage/activate;
+- подтвердить реальное асинхронное удаление session Windows PowerShell 5.1 и последовательность
+  `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`;
+- проверить `Launch` для GTA V, Fortnite и GTA V Enhanced. Эти игровые результаты не следуют из
+  mock/Pester и остаются физической приёмкой.
+
 ## Epic Games aggressive ProgramData snapshot v0.4.9 — 2026-08-23
 
 ### Операторские данные реального EGS client 0.4.8

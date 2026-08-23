@@ -361,9 +361,9 @@ function Get-ResetSessions {
     param([Parameter(Mandatory = $true)][string]$TargetIqn)
     if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
         $state = Read-SimulationState
-        return @($state.sessions | Where-Object { $_.target_iqn -eq $TargetIqn })
+        return @($state.sessions | Where-Object { $_.target_iqn -ceq $TargetIqn })
     }
-    return @(Get-IscsiSession | Where-Object { $_.TargetNodeAddress -eq $TargetIqn })
+    return @(Get-IscsiSession | Where-Object { $_.TargetNodeAddress -ceq $TargetIqn })
 }
 
 function Ensure-ResetPortal {
@@ -479,14 +479,40 @@ function Connect-ResetTarget {
 }
 
 function Disconnect-ResetTarget {
-    param([Parameter(Mandatory = $true)][string]$TargetIqn)
+    param(
+        [Parameter(Mandatory = $true)][string]$TargetIqn,
+        [int]$MaxAttempts = 16,
+        [int]$RetryAttempt = 6,
+        [int]$DelayMilliseconds = 1000
+    )
+    if ($MaxAttempts -lt 1) { throw "MaxAttempts must be at least one" }
+    if ($RetryAttempt -lt 1 -or $RetryAttempt -gt $MaxAttempts) {
+        throw "RetryAttempt must be between one and MaxAttempts"
+    }
+    if ($DelayMilliseconds -lt 0) { throw "DelayMilliseconds must not be negative" }
     if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
         $state = Read-SimulationState
-        $state.sessions = @($state.sessions | Where-Object { $_.target_iqn -ne $TargetIqn })
+        $state.sessions = @($state.sessions | Where-Object { $_.target_iqn -cne $TargetIqn })
         Save-SimulationState $state
-        return
+        if (@(Get-ResetSessions -TargetIqn $TargetIqn).Count -eq 0) { return }
+        throw "iSCSI target session remained connected after cleanup"
     }
-    Disconnect-IscsiTarget -NodeAddress $TargetIqn -Confirm:$false -ErrorAction SilentlyContinue
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if ($attempt -eq 1 -or $attempt -eq $RetryAttempt) {
+            try {
+                Disconnect-IscsiTarget -NodeAddress $TargetIqn -Confirm:$false `
+                    -ErrorAction Stop | Out-Null
+            } catch {
+                # Verification below is authoritative because Windows may remove the
+                # session even when the disconnect cmdlet reports a transient error.
+            }
+        }
+        if (@(Get-ResetSessions -TargetIqn $TargetIqn).Count -eq 0) { return }
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Milliseconds $DelayMilliseconds
+        }
+    }
+    throw "iSCSI target session remained connected after cleanup"
 }
 
 function Get-ResetSessionDisks {
@@ -1389,18 +1415,80 @@ function Read-ClientEgsBundle {
     return $result
 }
 
+function Test-ClientEgsOrdinalNameMember {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
+        [Parameter(Mandatory = $true)]$Names
+    )
+    foreach ($candidate in @($Names)) {
+        if ([string]$candidate -ceq $Name) { return $true }
+    }
+    return $false
+}
+
+function Assert-ClientEgsExactVolumeNameSet {
+    param(
+        [Parameter(Mandatory = $true)]$PublisherNames,
+        [Parameter(Mandatory = $true)]$ClientNames
+    )
+    $publisher = [string[]]@($PublisherNames | ForEach-Object { [string]$_ })
+    $client = [string[]]@($ClientNames | ForEach-Object { [string]$_ })
+    $publisherCount = $publisher.Count
+    $clientCount = $client.Count
+    $invalid = $publisherCount -eq 0 -or $clientCount -eq 0
+    foreach ($name in @($publisher) + @($client)) {
+        if ([string]::IsNullOrWhiteSpace($name)) { $invalid = $true }
+    }
+    [Array]::Sort($publisher, [StringComparer]::Ordinal)
+    [Array]::Sort($client, [StringComparer]::Ordinal)
+    for ($index = 1; $index -lt $publisher.Count; $index++) {
+        if ($publisher[$index - 1] -ceq $publisher[$index]) { $invalid = $true }
+    }
+    for ($index = 1; $index -lt $client.Count; $index++) {
+        if ($client[$index - 1] -ceq $client[$index]) { $invalid = $true }
+    }
+    if (-not $invalid -and $publisherCount -eq $clientCount) {
+        for ($index = 0; $index -lt $publisherCount; $index++) {
+            if ($publisher[$index] -cne $client[$index]) {
+                $invalid = $true
+                break
+            }
+        }
+    } else {
+        $invalid = $true
+    }
+    if ($invalid) {
+        throw ("Epic Games aggressive iSCSI volume set mismatch " +
+            "(publisher_count=$publisherCount, client_count=$clientCount)")
+    }
+}
+
+function Resolve-ClientEgsAggressiveAnchorRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$AnchorVolume,
+        [Parameter(Mandatory = $true)]$VolumeRoots
+    )
+    $matches = @($VolumeRoots | Where-Object {
+        [string]$_.Name -ceq $AnchorVolume
+    })
+    if ($matches.Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$matches[0].Root)) {
+        throw "Epic Games aggressive anchor is not a mounted iSCSI volume"
+    }
+    return [string]$matches[0].Root
+}
+
 function Read-ClientEgsAggressiveBundles {
     param(
         [Parameter(Mandatory = $true)]$ExpectedVolumes,
         [Parameter(Mandatory = $true)][string]$ConfigRevision
     )
     $expectedNames = @($ExpectedVolumes | ForEach-Object { [string]$_.name })
-    if ($expectedNames.Count -eq 0) {
-        throw "Epic Games aggressive sync requires the complete Publisher volume set"
-    }
+    Assert-ClientEgsExactVolumeNameSet -PublisherNames $expectedNames `
+        -ClientNames $expectedNames
     $desired = @()
     $archiveMetadata = $null
-    $roots = @{}
+    $roots = @()
     foreach ($volume in $ExpectedVolumes) {
         $volumeName = [string]$volume.name
         $letter = ([string]$volume.drive_letter).Trim().ToUpperInvariant()
@@ -1408,7 +1496,7 @@ function Read-ClientEgsAggressiveBundles {
             throw "Invalid drive letter for Epic Games volume $volumeName"
         }
         $root = "$letter`:\"
-        $roots[$volumeName] = $root
+        $roots += [pscustomobject]@{ Name = $volumeName; Root = $root }
         $bundlePath = Join-Path $root ".iscsi-reset\egs-manifests.v3.json"
         if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
             if (Test-Path -LiteralPath (Join-Path $root `
@@ -1420,15 +1508,14 @@ function Read-ClientEgsAggressiveBundles {
         $bundle = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json
         if ([int]$bundle.schema_version -ne 3 -or
             [string]$bundle.config_revision -ne $ConfigRevision -or
-            [string]$bundle.volume_name -ne $volumeName -or
+            [string]$bundle.volume_name -cne $volumeName -or
             $bundle.PSObject.Properties.Name -notcontains "manifests" -or
             $null -eq $bundle.archive) {
             throw "Epic Games aggressive bundle does not match volume $volumeName"
         }
-        if ((@($bundle.publisher_volume_names) -join "`n") -cne
-            ($expectedNames -join "`n")) {
-            throw "Epic Games aggressive sync requires the exact Publisher volume set"
-        }
+        Assert-ClientEgsExactVolumeNameSet `
+            -PublisherNames @($bundle.publisher_volume_names) `
+            -ClientNames $expectedNames
         $metadata = $bundle.archive
         foreach ($name in @(
             "anchor_volume", "archive_file_name", "archive_sha256", "archive_length",
@@ -1439,7 +1526,8 @@ function Read-ClientEgsAggressiveBundles {
                 throw "Epic Games aggressive archive metadata is incomplete"
             }
         }
-        if ([string]$metadata.anchor_volume -notin $expectedNames -or
+        if (-not (Test-ClientEgsOrdinalNameMember `
+            -Name ([string]$metadata.anchor_volume) -Names $expectedNames) -or
             [string]$metadata.archive_file_name -cne "egs-programdata.v3.zip" -or
             [string]$metadata.index_file_name -cne "egs-programdata.v3.index.json" -or
             [string]$metadata.archive_sha256 -notmatch "^[0-9A-Fa-f]{64}$" -or
@@ -1520,7 +1608,8 @@ function Read-ClientEgsAggressiveBundles {
         $seenApps[$entry.AppName] = $true
         $seenFiles[$entry.TargetFileName] = $true
     }
-    $anchorRoot = [string]$roots[[string]$archiveMetadata.anchor_volume]
+    $anchorRoot = Resolve-ClientEgsAggressiveAnchorRoot `
+        -AnchorVolume ([string]$archiveMetadata.anchor_volume) -VolumeRoots $roots
     return [pscustomobject]@{
         Desired = $desired
         ArchiveMetadata = $archiveMetadata
@@ -3024,9 +3113,7 @@ function Invoke-ResetMain {
             $disconnectVerified = $false
             try {
                 Disconnect-ResetTarget -TargetIqn $connectedTarget
-                $disconnectVerified = @(
-                    Get-ResetSessions -TargetIqn $connectedTarget
-                ).Count -eq 0
+                $disconnectVerified = $true
             } catch { }
             if ($disconnectVerified) {
                 Write-ResetProgress -RequestId $requestId `

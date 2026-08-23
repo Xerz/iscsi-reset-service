@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.9
+# iSCSI Reset Service v0.4.10
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -802,8 +802,10 @@ Reset API возвращает только portal, собственную це�
 не меняет поведение текущих установок.
 
 Режим `Aggressive` предназначен для выделенного игрового ПК, который является точным зеркалом
-Publisher. Он требует bundle v3 и подключения полного ordered-набора Publisher-томов. Publisher
-потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные bytes всего
+Publisher. Он требует bundle v3 и подключения полного точного набора логических iSCSI-томов
+Publisher. Их имена сравниваются case-sensitive как множество: порядок LUN, букв и JSON-массива
+не влияет на результат. Локальный системный `C:` Publisher или клиента в этот набор не входит.
+Publisher потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные bytes всего
 `C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` в отдельные ZIP/index на
 первом томе manifest. Каждый том получает `egs-manifests.v3.json` с одним anchor, hashes,
 лимитами и inventory игр. Reparse points, case-insensitive collisions, traversal, более
@@ -857,13 +859,17 @@ rollback удаляет и впервые созданный файл. Оста�
 
 Коллизия, где целевой GUID-файл принадлежит другому AppName, повреждённый локальный JSON,
 ошибка проверки или неполный rollback завершается кодом `40`, не пишет `ready` и отключает
-только iSCSI-session текущего запуска. Успешная синхронизация пишет
+только iSCSI-session текущего запуска. Аварийный cleanup обращается только к точному target IQN,
+до 15 секунд ждёт исчезновения session и один раз ограниченно повторяет disconnect при задержке
+Windows. `target_disconnected_after_error` пишется лишь после подтверждённого исчезновения;
+иначе остаётся `target_disconnect_failed`. Успешная синхронизация пишет
 `egs_launcher_registration_sync` с безопасными счётчиками, затем `egs_manifest_sync_ready` и
 только после этого `ready`; при takeover перед ними также появляется
 `egs_registration_takeover`.
 
-В `Aggressive` клиент проверяет v3 bundle на каждом томе, точный полный volume set, ZIP/index и
-каждый файл, распаковывает payload в защищённый staging и атомарно меняет всё дерево `Data` и
+В `Aggressive` клиент проверяет v3 bundle на каждом iSCSI-томе, точный полный case-sensitive
+volume set без зависимости от порядка, ZIP/index и каждый файл, распаковывает payload в
+защищённый staging и атомарно меняет всё дерево `Data` и
 целый `LauncherInstalled.dat`. Старое локальное состояние сохраняется в постоянном
 SHA-addressed каталоге `C:\ProgramData\IscsiReset\egs-programdata-backups`; transaction journal
 v3 восстанавливает дерево, launcher-файл и managed-state при любой ошибке. ACL/SID Publisher не
@@ -1010,11 +1016,26 @@ Client helper v0.4.7 переносил `.item`, но при отсутству�
 показали «Продолжить» и пытались начать полную загрузку. В v0.4.8 полный v2 registration import
 для трёх игр (`3 / 0 / 0`) и официальный сброс `webcache*` результата не изменили: GTA V и
 Fortnite остались в `Продолжить`, GTA V Enhanced — в `Launch`. Для следующей проверки
-переустановите оба helper v0.4.9 с `-EpicGamesManifestSync Aggressive`, выполните новый
+переустановите оба helper v0.4.10 с `-EpicGamesManifestSync Aggressive`, выполните новый
 `Disconnect` и создайте v3 release. До запуска EGS в журнале должны идти
 `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Если и точный общий
 ProgramData snapshot не даст `Launch`, следующий шаг — сбор launcher debug logs, а не перенос
 LocalAppData, webcache или account/session state вслепую.
+
+### `Epic Games aggressive sync requires the exact Publisher volume set`
+
+На реальном клиенте v0.4.9 Reset API подготовил два тома, Windows проверила сетевые `E:` и
+`D:`, но aggressive sync завершился до изменения ProgramData: два одинаковых логических набора
+были записаны Publisher и перечислены клиентом в разном порядке LUN. Системный `C:` причиной не
+был и в topology не участвовал. Клиент v0.4.10 сравнивает только имена томов из Reset API и v3
+bundle как точные case-sensitive множества; missing, extra, empty, duplicate и различающийся
+регистром том по-прежнему дают код `40`. Anchor обязан точно указывать на один из подключённых
+iSCSI-томов.
+
+Для этого hotfix достаточно обновить и переустановить только client helper. Существующий v3
+release совместим: новый Publisher `Disconnect`, snapshot, stage или activate не требуется.
+Если предыдущий запуск оставил session, сначала отключите точный client target вручную. После
+повтора ожидаются `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
 
 ### `Live state unavailable: A management dependency is unavailable`
 
