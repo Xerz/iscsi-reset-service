@@ -28,8 +28,11 @@ Publisher и клиентом. Schema v3, Reset/Management API, SQLite и TrueNA
 - Текущий hotfix удаляет только начальный `U+FEFF` из строки перед `ConvertFrom-Json`; исходные
   байты не меняются и по-прежнему используются для SHA-256 и Base64 bundle. Publisher/client
   regression fixtures теперь детерминированно включают BOM, а managed-state assertions явно
-  оборачивают `manifests` в массив. Повторная проверка настоящим Windows PowerShell 5.1 ожидает
-  GitHub Actions после push.
+  оборачивают `manifests` в массив.
+- [CI run `32641184477`](https://github.com/Xerz/iscsi-reset-service/actions/runs/32641184477)
+  для hotfix commit `43cf7f7` прошёл во всех трёх jobs. На GitHub-hosted Windows Server 2025
+  настоящий Windows PowerShell 5.1 с Pester 5.7.1 выполнил **77 passed, 0 failed, 0 skipped**,
+  включая обе прежние Publisher ошибки и client managed-state assertion.
 
 ### Локальные автоматические проверки
 
