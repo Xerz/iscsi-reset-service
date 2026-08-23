@@ -1,5 +1,50 @@
 # Verification record
 
+## Epic Games exact bytes без Publisher NTFS metadata v0.4.11 — 2026-08-24
+
+### Операторские данные реального клиента v0.4.10
+
+- После переключения `egs-sync.json` из `Enabled` в `Aggressive` клиент успешно подключил и
+  проверил оба iSCSI-диска, прочитал совместимый v3 release и дошёл до финальной проверки
+  скопированного ProgramData.
+- Запуск завершился `Epic Games aggressive target file metadata verification failed` до
+  событий `egs_programdata_sync_ready`/`ready`; EGS сохранил прежнее состояние. В коде эта
+  ошибка возможна только после успешной проверки существования, размера и SHA-256 target-файла,
+  поэтому расхождение локализовано до Publisher/client NTFS attributes либо timestamps.
+- Сообщения о неполном rollback не было. Неизменившееся состояние EGS согласуется с возвратом
+  прежнего дерева transaction journal v3, но физический побайтовый аудит rollback отдельно не
+  выполнялся.
+
+### Реализация и быстрые локальные проверки
+
+- Client по-прежнему проверяет ZIP/index, безопасные пути, полный file/directory set, размеры,
+  SHA-256, collisions и отсутствие reparse points. Готовое дерево атомарно подменяет `Data`, а
+  `LauncherInstalled.dat` записывается точными bytes.
+- Publisher timestamps/обычные attributes больше не применяются при распаковке и не участвуют
+  в target acceptance. Поля остаются синтаксически проверяемой частью index schema v3, поэтому
+  существующий release совместим. ACL и NTFS metadata создаются локально.
+- Journal v3, SHA-addressed backup и rollback не менялись. Возврат прежнего `Data` сохраняет
+  его локальную metadata; metadata прежнего локального launcher-файла по-прежнему
+  восстанавливается из journal.
+- PowerShell parser закреплённого `mcr.microsoft.com/powershell` прошёл для всех production и
+  test `.ps1`.
+- Профильный client Pester 5.7.1 в Linux PowerShell-контейнере — **71 passed, 0 failed,
+  0 skipped** за 8.33 секунды. Покрыты exact bytes при отличающейся metadata, отказ при
+  изменённых bytes, отсутствие Publisher metadata setters в normal aggressive path и
+  существующий directory-swap rollback.
+- По согласованному быстрому профилю Publisher/installer Pester, Ruff, Pytest и Compose не
+  запускались. Push в `main` не ожидает GitHub CI; tag и release не создаются.
+
+### Ожидает Windows/TrueNAS стенда
+
+- обновить только client helper, оставить `mode: aggressive` и повторить reset на существующем
+  v3 release;
+- подтвердить `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready` и точные bytes
+  ProgramData до запуска EGS;
+- проверить `Launch` для GTA V, Fortnite и GTA V Enhanced. Если «Продолжить» сохранится после
+  доказанного exact-byte sync, следующий этап — launcher debug logs без переноса account/session
+  state вслепую.
+
 ## Epic Games iSCSI volume-order и cleanup hotfix v0.4.10 — 2026-08-23
 
 ### Операторские данные реального клиента v0.4.9

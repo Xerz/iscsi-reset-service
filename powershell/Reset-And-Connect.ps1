@@ -1170,45 +1170,9 @@ function Expand-ClientEgsAggressiveArchive {
                 if ((Get-EgsFileSha256Hex -Path $target) -ne $expected.Sha256) {
                     throw "Epic Games aggressive extracted file hash is invalid"
                 }
-                [IO.File]::SetCreationTimeUtc(
-                    $target, [DateTime]::Parse(
-                        $expected.CreationTimeUtc,
-                        [Globalization.CultureInfo]::InvariantCulture,
-                        [Globalization.DateTimeStyles]::RoundtripKind
-                    ).ToUniversalTime()
-                )
-                [IO.File]::SetLastWriteTimeUtc(
-                    $target, [DateTime]::Parse(
-                        $expected.LastWriteTimeUtc,
-                        [Globalization.CultureInfo]::InvariantCulture,
-                        [Globalization.DateTimeStyles]::RoundtripKind
-                    ).ToUniversalTime()
-                )
-                [IO.File]::SetAttributes($target, [IO.FileAttributes]$expected.Attributes)
             }
         } finally {
             $zip.Dispose()
-        }
-        foreach ($directory in @($IndexData.Directories | Sort-Object {
-            -1 * $_.RelativePath.Length
-        })) {
-            $target = Join-ClientEgsRelativePath -Root $StagePath `
-                -RelativePath $directory.RelativePath
-            [IO.Directory]::SetCreationTimeUtc(
-                $target, [DateTime]::Parse(
-                    $directory.CreationTimeUtc,
-                    [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::RoundtripKind
-                ).ToUniversalTime()
-            )
-            [IO.Directory]::SetLastWriteTimeUtc(
-                $target, [DateTime]::Parse(
-                    $directory.LastWriteTimeUtc,
-                    [Globalization.CultureInfo]::InvariantCulture,
-                    [Globalization.DateTimeStyles]::RoundtripKind
-                ).ToUniversalTime()
-            )
-            [IO.File]::SetAttributes($target, [IO.FileAttributes]$directory.Attributes)
         }
     } catch {
         Remove-Item -LiteralPath $StagePath -Recurse -Force -ErrorAction SilentlyContinue
@@ -2204,24 +2168,9 @@ function Assert-ClientEgsAggressiveTree {
             throw "Epic Games aggressive target file verification failed"
         }
         $targetItem = Get-Item -LiteralPath $target -Force
-        $expectedCreation = [DateTime]::Parse(
-            $expected.CreationTimeUtc,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).ToUniversalTime()
-        $expectedLastWrite = [DateTime]::Parse(
-            $expected.LastWriteTimeUtc,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).ToUniversalTime()
         if ([Int64]$targetItem.Length -ne [Int64]$expected.Length -or
             (Get-EgsFileSha256Hex -Path $target) -ne [string]$expected.Sha256) {
             throw "Epic Games aggressive target file verification failed"
-        }
-        if ([int]$targetItem.Attributes -ne [int]$expected.Attributes -or
-            $targetItem.CreationTimeUtc.Ticks -ne $expectedCreation.Ticks -or
-            $targetItem.LastWriteTimeUtc.Ticks -ne $expectedLastWrite.Ticks) {
-            throw "Epic Games aggressive target file metadata verification failed"
         }
     }
     $expectedDirectories = @($IndexData.Directories | Where-Object {
@@ -2249,20 +2198,9 @@ function Assert-ClientEgsAggressiveTree {
             throw "Epic Games aggressive target directory verification failed"
         }
         $targetItem = Get-Item -LiteralPath $target -Force
-        $expectedCreation = [DateTime]::Parse(
-            $expected.CreationTimeUtc,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).ToUniversalTime()
-        $expectedLastWrite = [DateTime]::Parse(
-            $expected.LastWriteTimeUtc,
-            [Globalization.CultureInfo]::InvariantCulture,
-            [Globalization.DateTimeStyles]::RoundtripKind
-        ).ToUniversalTime()
-        if ([int]$targetItem.Attributes -ne [int]$expected.Attributes -or
-            $targetItem.CreationTimeUtc.Ticks -ne $expectedCreation.Ticks -or
-            $targetItem.LastWriteTimeUtc.Ticks -ne $expectedLastWrite.Ticks) {
-            throw "Epic Games aggressive target directory metadata verification failed"
+        if (([int]$targetItem.Attributes -band
+            [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Epic Games aggressive target contains a reparse directory"
         }
     }
 }
@@ -2944,11 +2882,6 @@ function Invoke-ClientEgsAggressiveSync {
             Reset-ClientEgsInheritedAcl -Path $ProgramDataPath
             Write-EgsBytesAtomic -Path $LauncherInstalledPath `
                 -Bytes ([IO.File]::ReadAllBytes($stageLauncherPath))
-            $launcherIndexEntry = @($index.Files | Where-Object {
-                $_.RelativePath -ceq "UnrealEngineLauncher/LauncherInstalled.dat"
-            })[0]
-            Set-ClientEgsIndexedFileMetadata -Path $LauncherInstalledPath `
-                -Entry $launcherIndexEntry
             Write-ClientEgsManagedState -Path $statePath -Desired $bundleSet.Desired
             $aggressiveState = [ordered]@{
                 schema_version = 1

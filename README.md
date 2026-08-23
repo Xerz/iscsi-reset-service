@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.10
+# iSCSI Reset Service v0.4.11
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -805,8 +805,8 @@ Reset API возвращает только portal, собственную це�
 Publisher. Он требует bundle v3 и подключения полного точного набора логических iSCSI-томов
 Publisher. Их имена сравниваются case-sensitive как множество: порядок LUN, букв и JSON-массива
 не влияет на результат. Локальный системный `C:` Publisher или клиента в этот набор не входит.
-Publisher потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные bytes всего
-`C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` в отдельные ZIP/index на
+Publisher потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные
+bytes всего `C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` в отдельные ZIP/index на
 первом томе manifest. Каждый том получает `egs-manifests.v3.json` с одним anchor, hashes,
 лимитами и inventory игр. Reparse points, case-insensitive collisions, traversal, более
 100 000 файлов, 1 GiB суммарно и 512 MiB на файл отклоняются до pending/offline/disconnect.
@@ -873,8 +873,10 @@ volume set без зависимости от порядка, ZIP/index и ка�
 целый `LauncherInstalled.dat`. Старое локальное состояние сохраняется в постоянном
 SHA-addressed каталоге `C:\ProgramData\IscsiReset\egs-programdata-backups`; transaction journal
 v3 восстанавливает дерево, launcher-файл и managed-state при любой ошибке. ACL/SID Publisher не
-копируются: после swap дерево получает локально наследуемые ACL; attributes и UTC timestamps
-восстанавливаются из index. Совпадающий tree hash даёт no-op. Успешный порядок событий:
+копируются: после swap дерево получает локально наследуемые ACL и локальную NTFS metadata.
+Attributes и UTC timestamps остаются в index для совместимости v3, но клиент их не применяет и
+не сравнивает между компьютерами. Размер и SHA-256 каждого файла остаются обязательными.
+Совпадающий tree hash даёт no-op. Успешный порядок событий:
 `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Задача клиента в этом режиме
 имеет execution limit 20 минут вместо 5.
 
@@ -1016,7 +1018,7 @@ Client helper v0.4.7 переносил `.item`, но при отсутству�
 показали «Продолжить» и пытались начать полную загрузку. В v0.4.8 полный v2 registration import
 для трёх игр (`3 / 0 / 0`) и официальный сброс `webcache*` результата не изменили: GTA V и
 Fortnite остались в `Продолжить`, GTA V Enhanced — в `Launch`. Для следующей проверки
-переустановите оба helper v0.4.10 с `-EpicGamesManifestSync Aggressive`, выполните новый
+переустановите оба helper v0.4.11 с `-EpicGamesManifestSync Aggressive`, выполните новый
 `Disconnect` и создайте v3 release. До запуска EGS в журнале должны идти
 `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Если и точный общий
 ProgramData snapshot не даст `Launch`, следующий шаг — сбор launcher debug logs, а не перенос
@@ -1036,6 +1038,18 @@ iSCSI-томов.
 release совместим: новый Publisher `Disconnect`, snapshot, stage или activate не требуется.
 Если предыдущий запуск оставил session, сначала отключите точный client target вручную. После
 повтора ожидаются `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
+
+### `Epic Games aggressive target file metadata verification failed`
+
+На реальном клиенте v0.4.10 aggressive sync прошёл проверку обоих iSCSI-томов, v3 bundle,
+размера и SHA-256 скопированного target-файла, но затем потребовал точного совпадения Publisher
+и client NTFS attributes/timestamps. Windows принял установку metadata, но прочитал её обратно
+с отличающимся значением; transaction успешно вернул прежний ProgramData, поэтому EGS остался
+в исходном состоянии.
+
+Клиент v0.4.11 сохраняет атомарную подмену и exact-byte verification, но использует локальные
+timestamps/attributes. Достаточно обновить только client helper и повторить reset в режиме
+`Aggressive` на существующем v3 release; повторный Publisher workflow не требуется.
 
 ### `Live state unavailable: A management dependency is unavailable`
 

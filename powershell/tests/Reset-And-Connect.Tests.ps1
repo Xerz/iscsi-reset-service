@@ -2076,6 +2076,58 @@ Describe "Epic Games aggressive ProgramData payload" {
             Should -Be '{"InstallationList":[]}'
     }
 
+    It "accepts exact target bytes when local NTFS metadata differs from Publisher" {
+        $metadata = New-AggressiveTestPayload
+        $index = Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+            -ArchiveMetadata $metadata
+        $stage = Join-Path $script:AggressiveRoot "stage-local-metadata"
+        Expand-ClientEgsAggressiveArchive -ArchivePath $script:AggressiveArchivePath `
+            -ArchiveMetadata $metadata -IndexData $index -StagePath $stage
+        foreach ($entry in @($index.Files) + @($index.Directories)) {
+            $entry.Attributes = [int](
+                [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::ReadOnly
+            )
+            $entry.CreationTimeUtc = "2001-01-01T00:00:00.0000000Z"
+            $entry.LastWriteTimeUtc = "2002-01-01T00:00:00.0000000Z"
+        }
+        $programData = Join-Path $stage "EpicGamesLauncher/Data"
+        $launcher = Join-Path $stage "UnrealEngineLauncher/LauncherInstalled.dat"
+
+        {
+            Assert-ClientEgsAggressiveTree -IndexData $index `
+                -ProgramDataPath $programData -LauncherInstalledPath $launcher
+        } | Should -Not -Throw
+        Get-EgsFileSha256Hex (Join-Path $programData "Manifests/one.item") |
+            Should -Be $index.Files[0].Sha256
+    }
+
+    It "still rejects changed bytes after ignoring Publisher NTFS metadata" {
+        $metadata = New-AggressiveTestPayload
+        $index = Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+            -ArchiveMetadata $metadata
+        $stage = Join-Path $script:AggressiveRoot "stage-changed-bytes"
+        Expand-ClientEgsAggressiveArchive -ArchivePath $script:AggressiveArchivePath `
+            -ArchiveMetadata $metadata -IndexData $index -StagePath $stage
+        $programData = Join-Path $stage "EpicGamesLauncher/Data"
+        $launcher = Join-Path $stage "UnrealEngineLauncher/LauncherInstalled.dat"
+        [IO.File]::AppendAllText(
+            (Join-Path $programData "Manifests/one.item"),
+            "changed"
+        )
+
+        {
+            Assert-ClientEgsAggressiveTree -IndexData $index `
+                -ProgramDataPath $programData -LauncherInstalledPath $launcher
+        } | Should -Throw "*target file verification failed*"
+    }
+
+    It "does not apply Publisher timestamps or attributes during aggressive sync" {
+        (Get-Command Expand-ClientEgsAggressiveArchive).Definition |
+            Should -Not -Match "SetCreationTimeUtc|SetLastWriteTimeUtc|SetAttributes"
+        (Get-Command Invoke-ClientEgsAggressiveSync).Definition |
+            Should -Not -Match "Set-ClientEgsIndexedFileMetadata"
+    }
+
     It "rejects traversal and case-insensitive path collisions before extraction" {
         $metadata = New-AggressiveTestPayload -Traversal
         {
