@@ -41,18 +41,19 @@
   shared bytes, пустую DB, блокировку активным InstallHelper, порядок событий, отказ от v3,
   journal v4 rollback и сохранность non-shared EOS state; recovery journal v3 также сохранён.
 - По согласованному быстрому профилю installer Pester, Ruff, Pytest и Compose локально не
-  запускались. Windows PowerShell 5.1 остаётся проверкой GitHub CI/физического стенда; push в
-  `main` не ожидает CI, tag и GitHub Release не создаются.
+  запускались. После push полный GitHub CI run `32664054849` прошёл успешно для commit
+  `76736df6`: Python/Ruff/Pytest/Node, interaction Compose и весь Pester 5.7.1 на Windows
+  PowerShell 5.1 завершились без ошибок.
 
-### Ожидает Windows/TrueNAS стенда
+### Физическая приёмка Windows/TrueNAS
 
-- обновить оба helper в режиме `Aggressive`, выполнить новый Publisher `Disconnect`, stage и
-  activate: старый v3 release намеренно несовместим;
-- подтвердить новый порядок четырёх событий и до запуска EGS проверить, что shared
-  InstallHelper перечисляет все три игры как `Installed` на `E:`, без старых `Incomplete`
-  Fortnite/GTA V на `C:`;
-- проверить `Launch` для GTA V, Fortnite и GTA V Enhanced. Этот игровой результат не следует
-  из Linux Pester и остаётся физической приёмкой.
+- Оператор обновил v0.4.12 helpers в режиме `Aggressive`, создал новый v4 release и подтвердил
+  успешный Publisher → stage → activate → client reset на реальном стенде.
+- GTA V, Fortnite и GTA V Enhanced распознаны EGS как готовые установки; прежнее состояние
+  «Продолжить» для GTA V/Fortnite устранено. На основании этого результата оператор разрешил
+  выпуск v0.4.12.
+- Отдельные destructive rollback/recovery сценарии из `TEST-PLAN.md` не объявляются пройденными
+  этим эксплуатационным подтверждением и остаются самостоятельными стендовыми проверками.
 
 ## Epic Games exact bytes без Publisher NTFS metadata v0.4.11 — 2026-08-24
 
