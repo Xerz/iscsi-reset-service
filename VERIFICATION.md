@@ -46,10 +46,12 @@ Reset/Management API, SQLite, TrueNAS backend, bundle v1, managed-state v1 и `e
   windows-simulation` — passed на локальном arm64 Docker host. Оба сервиса сообщили version
   `0.4.7`, итог — `Interaction suite passed`. Затем выполнен `docker compose down --volumes`;
   контейнеры, сеть и три тестовых volume удалены.
+- [CI run `32650509069`](https://github.com/Xerz/iscsi-reset-service/actions/runs/32650509069)
+  для commit `679b155` прошёл во всех трёх jobs: Python/JavaScript, Compose interaction и
+  настоящий Windows PowerShell 5.1 с Pester 5.7.1 завершили свои verification steps успешно.
 
 ### Ожидает Windows/TrueNAS стенда
 
-- Windows PowerShell 5.1/Pester 5.7.1 GitHub Actions после push;
 - повтор реального client reset с событиями takeover → sync ready → ready и точным
   managed-state;
 - подтверждение, что EGS показывает сетевой путь, локальные файлы сохранены и актуальный
