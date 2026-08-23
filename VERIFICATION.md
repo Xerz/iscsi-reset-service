@@ -45,6 +45,10 @@ Publisher и клиентом. Schema v3, Reset/Management API, SQLite и TrueNA
   `-EgsSyncConfigPath`, `-ClientScriptPath` и `-PublisherScriptPath` сохраняются без изменений.
   До установки hotfix client можно запустить с явным
   `-EgsSyncConfigPath "C:\ProgramData\IscsiReset\egs-sync.json"`.
+- [CI run `32647261549`](https://github.com/Xerz/iscsi-reset-service/actions/runs/32647261549)
+  для hotfix commit `c5f68ce` прошёл во всех трёх jobs. Windows Server 2025 с Windows
+  PowerShell 5.1/Pester 5.7.1 выполнил **82 passed, 0 failed, 0 skipped**; оба runtime helper
+  успешно стартовали дочерним `powershell.exe -File` без явного EGS config path.
 
 ### Локальные автоматические проверки
 
