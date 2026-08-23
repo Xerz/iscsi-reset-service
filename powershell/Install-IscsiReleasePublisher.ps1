@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ManifestSourcePath,
     [string]$InstallDirectory = "C:\ProgramData\IscsiResetPublisher",
     [string]$PublisherScriptPath = "",
-    [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
+    [ValidateSet("Enabled", "Disabled", "Aggressive")]
+    [string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -36,8 +37,8 @@ $egsConfigPath = Join-Path $InstallDirectory "egs-sync.json"
 Copy-Item -LiteralPath $ManifestSourcePath -Destination $configPath -Force
 Copy-Item -LiteralPath $PublisherScriptPath -Destination $installedScript -Force
 [ordered]@{
-    schema_version = 1
-    enabled = $EpicGamesManifestSync -eq "Enabled"
+    schema_version = 2
+    mode = $EpicGamesManifestSync.ToLowerInvariant()
 } | ConvertTo-Json | Set-Content -LiteralPath $egsConfigPath -Encoding UTF8
 
 & icacls.exe $InstallDirectory /inheritance:r | Out-Null

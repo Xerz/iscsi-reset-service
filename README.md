@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.8
+# iSCSI Reset Service v0.4.9
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -684,6 +684,15 @@ Set-ExecutionPolicy -Scope Process Bypass
   -EpicGamesManifestSync Enabled
 ```
 
+Для выделенного зеркала Publisher, которому нужен полный общий state EGS, используйте
+`Aggressive` на обеих машинах:
+
+```powershell
+./Install-IscsiReleasePublisher.ps1 `
+  -ManifestSourcePath ./publisher.json `
+  -EpicGamesManifestSync Aggressive
+```
+
 Установщик копирует `publisher.json` и вспомогательный скрипт в
 `C:\ProgramData\IscsiResetPublisher`, закрывает ACL по SID системной учётной записи и
 встроенной группы администраторов и не сохраняет сетевые учётные данные. После изменения
@@ -727,6 +736,15 @@ Set-ExecutionPolicy -Scope Process Bypass
   -CaCertificatePath ./reset-ca.crt `
   -ResetApiIp 10.20.40.10 `
   -EpicGamesManifestSync Enabled
+```
+
+Для выделенного клиента-зеркала с полным набором Publisher-томов:
+
+```powershell
+./Install-IscsiResetClient.ps1 `
+  -CaCertificatePath ./reset-ca.crt `
+  -ResetApiIp 10.20.40.10 `
+  -EpicGamesManifestSync Aggressive
 ```
 
 Reset API всегда используется по `https://<введённый-IP>:8443`; hostname и IPv6 установщик
@@ -783,6 +801,15 @@ Reset API возвращает только portal, собственную це�
 с тем же набором снимков. Это локальный opt-in обоих установщиков; по умолчанию он `Disabled` и
 не меняет поведение текущих установок.
 
+Режим `Aggressive` предназначен для выделенного игрового ПК, который является точным зеркалом
+Publisher. Он требует bundle v3 и подключения полного ordered-набора Publisher-томов. Publisher
+потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные bytes всего
+`C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` в отдельные ZIP/index на
+первом томе manifest. Каждый том получает `egs-manifests.v3.json` с одним anchor, hashes,
+лимитами и inventory игр. Reparse points, case-insensitive collisions, traversal, более
+100 000 файлов, 1 GiB суммарно и 512 MiB на файл отклоняются до pending/offline/disconnect.
+LocalAppData, `webcache*`, аккаунт, токены, авторизация и EOS state не переносятся.
+
 При `Disconnect` Publisher сначала закрывает `EpicGamesLauncher`, ждёт до 15 секунд и
 принудительно завершает оставшиеся `EpicGamesLauncher`/`EpicWebHelper`. После точной сверки
 master-дисков по NAA helper проверяет `AppName`, непрозрачный hex `InstallationGuid`, build,
@@ -835,10 +862,21 @@ rollback удаляет и впервые созданный файл. Оста�
 только после этого `ready`; при takeover перед ними также появляется
 `egs_registration_takeover`.
 
-Версия v2 требует одинаковых букв и полных путей игр на Publisher и клиентах. Client helper
-0.4.8 намеренно отклоняет release только с bundle v1 кодом `40`; после обновления требуется новый
-release. Механизм не копирует целиком Publisher `LauncherInstalled.dat`, LocalAppData, webcache,
-настройки аккаунта, авторизацию, EOS/service state или неизвестные поля игровых регистраций.
+В `Aggressive` клиент проверяет v3 bundle на каждом томе, точный полный volume set, ZIP/index и
+каждый файл, распаковывает payload в защищённый staging и атомарно меняет всё дерево `Data` и
+целый `LauncherInstalled.dat`. Старое локальное состояние сохраняется в постоянном
+SHA-addressed каталоге `C:\ProgramData\IscsiReset\egs-programdata-backups`; transaction journal
+v3 восстанавливает дерево, launcher-файл и managed-state при любой ошибке. ACL/SID Publisher не
+копируются: после swap дерево получает локально наследуемые ACL; attributes и UTC timestamps
+восстанавливаются из index. Совпадающий tree hash даёт no-op. Успешный порядок событий:
+`egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Задача клиента в этом режиме
+имеет execution limit 20 минут вместо 5.
+
+Версия v2 требует одинаковых букв и полных путей игр на Publisher и клиентах. Client helper в
+режиме `Enabled` отклоняет release только с bundle v1, а режим `Aggressive` принимает только
+новый v3 release; несовместимость завершается кодом `40`. Обычный `Enabled` по-прежнему не
+копирует целиком Publisher `LauncherInstalled.dat`. Ни один режим не копирует LocalAppData,
+webcache, настройки аккаунта, авторизацию или EOS/service state.
 Все ПК должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite
 build, ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
 `InstallTags` и [выбранных компонентов Fortnite](https://www.epicgames.com/help/c-202300000001636/c-202300000001690/a202300000015197?lang=en-US).
@@ -969,12 +1007,14 @@ bundle и оставляет игровые файлы прежней локал
 Client helper v0.4.7 переносил `.item`, но при отсутствующем локальном
 `LauncherInstalled.dat` не создавал EGS-регистрацию. На реальном клиенте после полной
 переустановки Launcher это дало `Launch` только для GTA V Enhanced, тогда как GTA V и Fortnite
-показали «Продолжить» и пытались начать полную загрузку. Установите helpers 0.4.8 на Publisher
-и клиент, выполните новый `Disconnect` и создайте новый release с bundle v2: старый v1 release
-намеренно не принимается. До запуска EGS в журнале должны идти
-`egs_launcher_registration_sync` → `egs_manifest_sync_ready` → `ready`; ненулевой
-`item_only_fallback_count` или `incomplete_warning_count` означает, что распознавание конкретной
-игры по-прежнему не гарантировано.
+показали «Продолжить» и пытались начать полную загрузку. В v0.4.8 полный v2 registration import
+для трёх игр (`3 / 0 / 0`) и официальный сброс `webcache*` результата не изменили: GTA V и
+Fortnite остались в `Продолжить`, GTA V Enhanced — в `Launch`. Для следующей проверки
+переустановите оба helper v0.4.9 с `-EpicGamesManifestSync Aggressive`, выполните новый
+`Disconnect` и создайте v3 release. До запуска EGS в журнале должны идти
+`egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Если и точный общий
+ProgramData snapshot не даст `Launch`, следующий шаг — сбор launcher debug logs, а не перенос
+LocalAppData, webcache или account/session state вслепую.
 
 ### `Live state unavailable: A management dependency is unavailable`
 

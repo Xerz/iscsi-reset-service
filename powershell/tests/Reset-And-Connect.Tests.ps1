@@ -912,6 +912,61 @@ Describe "Startup flow failure handling" {
         (Get-Content -LiteralPath $logPath -Raw) |
             Should -Not -Match "BaseURLs|publisher.invalid|client.invalid"
     }
+
+    It "logs aggressive ProgramData readiness before manifest readiness" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $syncConfig = Join-Path $TestDrive "egs-sync-aggressive.json"
+        @{ schema_version = 2; mode = "aggressive" } | ConvertTo-Json |
+            Set-Content $syncConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientEgsManifestSync { throw "managed mode must not run" }
+        Mock Invoke-ClientEgsAggressiveSync {
+            return [pscustomobject]@{
+                ManifestCount = 3
+                FileCount = 42
+                TotalBytes = 123456
+                Changed = $true
+                IncompleteWarningCount = 0
+            }
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath -SyncConfigPath $syncConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        $records = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $events = @($records.event)
+        [Array]::IndexOf($events, "egs_programdata_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "egs_manifest_sync_ready"))
+        [Array]::IndexOf($events, "egs_manifest_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "ready"))
+        $programData = $records | Where-Object event -eq "egs_programdata_sync_ready"
+        $programData.file_count | Should -Be 42
+        $programData.game_count | Should -Be 3
+        $programData.total_bytes | Should -Be 123456
+        Should -Invoke Invoke-ClientEgsAggressiveSync -Times 1 -Exactly
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
+    }
 }
 
 Describe "Epic Games client manifest validation and transaction" {
@@ -1740,5 +1795,154 @@ Describe "Epic Games client manifest validation and transaction" {
         Stop-EgsLauncherProcesses -GraceSeconds 0
 
         Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 10 -and $Force }
+    }
+}
+
+Describe "Epic Games aggressive ProgramData payload" {
+    BeforeEach {
+        $script:AggressiveRoot = Join-Path $TestDrive "aggressive"
+        Remove-Item -LiteralPath $script:AggressiveRoot -Recurse -Force `
+            -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $script:AggressiveRoot -Force | Out-Null
+        $script:AggressiveIndexPath = Join-Path $script:AggressiveRoot "index.json"
+        $script:AggressiveArchivePath = Join-Path $script:AggressiveRoot "payload.zip"
+        $script:AggressiveTimestamp = "2026-08-23T12:00:00.0000000Z"
+    }
+
+    BeforeAll {
+        function New-AggressiveTestPayload {
+            param([switch]$Collision, [switch]$Traversal)
+            Initialize-EgsZipSupport
+            $path1 = if ($Traversal) { "EpicGamesLauncher/Data/../escape.bin" } else {
+                "EpicGamesLauncher/Data/Manifests/one.item"
+            }
+            $fileDefinitions = @(
+                [pscustomobject]@{ Path = $path1; Bytes = [Text.Encoding]::UTF8.GetBytes("one") },
+                [pscustomobject]@{ Path = "UnrealEngineLauncher/LauncherInstalled.dat"; Bytes = [Text.Encoding]::UTF8.GetBytes('{"InstallationList":[]}') }
+            )
+            if ($Collision) {
+                $fileDefinitions += [pscustomobject]@{
+                    Path = "EpicGamesLauncher/Data/Manifests/ONE.item"
+                    Bytes = [Text.Encoding]::UTF8.GetBytes("collision")
+                }
+            }
+            $files = @($fileDefinitions | ForEach-Object {
+                [ordered]@{
+                    relative_path = $_.Path
+                    length = [Int64]$_.Bytes.Length
+                    sha256 = Get-EgsSha256Hex $_.Bytes
+                    attributes = [int][IO.FileAttributes]::Normal
+                    creation_time_utc = $script:AggressiveTimestamp
+                    last_write_time_utc = $script:AggressiveTimestamp
+                }
+            })
+            $totalBytes = [Int64]0
+            foreach ($definition in $fileDefinitions) {
+                $totalBytes += [Int64]$definition.Bytes.Length
+            }
+            $index = [ordered]@{
+                schema_version = 1
+                file_count = $files.Count
+                total_bytes = $totalBytes
+                directories = @(
+                    [ordered]@{ relative_path = "EpicGamesLauncher"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "EpicGamesLauncher/Data"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "EpicGamesLauncher/Data/Manifests"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "UnrealEngineLauncher"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp }
+                )
+                files = $files
+            }
+            $indexBytes = [Text.Encoding]::UTF8.GetBytes(($index | ConvertTo-Json -Depth 8))
+            [IO.File]::WriteAllBytes($script:AggressiveIndexPath, $indexBytes)
+            $zip = [IO.Compression.ZipFile]::Open(
+                $script:AggressiveArchivePath, [IO.Compression.ZipArchiveMode]::Create
+            )
+            try {
+                foreach ($directory in $index.directories) {
+                    $zip.CreateEntry("$($directory.relative_path)/") | Out-Null
+                }
+                foreach ($definition in $fileDefinitions) {
+                    $entry = $zip.CreateEntry($definition.Path)
+                    $stream = $entry.Open()
+                    try { $stream.Write($definition.Bytes, 0, $definition.Bytes.Length) } finally {
+                        $stream.Dispose()
+                    }
+                }
+            } finally { $zip.Dispose() }
+            return [pscustomobject]@{
+                archive_length = [Int64](Get-Item $script:AggressiveArchivePath).Length
+                archive_sha256 = Get-EgsFileSha256Hex $script:AggressiveArchivePath
+                index_length = [Int64]$indexBytes.Length
+                index_sha256 = Get-EgsSha256Hex $indexBytes
+                tree_sha256 = Get-EgsSha256Hex $indexBytes
+                file_count = $files.Count
+                total_bytes = [Int64]$index.total_bytes
+            }
+        }
+    }
+
+    It "verifies and extracts an exact indexed ProgramData payload" {
+        $metadata = New-AggressiveTestPayload
+        $index = Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+            -ArchiveMetadata $metadata
+        $stage = Join-Path $script:AggressiveRoot "stage"
+
+        Expand-ClientEgsAggressiveArchive -ArchivePath $script:AggressiveArchivePath `
+            -ArchiveMetadata $metadata -IndexData $index -StagePath $stage
+
+        Get-Content -LiteralPath (Join-Path $stage `
+            "EpicGamesLauncher/Data/Manifests/one.item") -Raw | Should -Be "one"
+        Get-Content -LiteralPath (Join-Path $stage `
+            "UnrealEngineLauncher/LauncherInstalled.dat") -Raw |
+            Should -Be '{"InstallationList":[]}'
+    }
+
+    It "rejects traversal and case-insensitive path collisions before extraction" {
+        $metadata = New-AggressiveTestPayload -Traversal
+        {
+            Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+                -ArchiveMetadata $metadata
+        } | Should -Throw "*unsafe relative path*"
+        Remove-Item -LiteralPath $script:AggressiveArchivePath -Force
+        $metadata = New-AggressiveTestPayload -Collision
+        {
+            Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+                -ArchiveMetadata $metadata
+        } | Should -Throw "*duplicate relative path*"
+    }
+
+    It "restores a version 3 directory-swap journal exactly" {
+        $programData = Join-Path $script:AggressiveRoot "Data"
+        $launcher = Join-Path $script:AggressiveRoot "LauncherInstalled.dat"
+        $state = Join-Path $script:AggressiveRoot "managed.json"
+        $aggressiveState = Join-Path $script:AggressiveRoot "aggressive.json"
+        $stage = Join-Path $script:AggressiveRoot "stage"
+        $transaction = Join-Path $script:AggressiveRoot "transaction"
+        New-Item -ItemType Directory -Path $programData -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $programData "old.bin") -Value "old"
+        Set-Content -LiteralPath $launcher -Value "old-launcher"
+        Set-Content -LiteralPath $state -Value "old-state"
+        Set-Content -LiteralPath $aggressiveState -Value "old-aggressive"
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        Mock Assert-EgsLauncherStopped { }
+        $journal = Start-ClientEgsAggressiveTransaction -TransactionPath $transaction `
+            -ProgramDataPath $programData -LauncherInstalledPath $launcher `
+            -StatePath $state -AggressiveStatePath $aggressiveState -StagePath $stage
+        Move-Item -LiteralPath $programData -Destination (Join-Path $transaction "backup/Data")
+        New-Item -ItemType Directory -Path $programData -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $programData "new.bin") -Value "new"
+        Set-Content -LiteralPath $launcher -Value "new-launcher"
+        Set-Content -LiteralPath $state -Value "new-state"
+        Set-Content -LiteralPath $aggressiveState -Value "new-aggressive"
+
+        Restore-ClientEgsTransaction -TransactionPath $transaction
+
+        Get-Content -LiteralPath (Join-Path $programData "old.bin") -Raw |
+            Should -Match "old"
+        Test-Path -LiteralPath (Join-Path $programData "new.bin") | Should -BeFalse
+        Get-Content -LiteralPath $launcher -Raw | Should -Match "old-launcher"
+        Get-Content -LiteralPath $state -Raw | Should -Match "old-state"
+        Get-Content -LiteralPath $aggressiveState -Raw | Should -Match "old-aggressive"
+        Test-Path -LiteralPath $transaction | Should -BeFalse
     }
 }

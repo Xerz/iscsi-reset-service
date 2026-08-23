@@ -441,6 +441,72 @@ Describe "Publisher Epic Games manifest bundles" {
         }
     }
 
+    It "writes one exact aggressive ProgramData archive for an ordered three-volume release" {
+        $programDataPath = Join-Path $TestDrive "EpicGamesLauncher/Data"
+        $script:EgsManifestDirectory = Join-Path $programDataPath "Manifests"
+        New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $programDataPath "Catalog") `
+            -Force | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $programDataPath "Catalog/unknown.bin"), `
+            [byte[]](9, 8, 7, 6))
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "11111111111111111111111111111111" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        New-PublisherTestEgsItem -AppName "Fortnite" `
+            -Guid "22222222222222222222222222222222" `
+            -VolumeRoot $script:EgsMappings[1].RootPath -InstallTags @("chunk0") | Out-Null
+        New-PublisherTestEgsItem -AppName "GTA5Enhanced" `
+            -Guid "33333333333333333333333333333333" `
+            -VolumeRoot $script:EgsMappings[2].RootPath -InstallTags @("default") | Out-Null
+        [ordered]@{
+            InstallationList = @(
+                New-PublisherTestLauncherEntry -AppName "GTA5" `
+                    -VolumeRoot $script:EgsMappings[0].RootPath
+                New-PublisherTestLauncherEntry -AppName "Fortnite" `
+                    -VolumeRoot $script:EgsMappings[1].RootPath
+                New-PublisherTestLauncherEntry -AppName "GTA5Enhanced" `
+                    -VolumeRoot $script:EgsMappings[2].RootPath
+            )
+            UnknownTopLevel = [ordered]@{ machine = "publisher"; value = 42 }
+        } | ConvertTo-Json -Depth 8 | Set-Content $script:EgsLauncherInstalledPath
+
+        $result = Export-PublisherEgsAggressiveBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings `
+            -ManifestDirectory $script:EgsManifestDirectory `
+            -ProgramDataPath $programDataPath `
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath
+
+        $result.FileCount | Should -BeGreaterThan 4
+        foreach ($mapping in $script:EgsMappings) {
+            $bundlePath = Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v3.json"
+            Test-Path -LiteralPath $bundlePath | Should -BeTrue
+            $bundle = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json
+            $bundle.schema_version | Should -Be 3
+            @($bundle.publisher_volume_names) | Should -Be @("ssd", "hdd", "bonus")
+            $bundle.archive.anchor_volume | Should -Be "ssd"
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v2.json") | Should -BeFalse
+        }
+        $anchorMetadata = Join-Path $script:EgsMappings[0].RootPath ".iscsi-reset"
+        $archivePath = Join-Path $anchorMetadata "egs-programdata.v3.zip"
+        $indexPath = Join-Path $anchorMetadata "egs-programdata.v3.index.json"
+        Test-Path -LiteralPath $archivePath | Should -BeTrue
+        Test-Path -LiteralPath $indexPath | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $script:EgsMappings[1].RootPath `
+            ".iscsi-reset/egs-programdata.v3.zip") | Should -BeFalse
+        $index = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
+        @($index.files.relative_path) |
+            Should -Contain "EpicGamesLauncher/Data/Catalog/unknown.bin"
+        @($index.files.relative_path) |
+            Should -Contain "UnrealEngineLauncher/LauncherInstalled.dat"
+        {
+            Get-PublisherEgsAggressiveIndexData -ProgramDataPath $programDataPath `
+                -LauncherInstalledPath $script:EgsLauncherInstalledPath `
+                -MaximumFileCount 1
+        } | Should -Throw "*file count safety limit*"
+    }
+
     It "uses item-only fallback for missing, duplicate, and mismatched registrations" {
         New-PublisherTestEgsItem -AppName "GTA5" `
             -Guid "10101010101010101010101010101010" `
@@ -651,5 +717,14 @@ Describe "Publisher Epic Games manifest bundles" {
         Get-EgsManifestSyncEnabled -Path $path | Should -BeFalse
         Remove-Item -LiteralPath $path
         Get-EgsManifestSyncEnabled -Path $path | Should -BeFalse
+    }
+
+    It "parses schema 2 aggressive mode while preserving schema 1 compatibility" {
+        $path = Join-Path $TestDrive "egs-sync-v2.json"
+        @{ schema_version = 2; mode = "aggressive" } | ConvertTo-Json | Set-Content $path
+        Get-EgsManifestSyncMode -Path $path | Should -Be "Aggressive"
+        Get-EgsManifestSyncEnabled -Path $path | Should -BeTrue
+        @{ schema_version = 2; mode = "enabled" } | ConvertTo-Json | Set-Content $path
+        Get-EgsManifestSyncMode -Path $path | Should -Be "Enabled"
     }
 }

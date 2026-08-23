@@ -4,7 +4,8 @@ param(
     [string]$ResetApiIp,
     [string]$InstallRoot = "C:\ProgramData\IscsiReset",
     [string]$ClientScriptPath = "",
-    [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
+    [ValidateSet("Enabled", "Disabled", "Aggressive")]
+    [string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -150,8 +151,8 @@ function Invoke-IscsiResetClientInstall {
         )
         Set-Acl -LiteralPath $tokenPath -AclObject (New-RestrictedFileSystemAcl)
         [ordered]@{
-            schema_version = 1
-            enabled = $EpicGamesManifestSync -eq "Enabled"
+            schema_version = 2
+            mode = $EpicGamesManifestSync.ToLowerInvariant()
         } | ConvertTo-Json | Set-Content -LiteralPath $egsConfigPath -Encoding UTF8
         Set-Acl -LiteralPath $egsConfigPath -AclObject (New-RestrictedFileSystemAcl)
 
@@ -177,7 +178,9 @@ function Invoke-IscsiResetClientInstall {
         $trigger.Delay = "PT15S"
         $principalTask = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
             -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+        $taskLimitMinutes = if ($EpicGamesManifestSync -eq "Aggressive") { 20 } else { 5 }
+        $settings = New-ScheduledTaskSettingsSet `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes $taskLimitMinutes) `
             -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $action `
             -Trigger $trigger -Principal $principalTask -Settings $settings -Force | Out-Null

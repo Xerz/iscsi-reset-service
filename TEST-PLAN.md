@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.8
+# Механический тест-план v0.4.9
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -145,9 +145,10 @@
    выбрав для Fortnite отличающийся набор компонентов/текстур. Добавить третий произвольно
    названный том без EGS-игр. Буквы и полные пути на Publisher и тестовом клиенте должны
    совпадать.
-2. Повторно установить оба helper с `-EpicGamesManifestSync Enabled`. Проверить защищённые
-   `egs-sync.json`; при `Disabled` Publisher не должен создавать bundle, а клиент — закрывать
-   EGS или менять локальные `.item`/managed-state.
+2. Сначала повторно установить оба helper с `-EpicGamesManifestSync Enabled`, затем отдельно с
+   `Aggressive`. Проверить защищённые schema 2 `egs-sync.json` и обратное чтение schema 1; при
+   `Disabled` Publisher не должен создавать bundle, а клиент — закрывать EGS или менять файлы.
+   Для aggressive scheduled task execution limit должен быть 20 минут, для остальных — 5.
 3. Запустить установленные client и Publisher helper отдельным `powershell.exe -File` без
    явного `-EgsSyncConfigPath`. Оба должны загрузиться без parameter-binding ошибки и выбрать
    соседний `egs-sync.json`. Повторить с явным произвольным безопасным путём и убедиться, что
@@ -194,7 +195,7 @@
    проверенный rollback должен восстановить все bytes, managed-state и `LauncherInstalled.dat`,
    а следующий запуск — успешно завершить транзакцию. Отдельно восстановить оставшийся journal
    v1 от v0.4.6; при искусственно неполном rollback журнал должен сохраниться.
-13. Активировать старый release только с v1: client 0.4.8 должен вернуть `40`, не записать
+13. Активировать старый release только с v1: client в режиме `Enabled` должен вернуть `40`, не записать
    `ready` и отключить только session текущего запуска.
 14. Выполнить полный Publisher → stage → activate → client workflow для трёх игр. На
    актуальном release EGS должен показать `Launch`. На старом release он должен показать
@@ -203,6 +204,33 @@
 15. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
    загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
    `InstallTags`/компонентами, а не реконструкцией `.item`.
+16. В режиме `Aggressive` проверить Publisher snapshot всего
+    `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точных bytes полного
+    `LauncherInstalled.dat`: anchor — первый том manifest, ZIP/index находятся только на нём,
+    а `egs-manifests.v3.json` на каждом из трёх томов содержит один ordered volume set и
+    совпадающие hashes/размеры. V1/v2 helper bundles должны быть удалены только после полной
+    проверки v3-набора.
+17. Добавить неизвестные файлы/JSON-поля, разные attributes и UTC timestamps; проверить точное
+    восстановление на клиенте без Publisher ACL/SID. Поочерёдно внедрить reparse point,
+    traversal, различающийся только регистром collision, более 100 000 файлов, более 1 GiB
+    суммарно и файл более 512 MiB: операция должна fail-closed завершиться до `ready`.
+18. Подключить клиент только с подмножеством томов и активировать v2 release при aggressive
+    config. Оба случая должны вернуть `40`, отключить только созданную session и не менять
+    локальный ProgramData. Полный v3-набор должен дать
+    `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
+19. Имитировать сбой Publisher после записи ZIP, index, первого v3 bundle и удаления первого
+    v1/v2 bundle; pending/offline/disconnect запрещены, retry согласует весь набор. На клиенте
+    имитировать сбои после directory swap, замены `LauncherInstalled.dat` и managed-state:
+    journal v3 обязан точно восстановить старые bytes, а неполный rollback — сохранить journal.
+20. Проверить recovery оставшихся journals v1/v2, постоянный SHA-addressed backup старого Data и
+    launcher-файла и no-op повторного запуска при точном tree hash. Старое локальное дерево не
+    должно удаляться из backup автоматически.
+21. На чистом выделенном клиенте с полным набором томов выполнить физический цикл Publisher →
+    stage → activate → reset в `Aggressive`. До запуска EGS проверить три игры и последовательность
+    событий; GTA V, Fortnite и GTA V Enhanced должны показать `Launch`.
+22. Если две игры по-прежнему показывают `Продолжить`, сохранить launcher debug logs для
+    отдельного анализа. LocalAppData, `webcache*`, account/session, authorization и EOS state в
+    этот тест не копировать.
 
 ## 8. Один dual-role Publisher/client ПК
 

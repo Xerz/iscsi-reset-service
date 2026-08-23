@@ -1,5 +1,51 @@
 # Verification record
 
+## Epic Games aggressive ProgramData snapshot v0.4.9 — 2026-08-23
+
+### Операторские данные реального EGS client 0.4.8
+
+- Bundle v2 успешно импортировал все три launcher-регистрации с диагностикой `3 / 0 / 0`, но
+  GTA V и Fortnite всё равно показали «Продолжить»; GTA V Enhanced показала `Launch`.
+- Ручной официальный сброс `webcache*` результата не изменил. Это не доказывает конкретный
+  внутренний ключ EGS, но обосновывает следующий ограниченный эксперимент: точный общий
+  ProgramData state без LocalAppData, webcache, account/session или authorization state.
+
+### Реализация и быстрые локальные проверки
+
+- Оба installer принимают `Disabled|Enabled|Aggressive` и записывают schema 2 `egs-sync.json`
+  с `mode`; schema 1 продолжает читаться. Для aggressive scheduled task limit увеличен до
+  20 минут.
+- Publisher останавливает EGS и потоково создаёт на первом manifest-томе точный ZIP/index всего
+  `EpicGamesLauncher\Data` и полного `LauncherInstalled.dat`. Все тома получают согласованный
+  bundle v3 с ordered volume set, anchor и hashes. Reparse points, unsafe/colliding paths и
+  лимиты 100 000 files / 1 GiB / 512 MiB проверяются до pending/offline/disconnect; v1/v2
+  удаляются только после полной проверки v3.
+- Client aggressive требует полный Publisher volume set, проверяет bundle/ZIP/index и каждый
+  файл, извлекает staging и через journal v3 заменяет весь `Data`, полный launcher-файл и
+  managed-state. Старое состояние получает постоянный SHA-addressed backup; rollback
+  восстанавливает прежнее дерево и bytes. Publisher ACL/SID не копируются, целевое дерево
+  получает локально наследуемый ACL. Повторный точный tree hash является no-op.
+- PowerShell parser закреплённого `mcr.microsoft.com/powershell` прошёл для всех production и
+  test `.ps1`.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **101 passed, 0 failed, 1 skipped** из 102
+  за 9.92 секунды. Профиль покрывает schema/mode installers, v2 compatibility, три
+  произвольных тома, v3 ZIP/index, unknown files, traversal/collision, extraction, journal v3
+  rollback и порядок `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
+  Пропущен существующий Windows-only ACL object test.
+- По явному запросу оператора локальные Ruff/Pytest/Compose проверки для этой быстрой итерации
+  не запускались. Полный GitHub CI запускается push в `main` асинхронно и перед передачей
+  результата не ожидается.
+
+### Ожидает Windows/TrueNAS стенда
+
+- повторная установка обоих helper с `-EpicGamesManifestSync Aggressive` на Windows PowerShell
+  5.1 и проверка 20-минутного task limit;
+- новый Publisher Disconnect → stage → activate → client reset для полного набора трёх томов;
+- точная последовательность v3 events и `Launch` для GTA V, Fortnite и GTA V Enhanced до
+  любых загрузок;
+- физические NTFS directory swap, локальное ACL inheritance, SHA-backup, partial rollback и
+  no-op retry. Если «Продолжить» сохранится, следующий этап — сравнение launcher debug logs.
+
 ## Epic Games registration bundle v2 v0.4.8 — 2026-08-23
 
 Publisher и client helpers теперь синхронизируют bundle schema 2. Помимо точных байтов `.item`,

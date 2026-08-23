@@ -154,12 +154,25 @@ Describe "Installer secret and ACL regression" {
 
     It "uses idempotent overwrite operations for repeat installation" {
         $source = Get-Content -LiteralPath $script:InstallerPath -Raw
+        $publisherSource = Get-Content -LiteralPath (Join-Path `
+            (Split-Path $script:InstallerPath -Parent) `
+            "Install-IscsiReleasePublisher.ps1") -Raw
 
         $source | Should -Match 'New-Item -ItemType Directory -Path \$InstallRoot -Force'
         $source | Should -Match 'Copy-Item .* -Destination \$installedScript -Force'
         $source | Should -Match 'Register-ScheduledTask .*\n\s*-Trigger .* -Force'
-        $source | Should -Match 'schema_version = 1'
-        $source | Should -Match 'enabled = \$EpicGamesManifestSync -eq "Enabled"'
+        $source | Should -Match 'schema_version = 2'
+        $source | Should -Match 'mode = \$EpicGamesManifestSync\.ToLowerInvariant\(\)'
+        $source | Should -Match 'ValidateSet\("Enabled", "Disabled", "Aggressive"\)'
+        $source | Should -Match '\$taskLimitMinutes = if \(\$EpicGamesManifestSync -eq "Aggressive"\)'
+        $source | Should -Match 'New-TimeSpan -Minutes \$taskLimitMinutes'
+        foreach ($installerSource in @($source, $publisherSource)) {
+            $installerSource | Should -Match 'schema_version = 2'
+            $installerSource | Should -Match `
+                'mode = \$EpicGamesManifestSync\.ToLowerInvariant\(\)'
+            $installerSource | Should -Match `
+                'ValidateSet\("Enabled", "Disabled", "Aggressive"\)'
+        }
     }
 
     It "does not place the raw token in scheduled-task arguments or output" {
