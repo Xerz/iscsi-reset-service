@@ -269,3 +269,183 @@ Describe "Publisher local disconnect and reconnect" {
         Should -Invoke Set-Disk -Times 0 -Exactly
     }
 }
+
+Describe "Publisher Epic Games manifest bundles" {
+    BeforeAll {
+        function New-PublisherTestEgsItem {
+            param(
+                [Parameter(Mandatory = $true)][string]$AppName,
+                [Parameter(Mandatory = $true)][string]$Guid,
+                [Parameter(Mandatory = $true)][string]$VolumeRoot,
+                [Parameter(Mandatory = $true)][string[]]$InstallTags
+            )
+            $installLocation = Join-Path $VolumeRoot $AppName
+            $egstore = Join-Path $installLocation ".egstore"
+            New-Item -ItemType Directory -Path $egstore -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $installLocation "$AppName.exe") -Value "exe"
+            [IO.File]::WriteAllBytes((Join-Path $egstore "$Guid.manifest"), [byte[]](1, 2, 3))
+            @{
+                AppName = $AppName
+                CatalogItemId = "catalog-$AppName"
+                CatalogNamespace = "namespace-$AppName"
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $egstore "$Guid.mancpn")
+            $item = [ordered]@{
+                AppName = $AppName
+                AppVersionString = "build-$AppName"
+                InstallationGuid = $Guid
+                InstallLocation = $installLocation
+                ManifestLocation = $egstore
+                StagingLocation = (Join-Path $egstore "bps")
+                InstallTags = $InstallTags
+                LaunchExecutable = "$AppName.exe"
+            }
+            $path = Join-Path $script:EgsManifestDirectory "$Guid.item"
+            $item | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding UTF8
+            return $path
+        }
+    }
+
+    BeforeEach {
+        $script:EgsManifestDirectory = Join-Path $TestDrive "ProgramData-Manifests"
+        Remove-Item -LiteralPath $script:EgsManifestDirectory -Recurse -Force `
+            -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
+        $script:EgsMappings = @(
+            [pscustomobject]@{ Name = "ssd"; RootPath = (Join-Path $TestDrive "ssd"); Disk = $null },
+            [pscustomobject]@{ Name = "hdd"; RootPath = (Join-Path $TestDrive "hdd"); Disk = $null },
+            [pscustomobject]@{ Name = "bonus"; RootPath = (Join-Path $TestDrive "bonus"); Disk = $null }
+        )
+        foreach ($mapping in $script:EgsMappings) {
+            Remove-Item -LiteralPath $mapping.RootPath -Recurse -Force `
+                -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $mapping.RootPath -Force | Out-Null
+        }
+        $script:EgsManifest = [pscustomobject]@{
+            config_revision = "0123456789abcdef"
+        }
+    }
+
+    It "writes exact GTA and Fortnite manifests to arbitrary three-volume bundles" {
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "11111111111111111111111111111111" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        New-PublisherTestEgsItem -AppName "Fortnite" `
+            -Guid "22222222222222222222222222222222" `
+            -VolumeRoot $script:EgsMappings[1].RootPath `
+            -InstallTags @("chunk0", "chunk10", "chunk10optional") | Out-Null
+
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
+
+        $ssd = Get-Content -LiteralPath (Join-Path $script:EgsMappings[0].RootPath `
+            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+        $hdd = Get-Content -LiteralPath (Join-Path $script:EgsMappings[1].RootPath `
+            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+        $bonus = Get-Content -LiteralPath (Join-Path $script:EgsMappings[2].RootPath `
+            ".iscsi-reset/egs-manifests.v1.json") -Raw | ConvertFrom-Json
+
+        @($ssd.manifests).Count | Should -Be 1
+        @($hdd.manifests).Count | Should -Be 1
+        @($bonus.manifests).Count | Should -Be 0
+        $fortniteBytes = [Convert]::FromBase64String($hdd.manifests[0].payload_base64)
+        $fortnite = [Text.Encoding]::UTF8.GetString($fortniteBytes) | ConvertFrom-Json
+        @($fortnite.InstallTags) | Should -Be @("chunk0", "chunk10", "chunk10optional")
+    }
+
+    It "rejects a bad GUID before writing any volume bundle" {
+        New-PublisherTestEgsItem -AppName "Fortnite" `
+            -Guid "33333333333333333333333333333333" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("chunk0") | Out-Null
+        $path = Join-Path $script:EgsManifestDirectory "33333333333333333333333333333333.item"
+        $item = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        $item.InstallationGuid = "not-a-guid"
+        $item | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path
+
+        {
+            Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+                -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
+        } | Should -Throw "*invalid Epic installation GUID*"
+
+        foreach ($mapping in $script:EgsMappings) {
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v1.json") | Should -BeFalse
+        }
+    }
+
+    It "reconciles every volume after a partial bundle write" {
+        New-PublisherTestEgsItem -AppName "GTA5" `
+            -Guid "44444444444444444444444444444444" `
+            -VolumeRoot $script:EgsMappings[0].RootPath -InstallTags @("default") | Out-Null
+        New-PublisherTestEgsItem -AppName "Fortnite" `
+            -Guid "55555555555555555555555555555555" `
+            -VolumeRoot $script:EgsMappings[1].RootPath -InstallTags @("chunk0") | Out-Null
+        $script:RealPublisherBundleWriter = ${function:Write-PublisherEgsBundleAtomic}
+        $script:PublisherBundleWriteCount = 0
+        $script:InjectPublisherBundleFailure = $true
+        Mock Write-PublisherEgsBundleAtomic {
+            $script:PublisherBundleWriteCount++
+            if ($script:InjectPublisherBundleFailure -and
+                $script:PublisherBundleWriteCount -eq 2) {
+                throw "injected after first bundle write"
+            }
+            & $script:RealPublisherBundleWriter -Path $Path -Bundle $Bundle
+        }
+
+        {
+            Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+                -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
+        } | Should -Throw "*after first bundle write*"
+        Test-Path -LiteralPath (Join-Path $script:EgsMappings[0].RootPath `
+            ".iscsi-reset/egs-manifests.v1.json") | Should -BeTrue
+
+        $script:InjectPublisherBundleFailure = $false
+        Export-PublisherEgsBundles -Manifest $script:EgsManifest `
+            -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
+
+        foreach ($mapping in $script:EgsMappings) {
+            Assert-PublisherEgsBundle -Path (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-manifests.v1.json") `
+                -ConfigRevision $script:EgsManifest.config_revision -VolumeName $mapping.Name
+        }
+    }
+
+    It "does not create pending state or offline disks when bundle export fails" {
+        $manifest = [pscustomobject]@{
+            schema_version = 1
+            config_revision = "0123456789abcdef"
+            target_iqn = "iqn.2026-08.lab.games:master"
+            volumes = @([pscustomobject]@{ name = "ssd"; disk_unique_id = "aaa"; lun = 0 })
+        }
+        $pendingPath = Join-Path $TestDrive "publisher.pending.json"
+        $session = [pscustomobject]@{ TargetNodeAddress = $manifest.target_iqn }
+        $disk = [pscustomobject]@{ UniqueId = "aaa"; Number = 10; IsOffline = $false }
+        Mock Get-PublisherSession { return @($session) }
+        Mock Get-PublisherSessionDisks { return @($disk) }
+        Mock Stop-EgsLauncherProcesses { }
+        Mock Get-PublisherEgsVolumeMappings {
+            return @([pscustomobject]@{ Name = "ssd"; RootPath = "S:\"; Disk = $disk })
+        }
+        Mock Export-PublisherEgsBundles { throw "injected after first bundle write" }
+        Mock Set-PublisherDisksOffline { }
+        Mock Disconnect-IscsiTarget { }
+
+        {
+            Invoke-PublisherDisconnect -Manifest $manifest -StatePath $pendingPath `
+                -EgsSyncEnabled $true -EpicManifestDirectory $script:EgsManifestDirectory
+        } | Should -Throw "*after first bundle write*"
+
+        Test-Path -LiteralPath $pendingPath | Should -BeFalse
+        Should -Invoke Set-PublisherDisksOffline -Times 0 -Exactly
+        Should -Invoke Disconnect-IscsiTarget -Times 0 -Exactly
+    }
+
+    It "parses explicit enabled and disabled local sync configuration" {
+        $path = Join-Path $TestDrive "egs-sync.json"
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json | Set-Content $path
+        Get-EgsManifestSyncEnabled -Path $path | Should -BeTrue
+        @{ schema_version = 1; enabled = $false } | ConvertTo-Json | Set-Content $path
+        Get-EgsManifestSyncEnabled -Path $path | Should -BeFalse
+        Remove-Item -LiteralPath $path
+        Get-EgsManifestSyncEnabled -Path $path | Should -BeFalse
+    }
+}

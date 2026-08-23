@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.5
+# iSCSI Reset Service v0.4.6
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -181,6 +181,9 @@ sequenceDiagram
 
     alt Полный набор совпал
         PC->>PC: Согласовать буквы внутри набора клиента
+        opt Включена синхронизация Epic Games
+            PC->>PC: Закрыть EGS, проверить bundle каждого тома<br/>и транзакционно заменить управляемые .item
+        end
     else Локальная проверка завершилась ошибкой
         PC->>TN: Отключить сеанс этого запуска
     end
@@ -673,6 +676,14 @@ Set-ExecutionPolicy -Scope Process Bypass
 ./Install-IscsiReleasePublisher.ps1 -ManifestSourcePath ./publisher.json
 ```
 
+Чтобы включить перенос установок Epic Games вместе с релизом, добавьте opt-in параметр:
+
+```powershell
+./Install-IscsiReleasePublisher.ps1 `
+  -ManifestSourcePath ./publisher.json `
+  -EpicGamesManifestSync Enabled
+```
+
 Установщик копирует `publisher.json` и вспомогательный скрипт в
 `C:\ProgramData\IscsiResetPublisher`, закрывает ACL по SID системной учётной записи и
 встроенной группы администраторов и не сохраняет сетевые учётные данные. После изменения
@@ -707,6 +718,15 @@ Set-ExecutionPolicy -Scope Process Bypass
 ./Install-IscsiResetClient.ps1 `
   -CaCertificatePath ./reset-ca.crt `
   -ResetApiIp 10.20.40.10
+```
+
+Для автоматической регистрации сетевых Epic Games-игр установите клиент с тем же opt-in:
+
+```powershell
+./Install-IscsiResetClient.ps1 `
+  -CaCertificatePath ./reset-ca.crt `
+  -ResetApiIp 10.20.40.10 `
+  -EpicGamesManifestSync Enabled
 ```
 
 Reset API всегда используется по `https://<введённый-IP>:8443`; hostname и IPv6 установщик
@@ -754,6 +774,43 @@ Reset API возвращает только portal, собственную це�
 `{lun, disk_unique_id, drive_letter, label}`. Имя релиза, пути снимков и чужие цели клиенту не
 выдаются. Скрипт не использует `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, удаление
 разделов или другие команды подготовки диска.
+
+### Синхронизация Epic Games Launcher
+
+[Epic Games Launcher официально не обнаруживает автоматически уже существующие игровые
+файлы](https://www.epicgames.com/help/c-202300000001639/c-202300000001735/a202300000017289?lang=en-US).
+Режим `-EpicGamesManifestSync Enabled` переносит точные Epic-authored `.item` Publisher вместе
+с тем же набором снимков. Это локальный opt-in обоих установщиков; по умолчанию он `Disabled` и
+не меняет поведение текущих установок.
+
+При `Disconnect` Publisher сначала закрывает `EpicGamesLauncher`, ждёт до 15 секунд и
+принудительно завершает оставшиеся `EpicGamesLauncher`/`EpicWebHelper`. После точной сверки
+master-дисков по NAA helper проверяет `AppName`, GUID, build, `InstallTags`, абсолютные пути,
+`.egstore` metadata и executable. На каждом томе, в том числе без EGS-игр, атомарно создаётся
+`X:\.iscsi-reset\egs-manifests.v1.json`. Bundle содержит редакцию конфигурации, логическое имя
+тома, SHA-256 и Base64 точных байтов каждого `.item`. Ошибка записи или повторного чтения не
+создаёт publisher pending state, не переводит диски offline и не отключает target.
+
+На клиенте синхронизация выполняется только после проверки iSCSI-дисков и назначения букв, но
+до локального события `ready`. Helper закрывает EGS, требует bundle для каждого подключённого
+тома и сверяет его с редакцией Reset API, именем тома, фактическими путями и `.egstore`
+metadata. Затем он транзакционно меняет `.item` в
+`C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests` и ведёт защищённый
+`C:\ProgramData\IscsiReset\egs-managed-apps.v1.json`. Удаляются только точные stale-записи из
+этого managed-state; посторонние локальные игры сохраняются. Любой unmanaged конфликт
+`AppName`, ошибка проверки или неполный rollback завершается кодом `40`, оставляет журнал для
+восстановления при необходимости и отключает только iSCSI-session текущего запуска.
+
+Версия v1 требует одинаковых букв и полных путей игр на Publisher и клиентах. Она не копирует
+`LauncherInstalled.dat`, LocalAppData, webcache, настройки аккаунта или авторизацию. Все ПК
+должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite build,
+ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
+`InstallTags` и [выбранных компонентов Fortnite](https://www.epicgames.com/help/c-202300000001636/c-202300000001690/a202300000015197?lang=en-US).
+Чтобы обновление не скачивалось во временный clone, [отключите Auto Update для сетевой игры
+штатным переключателем EGS](https://www.epicgames.com/help/c-202300000001639/c-202300000001731/a202300000013237?lang=en-US).
+При совпадающем build ожидается `Launch` без полной повторной загрузки. Механизм `.item` не
+является официальным интерфейсом Epic и должен быть подтверждён на реальном Windows
+PowerShell 5.1 стенде.
 
 ## Ежедневная эксплуатация
 

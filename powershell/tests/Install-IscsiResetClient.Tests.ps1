@@ -20,6 +20,7 @@ Describe "iSCSI reset client installer inputs" {
         })
 
         $parameterNames | Should -Contain "ResetApiIp"
+        $parameterNames | Should -Contain "EpicGamesManifestSync"
         $parameterNames | Should -Not -Contain "Token"
         $parameterNames | Should -Not -Contain "ApiBaseUrl"
     }
@@ -127,6 +128,8 @@ Describe "Installer secret and ACL regression" {
         $source | Should -Match 'New-Item -ItemType Directory -Path \$InstallRoot -Force'
         $source | Should -Match 'Copy-Item .* -Destination \$installedScript -Force'
         $source | Should -Match 'Register-ScheduledTask .*\n\s*-Trigger .* -Force'
+        $source | Should -Match 'schema_version = 1'
+        $source | Should -Match 'enabled = \$EpicGamesManifestSync -eq "Enabled"'
     }
 
     It "does not place the raw token in scheduled-task arguments or output" {

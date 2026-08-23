@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$ManifestSourcePath,
     [string]$InstallDirectory = "C:\ProgramData\IscsiResetPublisher",
-    [string]$PublisherScriptPath = "$PSScriptRoot\Publish-IscsiRelease.ps1"
+    [string]$PublisherScriptPath = "$PSScriptRoot\Publish-IscsiRelease.ps1",
+    [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -28,17 +29,23 @@ if ([int]$manifest.schema_version -ne 1 -or
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
 $configPath = Join-Path $InstallDirectory "publisher.json"
 $installedScript = Join-Path $InstallDirectory "Publish-IscsiRelease.ps1"
+$egsConfigPath = Join-Path $InstallDirectory "egs-sync.json"
 Copy-Item -LiteralPath $ManifestSourcePath -Destination $configPath -Force
 Copy-Item -LiteralPath $PublisherScriptPath -Destination $installedScript -Force
+[ordered]@{
+    schema_version = 1
+    enabled = $EpicGamesManifestSync -eq "Enabled"
+} | ConvertTo-Json | Set-Content -LiteralPath $egsConfigPath -Encoding UTF8
 
 & icacls.exe $InstallDirectory /inheritance:r | Out-Null
 & icacls.exe $InstallDirectory `
     /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-foreach ($path in @($configPath, $installedScript)) {
+foreach ($path in @($configPath, $installedScript, $egsConfigPath)) {
     & icacls.exe $path /inheritance:r | Out-Null
     & icacls.exe $path /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
 }
 
 Write-Host "Publisher helper installed: $installedScript"
 Write-Host "Manifest revision: $($manifest.config_revision)"
+Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
 Write-Host "Use -Action Disconnect before staging and -Action Reconnect after activation."

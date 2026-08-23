@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$CaCertificatePath,
     [string]$ResetApiIp,
     [string]$InstallRoot = "C:\ProgramData\IscsiReset",
-    [string]$ClientScriptPath = (Join-Path $PSScriptRoot "Reset-And-Connect.ps1")
+    [string]$ClientScriptPath = (Join-Path $PSScriptRoot "Reset-And-Connect.ps1"),
+    [ValidateSet("Enabled", "Disabled")][string]$EpicGamesManifestSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -136,6 +137,7 @@ function Invoke-IscsiResetClientInstall {
 
         $installedScript = Join-Path $InstallRoot "Reset-And-Connect.ps1"
         $tokenPath = Join-Path $InstallRoot "client.token"
+        $egsConfigPath = Join-Path $InstallRoot "egs-sync.json"
         Copy-Item -LiteralPath $ClientScriptPath -Destination $installedScript -Force
         Set-Acl -LiteralPath $installedScript -AclObject (New-RestrictedFileSystemAcl)
         [System.IO.File]::WriteAllText(
@@ -144,6 +146,11 @@ function Invoke-IscsiResetClientInstall {
             (New-Object System.Text.UTF8Encoding($false))
         )
         Set-Acl -LiteralPath $tokenPath -AclObject (New-RestrictedFileSystemAcl)
+        [ordered]@{
+            schema_version = 1
+            enabled = $EpicGamesManifestSync -eq "Enabled"
+        } | ConvertTo-Json | Set-Content -LiteralPath $egsConfigPath -Encoding UTF8
+        Set-Acl -LiteralPath $egsConfigPath -AclObject (New-RestrictedFileSystemAcl)
 
         Import-Certificate -FilePath $CaCertificatePath `
             -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
@@ -173,6 +180,7 @@ function Invoke-IscsiResetClientInstall {
             -Trigger $trigger -Principal $principalTask -Settings $settings -Force | Out-Null
 
         Write-Host "Installed iSCSI reset client for Reset API $($api.Ip):8443."
+        Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
         Write-Host "Reboot to run the first reset and non-persistent login."
     }
     finally {

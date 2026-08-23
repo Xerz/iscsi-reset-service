@@ -138,7 +138,41 @@
 10. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
 
-## 7. Один dual-role Publisher/client ПК
+## 7. Epic Games manifest sync
+
+1. На выделенном Publisher с реальным EGS установить GTA и Fortnite на разные master-тома,
+   выбрав для Fortnite отличающийся набор компонентов/текстур. Добавить третий произвольно
+   названный том без EGS-игр. Буквы и полные пути на Publisher и тестовом клиенте должны
+   совпадать.
+2. Повторно установить оба helper с `-EpicGamesManifestSync Enabled`. Проверить защищённые
+   `egs-sync.json`; при `Disabled` Publisher не должен создавать bundle, а клиент — закрывать
+   EGS или менять локальные `.item`/managed-state.
+3. Открыть реальный EGS и выполнить Publisher `Disconnect`. Проверить graceful close до 15
+   секунд и forced close оставшихся `EpicGamesLauncher`/`EpicWebHelper`. На каждом master-томе
+   должен существовать `.iscsi-reset\egs-manifests.v1.json`; третий bundle должен иметь пустой
+   `manifests`. SHA-256/Base64 обязаны воспроизводить точные исходные `.item`, включая разные
+   `InstallTags` GTA/Fortnite.
+4. Поочерёдно подменить на копии стенда GUID, install path, hash, `config_revision`,
+   `volume_name`, `.egstore\<GUID>.manifest/.mancpn` и executable. Publisher должен отказать до
+   pending/offline/disconnect; client — вернуть `40`, не записать `ready` и отключить только
+   созданную этим запуском session.
+5. Проверить локальный unmanaged `.item` с тем же `AppName` и постороннюю локальную EGS-игру.
+   Конфликт должен дать безопасный отказ; посторонняя игра и её bytes должны сохраниться.
+   Удаление игры из нового bundle должно удалить только точную запись из
+   `egs-managed-apps.v1.json`.
+6. Имитировать отказ после первой записи bundle Publisher. Повторный `Disconnect` должен
+   согласовать весь набор заново. На клиенте имитировать отказ после первой замены `.item`:
+   проверенный rollback должен восстановить все bytes и managed-state, а следующий запуск —
+   успешно завершить транзакцию. При искусственно неполном rollback журнал должен сохраниться.
+7. Выполнить полный Publisher → stage → activate → client workflow для GTA и Fortnite. На
+   актуальном release EGS должен показать `Launch`. На старом release он должен показать
+   `Update`, а не `Install`; Auto Update сетевых игр должен быть отключён штатным переключателем
+   EGS, и загрузка не должна начаться автоматически.
+8. На release с совпадающим build повторно загрузить клиента и проверить отсутствие полной
+   загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
+   `InstallTags`/компонентами, а не реконструкцией `.item`.
+
+## 8. Один dual-role Publisher/client ПК
 
 1. Настроить один клиент с той же полной парой SAN IP/IQN, что у Publisher, но с отдельными
    client target, extent и associations. Убедиться, что обе target имеют точный IQN и тот же
@@ -154,7 +188,7 @@
 6. Проверить частичное совпадение только IP, только IQN и постороннюю target: это должна быть
    красная ошибка `identity conflict`, а не ожидаемое предупреждение о другой роли.
 
-## 8. Комплект GitHub Release
+## 9. Комплект GitHub Release
 
 1. Скачать семь assets: YAML, `image-digest.txt`, `SHA256SUMS` и четыре операторских `.ps1`.
 2. Убедиться, что `publisher.json` и тестовые PowerShell-файлы в выпуск не попали.
@@ -165,7 +199,7 @@
 5. Проверить, что workflow artifact и GitHub Release содержат одинаковый комплект файлов.
 6. На опубликованном tag дождаться Python, Compose и Windows PowerShell 5.1 CI.
 
-## 9. Чек-лист результата
+## 10. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
@@ -175,6 +209,7 @@
 | Config save | 409/live recheck/SQLite guards/atomic history |  | ☐ |
 | Restart revisions | После restart startup = saved |  | ☐ |
 | Publisher Disconnect | Exact session/NAA, pending до mutations |  | ☐ |
+| Epic Games sync | Exact bundles, managed `.item`, rollback/retry |  | ☐ |
 | Stage | Fail-closed, immutable полный mapping |  | ☐ |
 | Incomplete retry | Исходный request ID, без удаления snapshots |  | ☐ |
 | Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |

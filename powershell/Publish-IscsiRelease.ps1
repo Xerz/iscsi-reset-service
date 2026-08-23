@@ -3,6 +3,8 @@ param(
     [ValidateSet("Disconnect", "Reconnect")][string]$Action = "Disconnect",
     [string]$ManifestPath = "C:\ProgramData\IscsiResetPublisher\publisher.json",
     [string]$PendingPath = "C:\ProgramData\IscsiResetPublisher\publisher.pending.json",
+    [string]$EgsSyncConfigPath = (Join-Path $PSScriptRoot "egs-sync.json"),
+    [string]$EgsManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests",
     [switch]$PassThruExitCode,
     [switch]$NoMain
 )
@@ -15,6 +17,325 @@ function Normalize-PublisherDiskId {
     $normalized = ($Value -replace "\s", "").ToLowerInvariant()
     if ($normalized.StartsWith("0x")) { return $normalized.Substring(2) }
     return $normalized
+}
+
+function Get-EgsManifestSyncEnabled {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ([int]$config.schema_version -ne 1 -or $config.enabled -isnot [bool]) {
+        throw "Epic Games manifest sync config is invalid: $Path"
+    }
+    return [bool]$config.enabled
+}
+
+function Get-EgsSha256Hex {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($algorithm.ComputeHash($Bytes) | ForEach-Object {
+            $_.ToString("x2")
+        }) -join "")
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
+function ConvertTo-EgsCanonicalPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "Epic Games path is empty" }
+    $candidate = $Path.Trim().Replace("/", "\")
+    if ($candidate -match "^[A-Za-z]:\\") {
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            return [IO.Path]::GetFullPath($candidate).TrimEnd([char[]]@(92))
+        }
+        return $candidate.TrimEnd([char[]]@(92))
+    }
+    $separators = [char[]]@(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    return [IO.Path]::GetFullPath($Path).TrimEnd($separators)
+}
+
+function Test-EgsPathWithinRoot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$RootPath
+    )
+    $candidate = ConvertTo-EgsCanonicalPath $Path
+    $root = ConvertTo-EgsCanonicalPath $RootPath
+    if ($candidate.Equals($root, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $separator = if ($candidate -match "^[A-Za-z]:\\") { "\" } else {
+        [IO.Path]::DirectorySeparatorChar
+    }
+    return $candidate.StartsWith(
+        $root.TrimEnd([char[]]@(92, 47)) + $separator,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Get-RequiredEgsString {
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($Item.PSObject.Properties.Name -notcontains $Name) {
+        throw "Epic Games manifest is missing $Name"
+    }
+    $value = [string]$Item.$Name
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "Epic Games manifest has an empty $Name"
+    }
+    return $value
+}
+
+function Stop-EgsLauncherProcesses {
+    param([int]$GraceSeconds = 15)
+    $names = @("EpicGamesLauncher", "EpicWebHelper")
+    $launcher = @(Get-Process -Name $names -ErrorAction SilentlyContinue)
+    foreach ($process in @($launcher | Where-Object { $_.ProcessName -eq "EpicGamesLauncher" })) {
+        try { $process.CloseMainWindow() | Out-Null } catch { }
+    }
+
+    for ($second = 0; $second -lt $GraceSeconds; $second++) {
+        if (@(Get-Process -Name $names -ErrorAction SilentlyContinue).Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+
+    foreach ($process in @(Get-Process -Name $names -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    if (@(Get-Process -Name $names -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw "Epic Games Launcher processes could not be stopped"
+    }
+}
+
+function Assert-EgsLauncherStopped {
+    $running = @(Get-Process -Name @("EpicGamesLauncher", "EpicWebHelper") `
+        -ErrorAction SilentlyContinue)
+    if ($running.Count -ne 0) { throw "Epic Games Launcher restarted during manifest export" }
+}
+
+function Get-PublisherEgsVolumeMappings {
+    param(
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)]$Disks
+    )
+    $mappings = @()
+    foreach ($expected in $ExpectedVolumes) {
+        $expectedId = Normalize-PublisherDiskId ([string]$expected.disk_unique_id)
+        $matches = @($Disks | Where-Object {
+            (Normalize-PublisherDiskId ([string]$_.UniqueId)) -eq $expectedId
+        })
+        if ($matches.Count -ne 1) {
+            throw "Expected exactly one Publisher disk for EGS volume $($expected.name)"
+        }
+        $partitions = @(Get-Partition -DiskNumber $matches[0].Number | Where-Object {
+            $_.Type -notin @("Reserved", "System", "Recovery")
+        })
+        if ($partitions.Count -ne 1 -or
+            [string]::IsNullOrWhiteSpace([string]$partitions[0].DriveLetter)) {
+            throw "Publisher volume $($expected.name) must have one mounted data partition"
+        }
+        $letter = ([string]$partitions[0].DriveLetter).ToUpperInvariant()
+        if ($letter -notmatch "^[A-Z]$") {
+            throw "Publisher volume $($expected.name) has an invalid drive letter"
+        }
+        $mappings += [pscustomobject]@{
+            Name = [string]$expected.name
+            Disk = $matches[0]
+            RootPath = "$letter`:\"
+        }
+    }
+    return $mappings
+}
+
+function Assert-PublisherEgsItem {
+    param(
+        [Parameter(Mandatory = $true)]$Item,
+        [Parameter(Mandatory = $true)][string]$ItemPath,
+        [Parameter(Mandatory = $true)]$VolumeMapping
+    )
+    $appName = Get-RequiredEgsString -Item $Item -Name "AppName"
+    $guid = Get-RequiredEgsString -Item $Item -Name "InstallationGuid"
+    if ($guid -notmatch "^[0-9A-Fa-f]{32}$") {
+        throw "$appName has an invalid Epic installation GUID"
+    }
+    if (-not ([IO.Path]::GetFileName($ItemPath)).Equals(
+        "$guid.item", [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "$appName .item filename does not match InstallationGuid"
+    }
+    Get-RequiredEgsString -Item $Item -Name "AppVersionString" | Out-Null
+    if ($Item.PSObject.Properties.Name -notcontains "InstallTags") {
+        throw "$appName manifest has no InstallTags"
+    }
+
+    $installLocation = ConvertTo-EgsCanonicalPath (
+        Get-RequiredEgsString -Item $Item -Name "InstallLocation"
+    )
+    if (-not (Test-EgsPathWithinRoot -Path $installLocation -RootPath $VolumeMapping.RootPath)) {
+        throw "$appName is outside Publisher volume $($VolumeMapping.Name)"
+    }
+    if (-not (Test-Path -LiteralPath $installLocation -PathType Container)) {
+        throw "$appName install directory does not exist"
+    }
+    $egstore = ConvertTo-EgsCanonicalPath (Join-Path $installLocation ".egstore")
+    $manifestLocation = ConvertTo-EgsCanonicalPath (
+        Get-RequiredEgsString -Item $Item -Name "ManifestLocation"
+    )
+    if (-not $manifestLocation.Equals($egstore, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$appName ManifestLocation does not match its .egstore directory"
+    }
+    $stagingLocation = ConvertTo-EgsCanonicalPath (
+        Get-RequiredEgsString -Item $Item -Name "StagingLocation"
+    )
+    $expectedStaging = ConvertTo-EgsCanonicalPath (Join-Path $egstore "bps")
+    if (-not $stagingLocation.Equals($expectedStaging, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$appName StagingLocation does not match its .egstore directory"
+    }
+
+    $binaryManifest = Join-Path $egstore "$guid.manifest"
+    $component = Join-Path $egstore "$guid.mancpn"
+    if (-not (Test-Path -LiteralPath $binaryManifest -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $component -PathType Leaf)) {
+        throw "$appName .egstore metadata is incomplete"
+    }
+    $componentData = Get-Content -LiteralPath $component -Raw | ConvertFrom-Json
+    if ([string]$componentData.AppName -ne $appName) {
+        throw "$appName .mancpn AppName does not match"
+    }
+    if ((Get-Item -LiteralPath $binaryManifest).Length -le 0) {
+        throw "$appName binary manifest is empty"
+    }
+
+    if ($Item.PSObject.Properties.Name -contains "LaunchExecutable" -and
+        -not [string]::IsNullOrWhiteSpace([string]$Item.LaunchExecutable)) {
+        $launchPath = [string]$Item.LaunchExecutable
+        if (-not [IO.Path]::IsPathRooted($launchPath)) {
+            $launchPath = Join-Path $installLocation $launchPath
+        }
+        if (-not (Test-Path -LiteralPath $launchPath -PathType Leaf)) {
+            throw "$appName launch executable does not exist"
+        }
+    }
+}
+
+function Assert-PublisherEgsBundle {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ConfigRevision,
+        [Parameter(Mandatory = $true)][string]$VolumeName
+    )
+    $bundle = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ([int]$bundle.schema_version -ne 1 -or
+        [string]$bundle.config_revision -ne $ConfigRevision -or
+        [string]$bundle.volume_name -ne $VolumeName -or
+        $bundle.PSObject.Properties.Name -notcontains "manifests") {
+        throw "Epic Games bundle verification failed for volume $VolumeName"
+    }
+    foreach ($entry in @($bundle.manifests)) {
+        $bytes = [Convert]::FromBase64String([string]$entry.payload_base64)
+        if ((Get-EgsSha256Hex $bytes) -ne [string]$entry.sha256) {
+            throw "Epic Games bundle hash verification failed for $($entry.app_name)"
+        }
+        $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        if ([string]$item.AppName -ne [string]$entry.app_name -or
+            [string]$item.InstallationGuid -ne [string]$entry.installation_guid) {
+            throw "Epic Games bundle identity verification failed"
+        }
+    }
+}
+
+function Write-PublisherEgsBundleAtomic {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Bundle
+    )
+    $directory = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $temporary = Join-Path $directory (".egs-bundle-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    $backup = Join-Path $directory (".egs-bundle-" + [Guid]::NewGuid().ToString("N") + ".bak")
+    try {
+        $json = $Bundle | ConvertTo-Json -Depth 8
+        [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $Path) {
+            [IO.File]::Replace($temporary, $Path, $backup)
+            Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($temporary, $Path)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Export-PublisherEgsBundles {
+    param(
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)]$VolumeMappings,
+        [Parameter(Mandatory = $true)][string]$ManifestDirectory
+    )
+    if (-not (Test-Path -LiteralPath $ManifestDirectory -PathType Container)) {
+        throw "Epic Games manifest directory does not exist: $ManifestDirectory"
+    }
+    Assert-EgsLauncherStopped
+    $byVolume = @{}
+    foreach ($mapping in $VolumeMappings) { $byVolume[$mapping.Name] = @() }
+    $seenApps = @{}
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $ManifestDirectory -Filter "*.item" -File | Sort-Object Name)) {
+        $bytes = [IO.File]::ReadAllBytes($file.FullName)
+        try {
+            $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        } catch {
+            throw "Epic Games manifest is not valid JSON: $($file.FullName)"
+        }
+        $installLocation = ConvertTo-EgsCanonicalPath (
+            Get-RequiredEgsString -Item $item -Name "InstallLocation"
+        )
+        $mapping = @($VolumeMappings | Where-Object {
+            Test-EgsPathWithinRoot -Path $installLocation -RootPath $_.RootPath
+        })
+        if ($mapping.Count -eq 0) { continue }
+        if ($mapping.Count -ne 1) {
+            throw "Epic Games manifest maps to more than one Publisher volume"
+        }
+        Assert-PublisherEgsItem -Item $item -ItemPath $file.FullName -VolumeMapping $mapping[0]
+        $appName = [string]$item.AppName
+        if ($seenApps.ContainsKey($appName)) {
+            throw "Duplicate Epic Games AppName on Publisher volumes: $appName"
+        }
+        $seenApps[$appName] = $true
+        $entry = [ordered]@{
+            app_name = $appName
+            installation_guid = [string]$item.InstallationGuid
+            sha256 = Get-EgsSha256Hex $bytes
+            payload_base64 = [Convert]::ToBase64String($bytes)
+        }
+        $byVolume[$mapping[0].Name] = @($byVolume[$mapping[0].Name]) + $entry
+    }
+
+    foreach ($mapping in $VolumeMappings) {
+        $bundlePath = Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v1.json"
+        $bundle = [ordered]@{
+            schema_version = 1
+            config_revision = [string]$Manifest.config_revision
+            volume_name = [string]$mapping.Name
+            manifests = @($byVolume[$mapping.Name] | Sort-Object app_name)
+        }
+        Write-PublisherEgsBundleAtomic -Path $bundlePath -Bundle $bundle
+    }
+    foreach ($mapping in $VolumeMappings) {
+        $bundlePath = Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v1.json"
+        Assert-PublisherEgsBundle -Path $bundlePath `
+            -ConfigRevision ([string]$Manifest.config_revision) -VolumeName $mapping.Name
+    }
+    Assert-EgsLauncherStopped
 }
 
 function Read-PublisherManifest {
@@ -230,7 +551,12 @@ function Connect-PublisherTarget {
 }
 
 function Invoke-PublisherDisconnect {
-    param([Parameter(Mandatory = $true)]$Manifest, [Parameter(Mandatory = $true)][string]$StatePath)
+    param(
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [bool]$EgsSyncEnabled = $false,
+        [string]$EpicManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests"
+    )
     if (Test-Path -LiteralPath $StatePath) {
         $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
         Assert-PublisherPending -Pending $pending -Manifest $Manifest
@@ -243,6 +569,13 @@ function Invoke-PublisherDisconnect {
     if ($sessions.Count -ne 1) { throw "Disconnect requires exactly one Publisher session" }
     $disks = @(Get-PublisherSessionDisks -Session $sessions[0])
     $matched = @(Assert-PublisherDisks -ExpectedVolumes @($Manifest.volumes) -Disks $disks)
+    if ($EgsSyncEnabled) {
+        Stop-EgsLauncherProcesses
+        $volumeMappings = @(Get-PublisherEgsVolumeMappings `
+            -ExpectedVolumes @($Manifest.volumes) -Disks $matched)
+        Export-PublisherEgsBundles -Manifest $Manifest -VolumeMappings $volumeMappings `
+            -ManifestDirectory $EpicManifestDirectory
+    }
     Save-PublisherPending -Path $StatePath -Manifest $Manifest
     Set-PublisherDisksOffline -Disks $matched
     Disconnect-IscsiTarget -NodeAddress ([string]$Manifest.target_iqn) -Confirm:$false
@@ -272,12 +605,16 @@ function Invoke-PublisherMain {
     param(
         [Parameter(Mandatory = $true)][ValidateSet("Disconnect", "Reconnect")][string]$RequestedAction,
         [Parameter(Mandatory = $true)][string]$PublisherManifestPath,
-        [Parameter(Mandatory = $true)][string]$StatePath
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][string]$SyncConfigPath,
+        [Parameter(Mandatory = $true)][string]$EpicManifestDirectory
     )
     try {
         $manifest = Read-PublisherManifest -Path $PublisherManifestPath
         if ($RequestedAction -eq "Disconnect") {
-            Invoke-PublisherDisconnect -Manifest $manifest -StatePath $StatePath
+            $egsSyncEnabled = Get-EgsManifestSyncEnabled -Path $SyncConfigPath
+            Invoke-PublisherDisconnect -Manifest $manifest -StatePath $StatePath `
+                -EgsSyncEnabled $egsSyncEnabled -EpicManifestDirectory $EpicManifestDirectory
             Write-Host "Publisher disconnected. Create and activate the release in the management UI."
         } else {
             Invoke-PublisherReconnect -Manifest $manifest -StatePath $StatePath
@@ -294,6 +631,8 @@ if (-not $NoMain) {
     $exitCode = Invoke-PublisherMain `
         -RequestedAction $Action `
         -PublisherManifestPath $ManifestPath `
-        -StatePath $PendingPath
+        -StatePath $PendingPath `
+        -SyncConfigPath $EgsSyncConfigPath `
+        -EpicManifestDirectory $EgsManifestDirectory
     if ($PassThruExitCode) { Write-Output $exitCode } else { exit $exitCode }
 }
