@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.11
+# iSCSI Reset Service v0.4.12
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -802,18 +802,25 @@ Reset API возвращает только portal, собственную це�
 не меняет поведение текущих установок.
 
 Режим `Aggressive` предназначен для выделенного игрового ПК, который является точным зеркалом
-Publisher. Он требует bundle v3 и подключения полного точного набора логических iSCSI-томов
+Publisher. Он требует bundle v4 и подключения полного точного набора логических iSCSI-томов
 Publisher. Их имена сравниваются case-sensitive как множество: порядок LUN, букв и JSON-массива
 не влияет на результат. Локальный системный `C:` Publisher или клиента в этот набор не входит.
 Publisher потоково упаковывает весь `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точные
-bytes всего `C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` в отдельные ZIP/index на
-первом томе manifest. Каждый том получает `egs-manifests.v3.json` с одним anchor, hashes,
-лимитами и inventory игр. Reparse points, case-insensitive collisions, traversal, более
-100 000 файлов, 1 GiB суммарно и 512 MiB на файл отклоняются до pending/offline/disconnect.
-LocalAppData, `webcache*`, аккаунт, токены, авторизация и EOS state не переносятся.
+bytes всего `C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat` вместе с opaque
+shared-базой `C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems` в
+`egs-state.v4.zip`/`egs-state.v4.index.json` на первом томе manifest. Каждый том получает
+`egs-manifests.v4.json` с одним anchor, hashes, лимитами и inventory игр. Reparse points,
+case-insensitive collisions, traversal, пустая shared-база, более 100 000 файлов, 1 GiB
+суммарно и 512 MiB на файл отклоняются до pending/offline/disconnect. LocalAppData,
+`webcache*`, аккаунт, токены и авторизация не переносятся. Отдельная локальная база
+`C:\ProgramData\Epic\EpicOnlineServices\InstallHelper\InstalledItems`, относящаяся к
+EOS service/overlay, никогда не копируется и не изменяется.
 
 При `Disconnect` Publisher сначала закрывает `EpicGamesLauncher`, ждёт до 15 секунд и
-принудительно завершает оставшиеся `EpicGamesLauncher`/`EpicWebHelper`. После точной сверки
+принудительно завершает оставшиеся `EpicGamesLauncher`/`EpicWebHelper`. В aggressive-режиме он
+также ждёт завершения `InstallHelper`, у которого точный `--installationdbdir` указывает на
+shared-базу; активный writer блокирует выпуск. Путь можно переопределить параметром
+`-EgsSharedInstallDbPath`. После точной сверки
 master-дисков по NAA helper проверяет `AppName`, непрозрачный hex `InstallationGuid`, build,
 `InstallTags`, абсолютные пути, `.egstore` metadata и executable. Идентификатор не приводится к
 стандартному GUID: EGS может создать 31-символьное значение. Имя `.item` и обязательного
@@ -867,24 +874,29 @@ Windows. `target_disconnected_after_error` пишется лишь после п
 только после этого `ready`; при takeover перед ними также появляется
 `egs_registration_takeover`.
 
-В `Aggressive` клиент проверяет v3 bundle на каждом iSCSI-томе, точный полный case-sensitive
+В `Aggressive` клиент проверяет v4 bundle на каждом iSCSI-томе, точный полный case-sensitive
 volume set без зависимости от порядка, ZIP/index и каждый файл, распаковывает payload в
-защищённый staging и атомарно меняет всё дерево `Data` и
-целый `LauncherInstalled.dat`. Старое локальное состояние сохраняется в постоянном
+защищённый staging и атомарно меняет всё дерево `Data`, целый `LauncherInstalled.dat` и
+shared-базу `EpicOnlineServicesShared\InstallHelper\InstalledItems`. До mutations он закрывает
+EGS и требует отсутствия `InstallHelper`, использующего именно эту базу. Старое локальное
+состояние всех трёх targets сохраняется в постоянном
 SHA-addressed каталоге `C:\ProgramData\IscsiReset\egs-programdata-backups`; transaction journal
-v3 восстанавливает дерево, launcher-файл и managed-state при любой ошибке. ACL/SID Publisher не
-копируются: после swap дерево получает локально наследуемые ACL и локальную NTFS metadata.
-Attributes и UTC timestamps остаются в index для совместимости v3, но клиент их не применяет и
+v4 восстанавливает shared-базу, дерево, launcher-файл и managed-state при любой ошибке. Journals
+v1–v3 по-прежнему восстанавливаются. ACL/SID Publisher не копируются: после swap targets
+получают локально наследуемые ACL и локальную NTFS metadata.
+Attributes и UTC timestamps остаются в index, но клиент их не применяет и
 не сравнивает между компьютерами. Размер и SHA-256 каждого файла остаются обязательными.
 Совпадающий tree hash даёт no-op. Успешный порядок событий:
-`egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Задача клиента в этом режиме
-имеет execution limit 20 минут вместо 5.
+`egs_eos_install_db_sync_ready` → `egs_programdata_sync_ready` →
+`egs_manifest_sync_ready` → `ready`. Задача клиента в этом режиме имеет execution limit
+20 минут вместо 5.
 
 Версия v2 требует одинаковых букв и полных путей игр на Publisher и клиентах. Client helper в
 режиме `Enabled` отклоняет release только с bundle v1, а режим `Aggressive` принимает только
-новый v3 release; несовместимость завершается кодом `40`. Обычный `Enabled` по-прежнему не
+новый v4 release; несовместимость завершается кодом `40`. Обычный `Enabled` по-прежнему не
 копирует целиком Publisher `LauncherInstalled.dat`. Ни один режим не копирует LocalAppData,
-webcache, настройки аккаунта, авторизацию или EOS/service state.
+webcache, настройки аккаунта или авторизацию. Shared Install DB переносится только в
+`Aggressive`; non-shared EOS/service state остаётся локальным.
 Все ПК должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite
 build, ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
 `InstallTags` и [выбранных компонентов Fortnite](https://www.epicgames.com/help/c-202300000001636/c-202300000001690/a202300000015197?lang=en-US).
@@ -1017,12 +1029,16 @@ Client helper v0.4.7 переносил `.item`, но при отсутству�
 переустановки Launcher это дало `Launch` только для GTA V Enhanced, тогда как GTA V и Fortnite
 показали «Продолжить» и пытались начать полную загрузку. В v0.4.8 полный v2 registration import
 для трёх игр (`3 / 0 / 0`) и официальный сброс `webcache*` результата не изменили: GTA V и
-Fortnite остались в `Продолжить`, GTA V Enhanced — в `Launch`. Для следующей проверки
-переустановите оба helper v0.4.11 с `-EpicGamesManifestSync Aggressive`, выполните новый
-`Disconnect` и создайте v3 release. До запуска EGS в журнале должны идти
-`egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`. Если и точный общий
-ProgramData snapshot не даст `Launch`, следующий шаг — сбор launcher debug logs, а не перенос
-LocalAppData, webcache или account/session state вслепую.
+Fortnite остались в `Продолжить`, GTA V Enhanced — в `Launch`. В v0.4.11 exact-byte
+aggressive sync успешно дал `egs_programdata_sync_ready` → `egs_manifest_sync_ready` →
+`ready`, но состояние двух игр не изменилось. InstallHelper logs локализовали различие:
+Publisher читал три игры как `Installed` на `E:` из shared Install DB, а клиент — старые
+Fortnite/GTA V как `Incomplete` на `C:` из собственной копии этой базы.
+
+v0.4.12 переносит её точные bytes в aggressive bundle v4. Переустановите оба helper,
+выполните новый Publisher `Disconnect` и создайте v4 release; старый v3 release несовместим.
+До запуска EGS ожидаются `egs_eos_install_db_sync_ready` →
+`egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
 
 ### `Epic Games aggressive sync requires the exact Publisher volume set`
 

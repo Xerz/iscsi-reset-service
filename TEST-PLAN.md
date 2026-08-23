@@ -1,4 +1,4 @@
-# Механический тест-план v0.4.11
+# Механический тест-план v0.4.12
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -210,12 +210,14 @@
    загрузки. Отдельно подтвердить, что различие размера Fortnite объясняется сохранёнными
    `InstallTags`/компонентами, а не реконструкцией `.item`.
 16. В режиме `Aggressive` проверить Publisher snapshot всего
-    `C:\ProgramData\Epic\EpicGamesLauncher\Data` и точных bytes полного
-    `LauncherInstalled.dat`: anchor — первый том manifest, ZIP/index находятся только на нём,
-    а `egs-manifests.v3.json` на каждом из трёх томов содержит один сохранённый ordered volume
+    `C:\ProgramData\Epic\EpicGamesLauncher\Data`, точных bytes полного
+    `LauncherInstalled.dat` и opaque shared-базы
+    `C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems`: anchor —
+    первый том manifest, `egs-state.v4.zip`/index находятся только на нём, а
+    `egs-manifests.v4.json` на каждом из трёх томов содержит один сохранённый ordered volume
     set и совпадающие hashes/размеры. На клиенте тот же case-sensitive набор должен приниматься
-    при обратном порядке LUN/JSON; локальный системный `C:` в сравнении не участвует. V1/v2
-    helper bundles должны быть удалены только после полной проверки v3-набора.
+    при обратном порядке LUN/JSON; локальный системный `C:` в сравнении не участвует. V1–v3
+    helper bundles/archive должны быть удалены только после полной проверки v4-набора.
 17. Добавить неизвестные файлы/JSON-поля и задать отличающиеся Publisher/client attributes и
     UTC timestamps. Проверить точные paths, размеры и SHA-256 при локальной NTFS metadata без
     Publisher ACL/SID. Поочерёдно внедрить изменённые bytes/размер, reparse point,
@@ -223,23 +225,28 @@
     суммарно и файл более 512 MiB: операция должна fail-closed завершиться до `ready`.
 18. Подключить клиент только с подмножеством томов, добавить лишний, пустой, дублированный и
     отличающийся только регистром logical volume, а также указать anchor отсутствующего тома.
-    Каждый случай должен вернуть `40`, отключить только созданную session и не менять локальный
-    ProgramData. Отдельно активировать v2 release при aggressive config с тем же ожиданием.
-    Полный v3-набор в любом порядке должен дать
+    Каждый случай должен вернуть `40`, отключить только созданную session и не менять локальные
+    ProgramData/shared DB. Отдельно активировать v2 и v3 release при aggressive config с тем же
+    ожиданием.
+    Полный v4-набор в любом порядке должен дать `egs_eos_install_db_sync_ready` →
     `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
-19. Имитировать сбой Publisher после записи ZIP, index, первого v3 bundle и удаления первого
-    v1/v2 bundle; pending/offline/disconnect запрещены, retry согласует весь набор. На клиенте
-    имитировать сбои после directory swap, замены `LauncherInstalled.dat` и managed-state:
-    journal v3 обязан точно восстановить старые bytes, а неполный rollback — сохранить journal.
-20. Проверить recovery оставшихся journals v1/v2, постоянный SHA-addressed backup старого Data и
-    launcher-файла и no-op повторного запуска при точном tree hash. Старое локальное дерево не
-    должно удаляться из backup автоматически.
+19. Имитировать сбой Publisher после записи ZIP, index, первого v4 bundle и удаления первого
+    v1–v3 helper-файла; pending/offline/disconnect запрещены, retry согласует весь набор. На
+    клиенте имитировать сбои после swap shared-базы, directory swap, замены
+    `LauncherInstalled.dat` и managed-state: journal v4 обязан точно восстановить старые bytes,
+    а неполный rollback — сохранить journal.
+20. Проверить recovery оставшихся journals v1–v3, постоянный SHA-addressed backup старых shared
+    Install DB, Data и launcher-файла и no-op повторного запуска при точном tree hash. Старое
+    локальное состояние не должно удаляться из backup автоматически. Отдельная non-shared база
+    `C:\ProgramData\Epic\EpicOnlineServices\InstallHelper\InstalledItems` и старые игровые
+    файлы на `C:` должны остаться без изменений.
 21. На чистом выделенном клиенте с полным набором томов выполнить физический цикл Publisher →
     stage → activate → reset в `Aggressive`. До запуска EGS проверить три игры и последовательность
     событий; GTA V, Fortnite и GTA V Enhanced должны показать `Launch`.
-22. Если две игры по-прежнему показывают `Продолжить`, сохранить launcher debug logs для
-    отдельного анализа. LocalAppData, `webcache*`, account/session, authorization и EOS state в
-    этот тест не копировать.
+22. До запуска EGS проверить InstallHelper logs: все три игры должны читаться как `Installed`
+    на `E:`, без старых `Incomplete` Fortnite/GTA V на `C:`. Если две игры по-прежнему
+    показывают `Продолжить`, сохранить launcher debug logs для отдельного анализа. LocalAppData,
+    `webcache*`, account/session, authorization и non-shared EOS state в этот тест не копировать.
 
 ## 8. Один dual-role Publisher/client ПК
 

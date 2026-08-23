@@ -1092,7 +1092,7 @@ Describe "Startup flow failure handling" {
             Should -Not -Match "BaseURLs|publisher.invalid|client.invalid"
     }
 
-    It "logs aggressive ProgramData readiness before manifest readiness" {
+    It "logs EOS shared database readiness before ProgramData and manifest readiness" {
         $state = Read-SimulationState
         ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
             "0x6589cfc000000001"
@@ -1123,6 +1123,8 @@ Describe "Startup flow failure handling" {
                 ManifestCount = 3
                 FileCount = 42
                 TotalBytes = 123456
+                SharedInstallDbFileCount = 3
+                SharedInstallDbTotalBytes = 789
                 Changed = $true
                 IncompleteWarningCount = 0
             }
@@ -1135,6 +1137,8 @@ Describe "Startup flow failure handling" {
         $records = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
             ForEach-Object { $_ | ConvertFrom-Json })
         $events = @($records.event)
+        [Array]::IndexOf($events, "egs_eos_install_db_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "egs_programdata_sync_ready"))
         [Array]::IndexOf($events, "egs_programdata_sync_ready") |
             Should -BeLessThan ([Array]::IndexOf($events, "egs_manifest_sync_ready"))
         [Array]::IndexOf($events, "egs_manifest_sync_ready") |
@@ -1143,6 +1147,9 @@ Describe "Startup flow failure handling" {
         $programData.file_count | Should -Be 42
         $programData.game_count | Should -Be 3
         $programData.total_bytes | Should -Be 123456
+        $sharedDb = $records | Where-Object event -eq "egs_eos_install_db_sync_ready"
+        $sharedDb.file_count | Should -Be 3
+        $sharedDb.total_bytes | Should -Be 789
         Should -Invoke Invoke-ClientEgsAggressiveSync -Times 1 -Exactly
         Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
     }
@@ -1990,7 +1997,7 @@ Describe "Epic Games aggressive ProgramData payload" {
 
     BeforeAll {
         function New-AggressiveTestPayload {
-            param([switch]$Collision, [switch]$Traversal)
+            param([switch]$Collision, [switch]$Traversal, [switch]$EmptyShared)
             Initialize-EgsZipSupport
             $path1 = if ($Traversal) { "EpicGamesLauncher/Data/../escape.bin" } else {
                 "EpicGamesLauncher/Data/Manifests/one.item"
@@ -1999,6 +2006,14 @@ Describe "Epic Games aggressive ProgramData payload" {
                 [pscustomobject]@{ Path = $path1; Bytes = [Text.Encoding]::UTF8.GetBytes("one") },
                 [pscustomobject]@{ Path = "UnrealEngineLauncher/LauncherInstalled.dat"; Bytes = [Text.Encoding]::UTF8.GetBytes('{"InstallationList":[]}') }
             )
+            if (-not $EmptyShared) {
+                $fileDefinitions += [pscustomobject]@{
+                    Path = "EpicOnlineServicesShared/InstallHelper/InstalledItems/Fortnite.json"
+                    Bytes = [Text.Encoding]::UTF8.GetBytes(
+                        '{"AppName":"Fortnite","InstallLocation":"E:\\EpicGames\\Fortnite","State":"Installed"}'
+                    )
+                }
+            }
             if ($Collision) {
                 $fileDefinitions += [pscustomobject]@{
                     Path = "EpicGamesLauncher/Data/Manifests/ONE.item"
@@ -2020,14 +2035,17 @@ Describe "Epic Games aggressive ProgramData payload" {
                 $totalBytes += [Int64]$definition.Bytes.Length
             }
             $index = [ordered]@{
-                schema_version = 1
+                schema_version = 2
                 file_count = $files.Count
                 total_bytes = $totalBytes
                 directories = @(
                     [ordered]@{ relative_path = "EpicGamesLauncher"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
                     [ordered]@{ relative_path = "EpicGamesLauncher/Data"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
                     [ordered]@{ relative_path = "EpicGamesLauncher/Data/Manifests"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
-                    [ordered]@{ relative_path = "UnrealEngineLauncher"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp }
+                    [ordered]@{ relative_path = "UnrealEngineLauncher"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "EpicOnlineServicesShared"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "EpicOnlineServicesShared/InstallHelper"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp },
+                    [ordered]@{ relative_path = "EpicOnlineServicesShared/InstallHelper/InstalledItems"; attributes = 16; creation_time_utc = $script:AggressiveTimestamp; last_write_time_utc = $script:AggressiveTimestamp }
                 )
                 files = $files
             }
@@ -2074,6 +2092,9 @@ Describe "Epic Games aggressive ProgramData payload" {
         Get-Content -LiteralPath (Join-Path $stage `
             "UnrealEngineLauncher/LauncherInstalled.dat") -Raw |
             Should -Be '{"InstallationList":[]}'
+        Get-Content -LiteralPath (Join-Path $stage `
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/Fortnite.json") `
+            -Raw | Should -Match '"State":"Installed"'
     }
 
     It "accepts exact target bytes when local NTFS metadata differs from Publisher" {
@@ -2092,10 +2113,13 @@ Describe "Epic Games aggressive ProgramData payload" {
         }
         $programData = Join-Path $stage "EpicGamesLauncher/Data"
         $launcher = Join-Path $stage "UnrealEngineLauncher/LauncherInstalled.dat"
+        $shared = Join-Path $stage `
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems"
 
         {
             Assert-ClientEgsAggressiveTree -IndexData $index `
-                -ProgramDataPath $programData -LauncherInstalledPath $launcher
+                -ProgramDataPath $programData -LauncherInstalledPath $launcher `
+                -SharedInstallDbPath $shared
         } | Should -Not -Throw
         Get-EgsFileSha256Hex (Join-Path $programData "Manifests/one.item") |
             Should -Be $index.Files[0].Sha256
@@ -2110,6 +2134,8 @@ Describe "Epic Games aggressive ProgramData payload" {
             -ArchiveMetadata $metadata -IndexData $index -StagePath $stage
         $programData = Join-Path $stage "EpicGamesLauncher/Data"
         $launcher = Join-Path $stage "UnrealEngineLauncher/LauncherInstalled.dat"
+        $shared = Join-Path $stage `
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems"
         [IO.File]::AppendAllText(
             (Join-Path $programData "Manifests/one.item"),
             "changed"
@@ -2117,8 +2143,18 @@ Describe "Epic Games aggressive ProgramData payload" {
 
         {
             Assert-ClientEgsAggressiveTree -IndexData $index `
-                -ProgramDataPath $programData -LauncherInstalledPath $launcher
+                -ProgramDataPath $programData -LauncherInstalledPath $launcher `
+                -SharedInstallDbPath $shared
         } | Should -Throw "*target file verification failed*"
+    }
+
+    It "rejects a v4 index with an empty shared installation database" {
+        $metadata = New-AggressiveTestPayload -EmptyShared
+
+        {
+            Read-ClientEgsAggressiveIndex -Path $script:AggressiveIndexPath `
+                -ArchiveMetadata $metadata
+        } | Should -Throw "*shared installation database is empty*"
     }
 
     It "does not apply Publisher timestamps or attributes during aggressive sync" {
@@ -2142,12 +2178,30 @@ Describe "Epic Games aggressive ProgramData payload" {
         } | Should -Throw "*duplicate relative path*"
     }
 
+    It "requires v4 bundles and explicitly rejects v3 aggressive releases" {
+        $definition = (Get-Command Read-ClientEgsAggressiveBundles).Definition
+        $definition | Should -Match "egs-manifests\.v4\.json"
+        $definition | Should -Match "bundle v3 is unsupported"
+    }
+
+    It "blocks while InstallHelper uses the exact shared installation database" {
+        Mock Get-EgsSharedInstallHelperProcesses { return @([pscustomobject]@{ Id = 42 }) }
+        Mock Start-Sleep { }
+
+        {
+            Wait-EgsSharedInstallDbIdle -InstallDbPath `
+                "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems" `
+                -TimeoutSeconds 0
+        } | Should -Throw "*shared installation database is still in use*"
+    }
+
     It "restores a version 3 directory-swap journal exactly" {
         $programData = Join-Path $script:AggressiveRoot "Data"
         $launcher = Join-Path $script:AggressiveRoot "LauncherInstalled.dat"
         $state = Join-Path $script:AggressiveRoot "managed.json"
         $aggressiveState = Join-Path $script:AggressiveRoot "aggressive.json"
         $stage = Join-Path $script:AggressiveRoot "stage"
+        $compatShared = Join-Path $script:AggressiveRoot "compat-shared"
         $transaction = Join-Path $script:AggressiveRoot "transaction"
         New-Item -ItemType Directory -Path $programData -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $programData "old.bin") -Value "old"
@@ -2156,9 +2210,16 @@ Describe "Epic Games aggressive ProgramData payload" {
         Set-Content -LiteralPath $aggressiveState -Value "old-aggressive"
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
         Mock Assert-EgsLauncherStopped { }
-        $journal = Start-ClientEgsAggressiveTransaction -TransactionPath $transaction `
+        Start-ClientEgsAggressiveTransaction -TransactionPath $transaction `
             -ProgramDataPath $programData -LauncherInstalledPath $launcher `
-            -StatePath $state -AggressiveStatePath $aggressiveState -StagePath $stage
+            -SharedInstallDbPath $compatShared -StatePath $state `
+            -AggressiveStatePath $aggressiveState -StagePath $stage | Out-Null
+        $journalPath = Join-Path $transaction "journal.json"
+        $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+        $journal.schema_version = 3
+        $journal.PSObject.Properties.Remove("shared_install_db_path")
+        $journal.PSObject.Properties.Remove("shared_install_db_existed")
+        $journal | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $journalPath
         Move-Item -LiteralPath $programData -Destination (Join-Path $transaction "backup/Data")
         New-Item -ItemType Directory -Path $programData -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $programData "new.bin") -Value "new"
@@ -2170,6 +2231,57 @@ Describe "Epic Games aggressive ProgramData payload" {
 
         Get-Content -LiteralPath (Join-Path $programData "old.bin") -Raw |
             Should -Match "old"
+        Test-Path -LiteralPath (Join-Path $programData "new.bin") | Should -BeFalse
+        Get-Content -LiteralPath $launcher -Raw | Should -Match "old-launcher"
+        Get-Content -LiteralPath $state -Raw | Should -Match "old-state"
+        Get-Content -LiteralPath $aggressiveState -Raw | Should -Match "old-aggressive"
+        Test-Path -LiteralPath $transaction | Should -BeFalse
+    }
+
+    It "restores a version 4 shared database swap without touching non-shared EOS state" {
+        $programData = Join-Path $script:AggressiveRoot "v4/Data"
+        $launcher = Join-Path $script:AggressiveRoot "v4/LauncherInstalled.dat"
+        $shared = Join-Path $script:AggressiveRoot "v4/Shared/InstalledItems"
+        $nonShared = Join-Path $script:AggressiveRoot "v4/NonShared/InstalledItems"
+        $state = Join-Path $script:AggressiveRoot "v4/managed.json"
+        $aggressiveState = Join-Path $script:AggressiveRoot "v4/aggressive.json"
+        $stage = Join-Path $script:AggressiveRoot "v4/stage"
+        $transaction = Join-Path $script:AggressiveRoot "v4/transaction"
+        foreach ($directory in @($programData, $shared, $nonShared, $stage)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        }
+        Set-Content -LiteralPath (Join-Path $programData "old.bin") -Value "old"
+        Set-Content -LiteralPath $launcher -Value "old-launcher"
+        Set-Content -LiteralPath (Join-Path $shared "Fortnite.json") `
+            -Value '{"InstallLocation":"C:\\Fortnite","State":"Incomplete"}'
+        Set-Content -LiteralPath (Join-Path $nonShared "EOS.json") -Value "local-eos"
+        Set-Content -LiteralPath $state -Value "old-state"
+        Set-Content -LiteralPath $aggressiveState -Value "old-aggressive"
+        Mock Assert-EgsLauncherStopped { }
+        Mock Get-EgsSharedInstallHelperProcesses { return @() }
+        Start-ClientEgsAggressiveTransaction -TransactionPath $transaction `
+            -ProgramDataPath $programData -LauncherInstalledPath $launcher `
+            -SharedInstallDbPath $shared -StatePath $state `
+            -AggressiveStatePath $aggressiveState -StagePath $stage | Out-Null
+        Move-Item -LiteralPath $programData -Destination (Join-Path $transaction "backup/Data")
+        Move-Item -LiteralPath $shared -Destination (Join-Path $transaction `
+            "backup/SharedInstallDb")
+        New-Item -ItemType Directory -Path $programData -Force | Out-Null
+        New-Item -ItemType Directory -Path $shared -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $programData "new.bin") -Value "new"
+        Set-Content -LiteralPath (Join-Path $shared "Fortnite.json") `
+            -Value '{"InstallLocation":"E:\\EpicGames\\Fortnite","State":"Installed"}'
+        Set-Content -LiteralPath $launcher -Value "new-launcher"
+        Set-Content -LiteralPath $state -Value "new-state"
+        Set-Content -LiteralPath $aggressiveState -Value "new-aggressive"
+
+        Restore-ClientEgsTransaction -TransactionPath $transaction
+
+        Get-Content -LiteralPath (Join-Path $shared "Fortnite.json") -Raw |
+            Should -Match '"State":"Incomplete"'
+        Get-Content -LiteralPath (Join-Path $nonShared "EOS.json") -Raw |
+            Should -Match "local-eos"
+        Test-Path -LiteralPath (Join-Path $programData "old.bin") | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $programData "new.bin") | Should -BeFalse
         Get-Content -LiteralPath $launcher -Raw | Should -Match "old-launcher"
         Get-Content -LiteralPath $state -Raw | Should -Match "old-state"

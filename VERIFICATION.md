@@ -1,5 +1,59 @@
 # Verification record
 
+## Epic Games EOS Shared Install DB v0.4.12 — 2026-08-24
+
+### Операторские данные реального клиента и InstallHelper
+
+- Client v0.4.11 успешно выполнил exact-byte aggressive sync: после проверки двух iSCSI-томов
+  журнал записал `egs_programdata_sync_ready` для 436 файлов, трёх игр и 116251735 bytes,
+  затем `egs_manifest_sync_ready` для трёх manifests и `ready`. Несмотря на доказанное
+  совпадение ProgramData/launcher state, GTA V и Fortnite остались в состоянии «Продолжить»;
+  GTA V Enhanced показывала `Launch`.
+- Publisher InstallHelper 5.6.0 использовал
+  `C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems` и перечислил
+  Fortnite, GTA V и GTA V Enhanced как `Installed` из `E:\EpicGames\...`.
+- Client InstallHelper с тем же shared `installationdbdir` перечислил старые Fortnite
+  registrations и GTA V как `Incomplete` из `C:\Program Files\Epic Games\...`. Отдельный
+  client InstallHelper с non-shared каталогом
+  `C:\ProgramData\Epic\EpicOnlineServices\InstallHelper\InstalledItems` перечислил только
+  локальные EOS overlay/service/support artifacts. Это локализует оставшееся различие до
+  shared Install DB и одновременно исключает non-shared EOS service DB из переноса.
+
+### Реализация и быстрые локальные проверки
+
+- Aggressive Publisher создаёт bundle v4 на каждом игровом томе и один exact-byte
+  `egs-state.v4.zip`/index schema 2 на anchor. Payload включает прежние
+  `EpicGamesLauncher\Data`, полный `LauncherInstalled.dat` и opaque shared Install DB. Пустой
+  каталог, reparse points, path collisions и прежние file/count/size limits блокируют
+  pending/offline/disconnect. После полной повторной проверки удаляются только helper-generated
+  v1–v3 bundles/archive.
+- Publisher и client ждут отсутствия InstallHelper с точным аргументом
+  `--installationdbdir` для shared DB. Client aggressive принимает только v4, атомарно меняет
+  все три targets, включает shared DB в SHA-addressed backup и journal v4 и восстанавливает
+  прежние bytes при ошибке. Journals v1–v3 остаются совместимыми. Non-shared EOS DB и каталоги
+  старых игр не входят в mutations.
+- Успешная диагностика теперь упорядочена как `egs_eos_install_db_sync_ready` →
+  `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
+- PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` прошёл для всех
+  production и test `.ps1`.
+- Профильные Publisher/client Pester 5.7.1 в том же Linux PowerShell-контейнере —
+  **103 passed, 0 failed, 0 skipped** за 11.65 секунды. Новые тесты покрывают v4 ZIP/index и
+  shared bytes, пустую DB, блокировку активным InstallHelper, порядок событий, отказ от v3,
+  journal v4 rollback и сохранность non-shared EOS state; recovery journal v3 также сохранён.
+- По согласованному быстрому профилю installer Pester, Ruff, Pytest и Compose локально не
+  запускались. Windows PowerShell 5.1 остаётся проверкой GitHub CI/физического стенда; push в
+  `main` не ожидает CI, tag и GitHub Release не создаются.
+
+### Ожидает Windows/TrueNAS стенда
+
+- обновить оба helper в режиме `Aggressive`, выполнить новый Publisher `Disconnect`, stage и
+  activate: старый v3 release намеренно несовместим;
+- подтвердить новый порядок четырёх событий и до запуска EGS проверить, что shared
+  InstallHelper перечисляет все три игры как `Installed` на `E:`, без старых `Incomplete`
+  Fortnite/GTA V на `C:`;
+- проверить `Launch` для GTA V, Fortnite и GTA V Enhanced. Этот игровой результат не следует
+  из Linux Pester и остаётся физической приёмкой.
+
 ## Epic Games exact bytes без Publisher NTFS metadata v0.4.11 — 2026-08-24
 
 ### Операторские данные реального клиента v0.4.10

@@ -254,6 +254,49 @@ function Assert-EgsLauncherStopped {
     if ($running.Count -ne 0) { throw "Epic Games Launcher restarted during manifest sync" }
 }
 
+function Get-EgsSharedInstallHelperProcesses {
+    param([Parameter(Mandatory = $true)][string]$InstallDbPath)
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return @() }
+    $needle = $InstallDbPath.TrimEnd([char[]]@(92, 47)).Replace("/", "\")
+    try {
+        return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object {
+            $commandLine = ([string]$_.CommandLine).Replace("/", "\")
+            if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+            $match = [regex]::Match(
+                $commandLine,
+                '--installationdbdir(?:\s*=\s*|\s+)(?:"([^"]+)"|([^\s"]+))',
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+            if (-not $match.Success) { return $false }
+            $candidate = if ($match.Groups[1].Success) {
+                $match.Groups[1].Value
+            } else {
+                $match.Groups[2].Value
+            }
+            [string]::Equals(
+                $candidate.TrimEnd([char[]]@(92, 47)),
+                $needle,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+    } catch {
+        throw "Epic Games InstallHelper process state could not be verified"
+    }
+}
+
+function Wait-EgsSharedInstallDbIdle {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDbPath,
+        [int]$TimeoutSeconds = 15
+    )
+    for ($second = 0; $second -le $TimeoutSeconds; $second++) {
+        if (@(Get-EgsSharedInstallHelperProcesses `
+            -InstallDbPath $InstallDbPath).Count -eq 0) { return }
+        if ($second -lt $TimeoutSeconds) { Start-Sleep -Seconds 1 }
+    }
+    throw "Epic Games shared installation database is still in use"
+}
+
 function New-ApiException {
     param([int]$StatusCode, [string]$Code, [string]$Message)
     $exception = New-Object System.Exception($Message)
@@ -969,7 +1012,7 @@ function Read-ClientEgsAggressiveIndex {
     try { $index = ConvertFrom-EgsJsonBytes -Bytes $indexBytes } catch {
         throw "Epic Games aggressive index is not valid JSON"
     }
-    if ([int]$index.schema_version -ne 1 -or
+    if ([int]$index.schema_version -ne 2 -or
         [int]$index.file_count -ne @($index.files).Count -or
         [int]$index.file_count -gt $MaximumFileCount -or
         [Int64]$index.total_bytes -gt $MaximumTotalBytes -or
@@ -985,6 +1028,9 @@ function Read-ClientEgsAggressiveIndex {
         $relative = ConvertTo-ClientEgsArchiveRelativePath ([string]$entry.relative_path)
         if (-not ($relative.StartsWith(
             "EpicGamesLauncher/Data/", [StringComparison]::Ordinal
+        ) -or $relative.StartsWith(
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+            [StringComparison]::Ordinal
         ) -or $relative -ceq "UnrealEngineLauncher/LauncherInstalled.dat")) {
             throw "Epic Games aggressive index contains an unsupported file root"
         }
@@ -1029,6 +1075,14 @@ function Read-ClientEgsAggressiveIndex {
         }).Count -ne 1) {
         throw "Epic Games aggressive index total or LauncherInstalled.dat is invalid"
     }
+    if (@($files | Where-Object {
+        $_.RelativePath.StartsWith(
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+            [StringComparison]::Ordinal
+        )
+    }).Count -eq 0) {
+        throw "Epic Games aggressive shared installation database is empty"
+    }
 
     $directories = @()
     foreach ($entry in @($index.directories)) {
@@ -1036,7 +1090,14 @@ function Read-ClientEgsAggressiveIndex {
         if (-not ($relative -ceq "EpicGamesLauncher" -or
             $relative -ceq "EpicGamesLauncher/Data" -or
             $relative.StartsWith("EpicGamesLauncher/Data/", [StringComparison]::Ordinal) -or
-            $relative -ceq "UnrealEngineLauncher")) {
+            $relative -ceq "UnrealEngineLauncher" -or
+            $relative -ceq "EpicOnlineServicesShared" -or
+            $relative -ceq "EpicOnlineServicesShared/InstallHelper" -or
+            $relative -ceq "EpicOnlineServicesShared/InstallHelper/InstalledItems" -or
+            $relative.StartsWith(
+                "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+                [StringComparison]::Ordinal
+            ))) {
             throw "Epic Games aggressive index contains an unsupported directory root"
         }
         if ($seen.ContainsKey($relative)) {
@@ -1066,7 +1127,9 @@ function Read-ClientEgsAggressiveIndex {
         }
     }
     foreach ($required in @(
-        "EpicGamesLauncher", "EpicGamesLauncher/Data", "UnrealEngineLauncher"
+        "EpicGamesLauncher", "EpicGamesLauncher/Data", "UnrealEngineLauncher",
+        "EpicOnlineServicesShared", "EpicOnlineServicesShared/InstallHelper",
+        "EpicOnlineServicesShared/InstallHelper/InstalledItems"
     )) {
         if (@($directories | Where-Object { $_.RelativePath -ceq $required }).Count -ne 1) {
             throw "Epic Games aggressive index is missing a required directory"
@@ -1461,16 +1524,20 @@ function Read-ClientEgsAggressiveBundles {
         }
         $root = "$letter`:\"
         $roots += [pscustomobject]@{ Name = $volumeName; Root = $root }
-        $bundlePath = Join-Path $root ".iscsi-reset\egs-manifests.v3.json"
+        $bundlePath = Join-Path $root ".iscsi-reset\egs-manifests.v4.json"
         if (-not (Test-Path -LiteralPath $bundlePath -PathType Leaf)) {
             if (Test-Path -LiteralPath (Join-Path $root `
+                ".iscsi-reset\egs-manifests.v3.json") -PathType Leaf) {
+                throw "Epic Games bundle v3 is unsupported in aggressive mode; create a v4 release"
+            }
+            if (Test-Path -LiteralPath (Join-Path $root `
                 ".iscsi-reset\egs-manifests.v2.json") -PathType Leaf) {
-                throw "Epic Games bundle v2 is unsupported in aggressive mode; create a v3 release"
+                throw "Epic Games bundle v2 is unsupported in aggressive mode; create a v4 release"
             }
             throw "Epic Games aggressive bundle is missing for volume $volumeName"
         }
         $bundle = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json
-        if ([int]$bundle.schema_version -ne 3 -or
+        if ([int]$bundle.schema_version -ne 4 -or
             [string]$bundle.config_revision -ne $ConfigRevision -or
             [string]$bundle.volume_name -cne $volumeName -or
             $bundle.PSObject.Properties.Name -notcontains "manifests" -or
@@ -1492,8 +1559,8 @@ function Read-ClientEgsAggressiveBundles {
         }
         if (-not (Test-ClientEgsOrdinalNameMember `
             -Name ([string]$metadata.anchor_volume) -Names $expectedNames) -or
-            [string]$metadata.archive_file_name -cne "egs-programdata.v3.zip" -or
-            [string]$metadata.index_file_name -cne "egs-programdata.v3.index.json" -or
+            [string]$metadata.archive_file_name -cne "egs-state.v4.zip" -or
+            [string]$metadata.index_file_name -cne "egs-state.v4.index.json" -or
             [string]$metadata.archive_sha256 -notmatch "^[0-9A-Fa-f]{64}$" -or
             [string]$metadata.index_sha256 -notmatch "^[0-9A-Fa-f]{64}$" -or
             [string]$metadata.tree_sha256 -notmatch "^[0-9A-Fa-f]{64}$" -or
@@ -2112,7 +2179,8 @@ function Get-ClientEgsAggressiveTargetPath {
     param(
         [Parameter(Mandatory = $true)][string]$RelativePath,
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath
     )
     $safe = ConvertTo-ClientEgsArchiveRelativePath $RelativePath
     if ($safe -ceq "UnrealEngineLauncher/LauncherInstalled.dat") {
@@ -2120,6 +2188,11 @@ function Get-ClientEgsAggressiveTargetPath {
     }
     $prefix = "EpicGamesLauncher/Data/"
     if (-not $safe.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        $sharedPrefix = "EpicOnlineServicesShared/InstallHelper/InstalledItems/"
+        if ($safe.StartsWith($sharedPrefix, [StringComparison]::Ordinal)) {
+            return Join-ClientEgsRelativePath -Root $SharedInstallDbPath `
+                -RelativePath $safe.Substring($sharedPrefix.Length)
+        }
         throw "Epic Games aggressive index contains an unsupported target"
     }
     return Join-ClientEgsRelativePath -Root $ProgramDataPath `
@@ -2130,10 +2203,12 @@ function Assert-ClientEgsAggressiveTree {
     param(
         [Parameter(Mandatory = $true)]$IndexData,
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath
     )
     if (-not (Test-Path -LiteralPath $ProgramDataPath -PathType Container) -or
-        -not (Test-Path -LiteralPath $LauncherInstalledPath -PathType Leaf)) {
+        -not (Test-Path -LiteralPath $LauncherInstalledPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $SharedInstallDbPath -PathType Container)) {
         throw "Epic Games aggressive target tree is incomplete"
     }
     $expectedData = @($IndexData.Files | Where-Object {
@@ -2160,10 +2235,37 @@ function Assert-ClientEgsAggressiveTree {
         }
         $seen[$key] = $file
     }
+    $expectedShared = @($IndexData.Files | Where-Object {
+        $_.RelativePath.StartsWith(
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+            [StringComparison]::Ordinal
+        )
+    })
+    $actualShared = @(Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force -File)
+    if ($actualShared.Count -ne $expectedShared.Count) {
+        throw "Epic Games aggressive shared installation database has an unexpected file set"
+    }
+    $sharedRoot = (Get-Item -LiteralPath $SharedInstallDbPath -Force).FullName.TrimEnd(
+        [char[]]@(92, 47)
+    )
+    foreach ($file in $actualShared) {
+        if (([int]$file.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Epic Games aggressive shared installation database contains a reparse point"
+        }
+        $relative = $file.FullName.Substring($sharedRoot.Length).TrimStart(
+            [char[]]@(92, 47)
+        ).Replace("\", "/")
+        $key = "EpicOnlineServicesShared/InstallHelper/InstalledItems/$relative"
+        if ($seen.ContainsKey($key)) {
+            throw "Epic Games aggressive target contains a path collision"
+        }
+        $seen[$key] = $file
+    }
     foreach ($expected in $IndexData.Files) {
         $target = Get-ClientEgsAggressiveTargetPath `
             -RelativePath $expected.RelativePath -ProgramDataPath $ProgramDataPath `
-            -LauncherInstalledPath $LauncherInstalledPath
+            -LauncherInstalledPath $LauncherInstalledPath `
+            -SharedInstallDbPath $SharedInstallDbPath
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
             throw "Epic Games aggressive target file verification failed"
         }
@@ -2203,6 +2305,38 @@ function Assert-ClientEgsAggressiveTree {
             throw "Epic Games aggressive target contains a reparse directory"
         }
     }
+    $expectedSharedDirectories = @($IndexData.Directories | Where-Object {
+        $_.RelativePath -ceq "EpicOnlineServicesShared/InstallHelper/InstalledItems" -or
+        $_.RelativePath.StartsWith(
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+            [StringComparison]::Ordinal
+        )
+    })
+    $actualSharedDirectoryCount = 1 + @(
+        Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force -Directory
+    ).Count
+    if ($actualSharedDirectoryCount -ne $expectedSharedDirectories.Count) {
+        throw "Epic Games aggressive shared installation database has an unexpected directory set"
+    }
+    foreach ($expected in $expectedSharedDirectories) {
+        if ($expected.RelativePath -ceq
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems") {
+            $target = $SharedInstallDbPath
+        } else {
+            $target = Join-ClientEgsRelativePath -Root $SharedInstallDbPath `
+                -RelativePath $expected.RelativePath.Substring(
+                    "EpicOnlineServicesShared/InstallHelper/InstalledItems/".Length
+                )
+        }
+        if (-not (Test-Path -LiteralPath $target -PathType Container)) {
+            throw "Epic Games aggressive shared installation database directory verification failed"
+        }
+        $targetItem = Get-Item -LiteralPath $target -Force
+        if (([int]$targetItem.Attributes -band
+            [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Epic Games aggressive shared installation database contains a reparse directory"
+        }
+    }
 }
 
 function Assert-ClientEgsAggressiveInventory {
@@ -2227,7 +2361,8 @@ function Assert-ClientEgsAggressiveInventory {
 function Assert-ClientEgsAggressiveLocalTargetsSafe {
     param(
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath
     )
     if (Test-Path -LiteralPath $ProgramDataPath) {
         $root = Get-Item -LiteralPath $ProgramDataPath -Force
@@ -2248,12 +2383,25 @@ function Assert-ClientEgsAggressiveLocalTargetsSafe {
             throw "Existing LauncherInstalled.dat target is unsafe"
         }
     }
+    if (Test-Path -LiteralPath $SharedInstallDbPath) {
+        $root = Get-Item -LiteralPath $SharedInstallDbPath -Force
+        if (-not $root.PSIsContainer -or
+            (([int]$root.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Existing Epic Games shared installation database target is unsafe"
+        }
+        foreach ($item in @(Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force)) {
+            if (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Existing Epic Games shared installation database contains a reparse point"
+            }
+        }
+    }
 }
 
 function Get-ClientEgsAggressiveStateSha256 {
     param(
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [string]$SharedInstallDbPath = ""
     )
     $records = @()
     if (Test-Path -LiteralPath $ProgramDataPath -PathType Container) {
@@ -2290,6 +2438,36 @@ function Get-ClientEgsAggressiveStateSha256 {
         }
         $records += "L/LauncherInstalled.dat`n$([Int64]$file.Length)`n$(Get-EgsFileSha256Hex $file.FullName)"
     }
+    if (-not [string]::IsNullOrWhiteSpace($SharedInstallDbPath) -and
+        (Test-Path -LiteralPath $SharedInstallDbPath -PathType Container)) {
+        $root = (Get-Item -LiteralPath $SharedInstallDbPath -Force).FullName.TrimEnd(
+            [char[]]@(92, 47)
+        )
+        $records += "R/SharedInstallDb"
+        foreach ($directory in @(
+            Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force -Directory
+        )) {
+            if (([int]$directory.Attributes -band
+                [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Epic Games displaced shared installation database contains a reparse point"
+            }
+            $relative = $directory.FullName.Substring($root.Length).TrimStart(
+                [char[]]@(92, 47)
+            ).Replace("\", "/")
+            $records += "R/SharedInstallDb/$relative"
+        }
+        foreach ($file in @(
+            Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force -File
+        )) {
+            if (([int]$file.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Epic Games displaced shared installation database contains a reparse point"
+            }
+            $relative = $file.FullName.Substring($root.Length).TrimStart(
+                [char[]]@(92, 47)
+            ).Replace("\", "/")
+            $records += "S/$relative`n$([Int64]$file.Length)`n$(Get-EgsFileSha256Hex $file.FullName)"
+        }
+    }
     $text = (@($records | Sort-Object) -join "`n")
     return Get-EgsSha256Hex ([Text.Encoding]::UTF8.GetBytes($text))
 }
@@ -2300,7 +2478,7 @@ function Reset-ClientEgsInheritedAcl {
     $icacls = Join-Path $env:SystemRoot "System32\icacls.exe"
     & $icacls $Path "/reset" "/T" "/C" "/Q" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "Epic Games local ProgramData ACL inheritance reset failed"
+        throw "Epic Games local state ACL inheritance reset failed"
     }
 }
 
@@ -2337,17 +2515,19 @@ function Save-ClientEgsAggressiveBackup {
     $transactionBackup = Join-Path $TransactionPath "backup"
     $oldData = Join-Path $transactionBackup "Data"
     $oldLauncher = Join-Path $transactionBackup "launcher-installed.bak"
+    $oldSharedInstallDb = Join-Path $transactionBackup "SharedInstallDb"
     $fingerprint = Get-ClientEgsAggressiveStateSha256 -ProgramDataPath $oldData `
-        -LauncherInstalledPath $oldLauncher
+        -LauncherInstalledPath $oldLauncher -SharedInstallDbPath $oldSharedInstallDb
     $destination = Join-Path $BackupRoot $fingerprint
     if (Test-Path -LiteralPath (Join-Path $destination "backup.json") -PathType Leaf) {
         $existingMetadata = Get-Content -LiteralPath (Join-Path $destination "backup.json") `
             -Raw | ConvertFrom-Json
-        if ([int]$existingMetadata.schema_version -ne 1 -or
+        if ([int]$existingMetadata.schema_version -notin @(1, 2) -or
             [string]$existingMetadata.state_sha256 -ne $fingerprint -or
             (Get-ClientEgsAggressiveStateSha256 `
                 -ProgramDataPath (Join-Path $destination "Data") `
-                -LauncherInstalledPath (Join-Path $destination "LauncherInstalled.dat")) -ne
+                -LauncherInstalledPath (Join-Path $destination "LauncherInstalled.dat") `
+                -SharedInstallDbPath (Join-Path $destination "SharedInstallDb")) -ne
                 $fingerprint) {
             throw "Existing Epic Games displaced ProgramData backup is invalid"
         }
@@ -2370,19 +2550,26 @@ function Save-ClientEgsAggressiveBackup {
             Copy-Item -LiteralPath $oldLauncher `
                 -Destination (Join-Path $temporary "LauncherInstalled.dat") -Force
         }
+        if ([bool]$Journal.shared_install_db_existed) {
+            Copy-Item -LiteralPath $oldSharedInstallDb `
+                -Destination (Join-Path $temporary "SharedInstallDb") -Recurse -Force
+        }
         $metadata = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             state_sha256 = $fingerprint
             data_existed = [bool]$Journal.data_existed
             launcher_installed_existed = [bool]$Journal.launcher_installed_existed
+            shared_install_db_existed = [bool]$Journal.shared_install_db_existed
             created_at = [DateTime]::UtcNow.ToString("o")
         } | ConvertTo-Json -Depth 3
         Write-EgsBytesAtomic -Path (Join-Path $temporary "backup.json") `
             -Bytes ([Text.Encoding]::UTF8.GetBytes($metadata))
         $copiedData = Join-Path $temporary "Data"
         $copiedLauncher = Join-Path $temporary "LauncherInstalled.dat"
+        $copiedSharedInstallDb = Join-Path $temporary "SharedInstallDb"
         if ((Get-ClientEgsAggressiveStateSha256 -ProgramDataPath $copiedData `
-            -LauncherInstalledPath $copiedLauncher) -ne $fingerprint) {
+            -LauncherInstalledPath $copiedLauncher `
+            -SharedInstallDbPath $copiedSharedInstallDb) -ne $fingerprint) {
             throw "Epic Games displaced ProgramData backup verification failed"
         }
         if (-not (Test-Path -LiteralPath $destination)) {
@@ -2399,6 +2586,7 @@ function Start-ClientEgsAggressiveTransaction {
         [Parameter(Mandatory = $true)][string]$TransactionPath,
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
         [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath,
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][string]$AggressiveStatePath,
         [Parameter(Mandatory = $true)][string]$StagePath
@@ -2409,14 +2597,16 @@ function Start-ClientEgsAggressiveTransaction {
     $backupDirectory = Join-Path $TransactionPath "backup"
     New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
     $journal = [ordered]@{
-        schema_version = 3
+        schema_version = 4
         program_data_path = $ProgramDataPath
         launcher_installed_path = $LauncherInstalledPath
+        shared_install_db_path = $SharedInstallDbPath
         state_path = $StatePath
         aggressive_state_path = $AggressiveStatePath
         stage_path = $StagePath
         data_existed = Test-Path -LiteralPath $ProgramDataPath -PathType Container
         launcher_installed_existed = Test-Path -LiteralPath $LauncherInstalledPath -PathType Leaf
+        shared_install_db_existed = Test-Path -LiteralPath $SharedInstallDbPath -PathType Container
         state_existed = Test-Path -LiteralPath $StatePath -PathType Leaf
         aggressive_state_existed = Test-Path -LiteralPath $AggressiveStatePath -PathType Leaf
         launcher_installed_sha256 = ""
@@ -2478,6 +2668,30 @@ function Restore-ClientEgsAggressiveTransaction {
         }
     } catch { $errors += "ProgramData: $($_.Exception.Message)" }
 
+    if ($Journal.PSObject.Properties.Name -contains "shared_install_db_path") {
+        $sharedInstallDbPath = [string]$Journal.shared_install_db_path
+        try {
+            $oldSharedInstallDb = Join-Path $backupDirectory "SharedInstallDb"
+            if ([bool]$Journal.shared_install_db_existed) {
+                if (Test-Path -LiteralPath $oldSharedInstallDb -PathType Container) {
+                    if (Test-Path -LiteralPath $sharedInstallDbPath) {
+                        Remove-Item -LiteralPath $sharedInstallDbPath -Recurse -Force
+                    }
+                    $parent = Split-Path $sharedInstallDbPath -Parent
+                    if (-not (Test-Path -LiteralPath $parent)) {
+                        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                    }
+                    Move-Item -LiteralPath $oldSharedInstallDb `
+                        -Destination $sharedInstallDbPath
+                } elseif (-not (Test-Path -LiteralPath $sharedInstallDbPath -PathType Container)) {
+                    throw "Original shared installation database is unavailable"
+                }
+            } elseif (Test-Path -LiteralPath $sharedInstallDbPath) {
+                Remove-Item -LiteralPath $sharedInstallDbPath -Recurse -Force
+            }
+        } catch { $errors += "SharedInstallDb: $($_.Exception.Message)" }
+    }
+
     foreach ($restore in @(
         [pscustomobject]@{ Exists = $Journal.launcher_installed_existed; Target = [string]$Journal.launcher_installed_path; Name = "launcher-installed.bak"; Sha = [string]$Journal.launcher_installed_sha256 },
         [pscustomobject]@{ Exists = $Journal.state_existed; Target = [string]$Journal.state_path; Name = "state.bak"; Sha = [string]$Journal.state_sha256 },
@@ -2520,7 +2734,10 @@ function Restore-ClientEgsTransaction {
     }
     $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
     $journalVersion = [int]$journal.schema_version
-    if ($journalVersion -eq 3) {
+    if ($journalVersion -in @(3, 4)) {
+        if ($journalVersion -eq 4) {
+            Wait-EgsSharedInstallDbIdle -InstallDbPath ([string]$journal.shared_install_db_path)
+        }
         Restore-ClientEgsAggressiveTransaction -TransactionPath $TransactionPath `
             -Journal $journal
         return
@@ -2800,9 +3017,12 @@ function Invoke-ClientEgsAggressiveSync {
         [Parameter(Mandatory = $true)][string]$SyncConfigPath,
         [string]$ProgramDataPath = "C:\ProgramData\Epic\EpicGamesLauncher\Data",
         [string]$LauncherInstalledPath =
-            "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"
+            "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat",
+        [string]$SharedInstallDbPath =
+            "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems"
     )
     Stop-EgsLauncherProcesses
+    Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
     $installRoot = Split-Path $SyncConfigPath -Parent
     $statePath = Join-Path $installRoot "egs-managed-apps.v1.json"
     $aggressiveStatePath = Join-Path $installRoot "egs-aggressive-state.v1.json"
@@ -2813,7 +3033,8 @@ function Invoke-ClientEgsAggressiveSync {
         Restore-ClientEgsTransaction -TransactionPath $transactionPath
     }
     Assert-ClientEgsAggressiveLocalTargetsSafe -ProgramDataPath $ProgramDataPath `
-        -LauncherInstalledPath $LauncherInstalledPath
+        -LauncherInstalledPath $LauncherInstalledPath `
+        -SharedInstallDbPath $SharedInstallDbPath
 
     $bundleSet = Read-ClientEgsAggressiveBundles -ExpectedVolumes $ExpectedVolumes `
         -ConfigRevision $ConfigRevision
@@ -2834,13 +3055,14 @@ function Invoke-ClientEgsAggressiveSync {
     if (Test-Path -LiteralPath $aggressiveStatePath -PathType Leaf) {
         try {
             $currentState = Get-Content -LiteralPath $aggressiveStatePath -Raw | ConvertFrom-Json
-            if ([int]$currentState.schema_version -eq 1 -and
+            if ([int]$currentState.schema_version -eq 2 -and
                 [string]$currentState.tree_sha256 -eq [string]$index.TreeSha256 -and
                 [string]$currentState.archive_sha256 -eq
                     [string]$bundleSet.ArchiveMetadata.archive_sha256) {
                 Assert-ClientEgsAggressiveTree -IndexData $index `
                     -ProgramDataPath $ProgramDataPath `
-                    -LauncherInstalledPath $LauncherInstalledPath
+                    -LauncherInstalledPath $LauncherInstalledPath `
+                    -SharedInstallDbPath $SharedInstallDbPath
                 Assert-ClientEgsAggressiveInventory -ManifestDirectory $manifestDirectory `
                     -Desired $bundleSet.Desired
                 Assert-ClientEgsAggressiveManagedState -Path $statePath `
@@ -2856,21 +3078,30 @@ function Invoke-ClientEgsAggressiveSync {
         $stageDataPath = Join-Path $stagePath "EpicGamesLauncher\Data"
         $stageLauncherPath = Join-Path $stagePath `
             "UnrealEngineLauncher\LauncherInstalled.dat"
+        $stageSharedInstallDbPath = Join-Path $stagePath `
+            "EpicOnlineServicesShared\InstallHelper\InstalledItems"
         Assert-ClientEgsAggressiveTree -IndexData $index `
-            -ProgramDataPath $stageDataPath -LauncherInstalledPath $stageLauncherPath
+            -ProgramDataPath $stageDataPath -LauncherInstalledPath $stageLauncherPath `
+            -SharedInstallDbPath $stageSharedInstallDbPath
         Assert-ClientEgsAggressiveInventory `
             -ManifestDirectory (Join-Path $stageDataPath "Manifests") `
             -Desired $bundleSet.Desired
 
         $journal = Start-ClientEgsAggressiveTransaction `
             -TransactionPath $transactionPath -ProgramDataPath $ProgramDataPath `
-            -LauncherInstalledPath $LauncherInstalledPath -StatePath $statePath `
+            -LauncherInstalledPath $LauncherInstalledPath `
+            -SharedInstallDbPath $SharedInstallDbPath -StatePath $statePath `
             -AggressiveStatePath $aggressiveStatePath -StagePath $stagePath
         try {
             Assert-EgsLauncherStopped
+            Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
             if ([bool]$journal.data_existed) {
                 Move-Item -LiteralPath $ProgramDataPath `
                     -Destination (Join-Path $transactionPath "backup\Data")
+            }
+            if ([bool]$journal.shared_install_db_existed) {
+                Move-Item -LiteralPath $SharedInstallDbPath `
+                    -Destination (Join-Path $transactionPath "backup\SharedInstallDb")
             }
             Save-ClientEgsAggressiveBackup -TransactionPath $transactionPath `
                 -BackupRoot $backupRoot -Journal $journal | Out-Null
@@ -2880,11 +3111,18 @@ function Invoke-ClientEgsAggressiveSync {
             }
             Move-Item -LiteralPath $stageDataPath -Destination $ProgramDataPath
             Reset-ClientEgsInheritedAcl -Path $ProgramDataPath
+            $sharedParent = Split-Path $SharedInstallDbPath -Parent
+            if (-not (Test-Path -LiteralPath $sharedParent)) {
+                New-Item -ItemType Directory -Path $sharedParent -Force | Out-Null
+            }
+            Move-Item -LiteralPath $stageSharedInstallDbPath `
+                -Destination $SharedInstallDbPath
+            Reset-ClientEgsInheritedAcl -Path $SharedInstallDbPath
             Write-EgsBytesAtomic -Path $LauncherInstalledPath `
                 -Bytes ([IO.File]::ReadAllBytes($stageLauncherPath))
             Write-ClientEgsManagedState -Path $statePath -Desired $bundleSet.Desired
             $aggressiveState = [ordered]@{
-                schema_version = 1
+                schema_version = 2
                 tree_sha256 = [string]$index.TreeSha256
                 archive_sha256 = [string]$bundleSet.ArchiveMetadata.archive_sha256
                 file_count = [int]$index.FileCount
@@ -2893,9 +3131,11 @@ function Invoke-ClientEgsAggressiveSync {
             Write-EgsBytesAtomic -Path $aggressiveStatePath `
                 -Bytes ([Text.Encoding]::UTF8.GetBytes($aggressiveState))
             Assert-EgsLauncherStopped
+            Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
             Assert-ClientEgsAggressiveTree -IndexData $index `
                 -ProgramDataPath $ProgramDataPath `
-                -LauncherInstalledPath $LauncherInstalledPath
+                -LauncherInstalledPath $LauncherInstalledPath `
+                -SharedInstallDbPath $SharedInstallDbPath
             Assert-ClientEgsAggressiveInventory -ManifestDirectory $manifestDirectory `
                 -Desired $bundleSet.Desired
             Assert-ClientEgsAggressiveManagedState -Path $statePath `
@@ -2906,6 +3146,7 @@ function Invoke-ClientEgsAggressiveSync {
             $failure = $_
             try { Stop-EgsLauncherProcesses } catch { }
             try {
+                Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
                 Restore-ClientEgsTransaction -TransactionPath $transactionPath
             } catch {
                 throw "Epic Games aggressive sync failed and rollback did not complete: $($_.Exception.Message)"
@@ -2917,10 +3158,20 @@ function Invoke-ClientEgsAggressiveSync {
     foreach ($entry in $bundleSet.Desired) {
         $warningCount += @($entry.StateWarnings).Count
     }
+    $sharedFiles = @($index.Files | Where-Object {
+        $_.RelativePath.StartsWith(
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/",
+            [StringComparison]::Ordinal
+        )
+    })
+    $sharedBytes = [Int64]0
+    foreach ($entry in $sharedFiles) { $sharedBytes += [Int64]$entry.Length }
     return [pscustomobject]@{
         ManifestCount = @($bundleSet.Desired).Count
         FileCount = [int]$index.FileCount
         TotalBytes = [Int64]$index.TotalBytes
+        SharedInstallDbFileCount = $sharedFiles.Count
+        SharedInstallDbTotalBytes = $sharedBytes
         Changed = -not $alreadyCurrent
         IncompleteWarningCount = $warningCount
     }
@@ -2993,6 +3244,13 @@ function Invoke-ResetMain {
                     -ExpectedVolumes @($prepared.volumes) `
                     -ConfigRevision ([string]$health.config_revision) `
                     -SyncConfigPath $SyncConfigPath
+                Write-ResetProgress -RequestId $requestId `
+                    -Event "egs_eos_install_db_sync_ready" `
+                    -Message "Epic Games EOS shared installation database matches the mounted release" `
+                    -Details @{
+                        file_count = [int]$syncResult.SharedInstallDbFileCount
+                        total_bytes = [Int64]$syncResult.SharedInstallDbTotalBytes
+                    }
                 Write-ResetProgress -RequestId $requestId `
                     -Event "egs_programdata_sync_ready" `
                     -Message "Epic Games shared ProgramData matches the mounted release" `

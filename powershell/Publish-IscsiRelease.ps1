@@ -8,6 +8,8 @@ param(
     [string]$EgsProgramDataPath = "C:\ProgramData\Epic\EpicGamesLauncher\Data",
     [string]$EgsLauncherInstalledPath =
         "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat",
+    [string]$EgsSharedInstallDbPath =
+        "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems",
     [switch]$PassThruExitCode,
     [switch]$NoMain
 )
@@ -212,6 +214,49 @@ function Assert-EgsLauncherStopped {
     $running = @(Get-Process -Name @("EpicGamesLauncher", "EpicWebHelper") `
         -ErrorAction SilentlyContinue)
     if ($running.Count -ne 0) { throw "Epic Games Launcher restarted during manifest export" }
+}
+
+function Get-EgsSharedInstallHelperProcesses {
+    param([Parameter(Mandatory = $true)][string]$InstallDbPath)
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return @() }
+    $needle = $InstallDbPath.TrimEnd([char[]]@(92, 47)).Replace("/", "\")
+    try {
+        return @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object {
+            $commandLine = ([string]$_.CommandLine).Replace("/", "\")
+            if ([string]::IsNullOrWhiteSpace($commandLine)) { return $false }
+            $match = [regex]::Match(
+                $commandLine,
+                '--installationdbdir(?:\s*=\s*|\s+)(?:"([^"]+)"|([^\s"]+))',
+                [Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+            if (-not $match.Success) { return $false }
+            $candidate = if ($match.Groups[1].Success) {
+                $match.Groups[1].Value
+            } else {
+                $match.Groups[2].Value
+            }
+            [string]::Equals(
+                $candidate.TrimEnd([char[]]@(92, 47)),
+                $needle,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        })
+    } catch {
+        throw "Epic Games InstallHelper process state could not be verified"
+    }
+}
+
+function Wait-EgsSharedInstallDbIdle {
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallDbPath,
+        [int]$TimeoutSeconds = 15
+    )
+    for ($second = 0; $second -le $TimeoutSeconds; $second++) {
+        if (@(Get-EgsSharedInstallHelperProcesses `
+            -InstallDbPath $InstallDbPath).Count -eq 0) { return }
+        if ($second -lt $TimeoutSeconds) { Start-Sleep -Seconds 1 }
+    }
+    throw "Epic Games shared installation database is still in use"
 }
 
 function Get-PublisherEgsVolumeMappings {
@@ -575,11 +620,12 @@ function Get-PublisherEgsAggressiveIndexData {
     param(
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
         [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath,
         [int]$MaximumFileCount = 100000,
         [Int64]$MaximumTotalBytes = 1GB,
         [Int64]$MaximumFileBytes = 512MB
     )
-    foreach ($root in @($ProgramDataPath, $LauncherInstalledPath)) {
+    foreach ($root in @($ProgramDataPath, $LauncherInstalledPath, $SharedInstallDbPath)) {
         if (-not (Test-Path -LiteralPath $root)) {
             throw "Epic Games aggressive state source is missing: $root"
         }
@@ -588,13 +634,19 @@ function Get-PublisherEgsAggressiveIndexData {
         }
     }
     if (-not (Test-Path -LiteralPath $ProgramDataPath -PathType Container) -or
-        -not (Test-Path -LiteralPath $LauncherInstalledPath -PathType Leaf)) {
+        -not (Test-Path -LiteralPath $LauncherInstalledPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $SharedInstallDbPath -PathType Container)) {
         throw "Epic Games aggressive state sources have invalid types"
     }
 
     $sourceRoot = (Get-Item -LiteralPath $ProgramDataPath -Force).FullName.TrimEnd(
         [char[]]@(92, 47)
     )
+    $sharedSourceRoot = (Get-Item -LiteralPath $SharedInstallDbPath -Force).FullName.TrimEnd(
+        [char[]]@(92, 47)
+    )
+    $sharedInstallHelperPath = Split-Path $SharedInstallDbPath -Parent
+    $sharedRootPath = Split-Path $sharedInstallHelperPath -Parent
     $seen = @{}
     $directories = @()
     $files = @()
@@ -612,6 +664,18 @@ function Get-PublisherEgsAggressiveIndexData {
         [pscustomobject]@{
             ArchivePath = "UnrealEngineLauncher"
             SourcePath = Split-Path $LauncherInstalledPath -Parent
+        },
+        [pscustomobject]@{
+            ArchivePath = "EpicOnlineServicesShared"
+            SourcePath = $sharedRootPath
+        },
+        [pscustomobject]@{
+            ArchivePath = "EpicOnlineServicesShared/InstallHelper"
+            SourcePath = $sharedInstallHelperPath
+        },
+        [pscustomobject]@{
+            ArchivePath = "EpicOnlineServicesShared/InstallHelper/InstalledItems"
+            SourcePath = $SharedInstallDbPath
         }
     )
     foreach ($fixedDirectory in $fixedDirectories) {
@@ -627,6 +691,55 @@ function Get-PublisherEgsAggressiveIndexData {
             CreationTimeUtc = $sourceDirectory.CreationTimeUtc.ToString("o")
             LastWriteTimeUtc = $sourceDirectory.LastWriteTimeUtc.ToString("o")
         }
+    }
+
+    $sharedFileCount = 0
+    $sharedTotalBytes = [Int64]0
+    foreach ($item in @(Get-ChildItem -LiteralPath $SharedInstallDbPath -Recurse -Force)) {
+        if (Test-EgsReparsePoint $item) {
+            throw "Epic Games aggressive state contains a reparse point"
+        }
+        $relative = $item.FullName.Substring($sharedSourceRoot.Length).TrimStart(
+            [char[]]@(92, 47)
+        )
+        $archivePath = ConvertTo-EgsArchiveRelativePath (
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/" +
+                $relative.Replace("\", "/")
+        )
+        if ($seen.ContainsKey($archivePath)) {
+            throw "Epic Games aggressive state contains a duplicate relative path"
+        }
+        $seen[$archivePath] = $true
+        if ($item.PSIsContainer) {
+            $directories += [pscustomobject]@{
+                ArchivePath = $archivePath
+                Attributes = [int]$item.Attributes
+                CreationTimeUtc = $item.CreationTimeUtc.ToString("o")
+                LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString("o")
+            }
+            continue
+        }
+        if ([Int64]$item.Length -gt $MaximumFileBytes) {
+            throw "Epic Games aggressive state contains a file larger than the safety limit"
+        }
+        $sharedFileCount++
+        $sharedTotalBytes += [Int64]$item.Length
+        $totalBytes += [Int64]$item.Length
+        if ($totalBytes -gt $MaximumTotalBytes) {
+            throw "Epic Games aggressive state exceeds the total size safety limit"
+        }
+        $files += [pscustomobject]@{
+            ArchivePath = $archivePath
+            SourcePath = $item.FullName
+            Length = [Int64]$item.Length
+            Sha256 = Get-EgsFileSha256Hex -Path $item.FullName
+            Attributes = [int]$item.Attributes
+            CreationTimeUtc = $item.CreationTimeUtc.ToString("o")
+            LastWriteTimeUtc = $item.LastWriteTimeUtc.ToString("o")
+        }
+    }
+    if ($sharedFileCount -eq 0) {
+        throw "Epic Games shared installation database is empty"
     }
 
     foreach ($item in @(Get-ChildItem -LiteralPath $ProgramDataPath -Recurse -Force)) {
@@ -714,8 +827,10 @@ function Get-PublisherEgsAggressiveIndexData {
         Directories = @($directories | Sort-Object ArchivePath)
         Files = @($files | Sort-Object ArchivePath)
         TotalBytes = $totalBytes
+        SharedInstallDbFileCount = $sharedFileCount
+        SharedInstallDbTotalBytes = $sharedTotalBytes
         PublicIndex = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             file_count = $files.Count
             total_bytes = $totalBytes
             directories = $publicDirectories
@@ -798,7 +913,7 @@ function Assert-PublisherEgsAggressivePayload {
         throw "Epic Games aggressive index bytes verification failed"
     }
     $parsed = ConvertFrom-EgsJsonBytes -Bytes $indexBytes
-    if ([int]$parsed.schema_version -ne 1 -or
+    if ([int]$parsed.schema_version -ne 2 -or
         [int]$parsed.file_count -ne @($IndexData.Files).Count -or
         [Int64]$parsed.total_bytes -ne [Int64]$IndexData.TotalBytes) {
         throw "Epic Games aggressive index verification failed"
@@ -949,7 +1064,7 @@ function Export-PublisherEgsBundles {
     Assert-EgsLauncherStopped
 }
 
-function Assert-PublisherEgsV3Bundle {
+function Assert-PublisherEgsV4Bundle {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$ConfigRevision,
@@ -958,7 +1073,7 @@ function Assert-PublisherEgsV3Bundle {
         [Parameter(Mandatory = $true)]$ArchiveMetadata
     )
     $bundle = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-    if ([int]$bundle.schema_version -ne 3 -or
+    if ([int]$bundle.schema_version -ne 4 -or
         [string]$bundle.config_revision -ne $ConfigRevision -or
         [string]$bundle.volume_name -ne $VolumeName -or
         $bundle.PSObject.Properties.Name -notcontains "manifests") {
@@ -995,22 +1110,25 @@ function Export-PublisherEgsAggressiveBundles {
         [Parameter(Mandatory = $true)]$VolumeMappings,
         [Parameter(Mandatory = $true)][string]$ManifestDirectory,
         [Parameter(Mandatory = $true)][string]$ProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$LauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$SharedInstallDbPath
     )
     if (@($VolumeMappings).Count -eq 0) {
         throw "Epic Games aggressive export requires Publisher volumes"
     }
     Assert-EgsLauncherStopped
+    Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
     Export-PublisherEgsBundles -Manifest $Manifest -VolumeMappings $VolumeMappings `
         -ManifestDirectory $ManifestDirectory -LauncherInstalledPath $LauncherInstalledPath `
         -PreserveLegacyBundles
 
     $anchor = $VolumeMappings[0]
     $metadataDirectory = Join-Path $anchor.RootPath ".iscsi-reset"
-    $archivePath = Join-Path $metadataDirectory "egs-programdata.v3.zip"
-    $indexPath = Join-Path $metadataDirectory "egs-programdata.v3.index.json"
+    $archivePath = Join-Path $metadataDirectory "egs-state.v4.zip"
+    $indexPath = Join-Path $metadataDirectory "egs-state.v4.index.json"
     $indexData = Get-PublisherEgsAggressiveIndexData -ProgramDataPath $ProgramDataPath `
-        -LauncherInstalledPath $LauncherInstalledPath
+        -LauncherInstalledPath $LauncherInstalledPath `
+        -SharedInstallDbPath $SharedInstallDbPath
     $indexBytes = ConvertTo-PublisherEgsIndexBytes -Index $indexData.PublicIndex
     Write-PublisherEgsAggressiveArchiveAtomic -Path $archivePath -IndexData $indexData
     Write-PublisherEgsBytesAtomic -Path $indexPath -Bytes $indexBytes
@@ -1019,10 +1137,10 @@ function Export-PublisherEgsAggressiveBundles {
 
     $archiveMetadata = [ordered]@{
         anchor_volume = [string]$anchor.Name
-        archive_file_name = "egs-programdata.v3.zip"
+        archive_file_name = "egs-state.v4.zip"
         archive_sha256 = Get-EgsFileSha256Hex -Path $archivePath
         archive_length = [Int64](Get-Item -LiteralPath $archivePath).Length
-        index_file_name = "egs-programdata.v3.index.json"
+        index_file_name = "egs-state.v4.index.json"
         index_sha256 = Get-EgsSha256Hex $indexBytes
         index_length = [Int64]$indexBytes.Length
         tree_sha256 = Get-EgsSha256Hex $indexBytes
@@ -1034,8 +1152,8 @@ function Export-PublisherEgsAggressiveBundles {
     foreach ($mapping in $VolumeMappings) {
         $v2Path = Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v2.json"
         $v2 = Get-Content -LiteralPath $v2Path -Raw | ConvertFrom-Json
-        $v3 = [ordered]@{
-            schema_version = 3
+        $v4 = [ordered]@{
+            schema_version = 4
             config_revision = [string]$Manifest.config_revision
             volume_name = [string]$mapping.Name
             publisher_volume_names = $publisherVolumeNames
@@ -1043,45 +1161,68 @@ function Export-PublisherEgsAggressiveBundles {
             manifests = @($v2.manifests)
         }
         Write-PublisherEgsBundleAtomic `
-            -Path (Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v3.json") `
-            -Bundle $v3
+            -Path (Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v4.json") `
+            -Bundle $v4
     }
     foreach ($mapping in $VolumeMappings) {
-        Assert-PublisherEgsV3Bundle `
-            -Path (Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v3.json") `
+        Assert-PublisherEgsV4Bundle `
+            -Path (Join-Path $mapping.RootPath ".iscsi-reset\egs-manifests.v4.json") `
             -ConfigRevision ([string]$Manifest.config_revision) `
             -VolumeName ([string]$mapping.Name) `
             -PublisherVolumeNames $publisherVolumeNames -ArchiveMetadata $archiveMetadata
     }
 
     foreach ($mapping in $VolumeMappings) {
-        foreach ($version in @(1, 2)) {
+        foreach ($version in @(1, 2, 3)) {
             Remove-PublisherEgsLegacyBundle -Path (Join-Path $mapping.RootPath `
                 ".iscsi-reset\egs-manifests.v$version.json")
         }
+        foreach ($fileName in @(
+            "egs-programdata.v3.zip", "egs-programdata.v3.index.json"
+        )) {
+            Remove-PublisherEgsLegacyBundle -Path (Join-Path $mapping.RootPath `
+                ".iscsi-reset\$fileName")
+        }
         if ([string]$mapping.Name -cne [string]$anchor.Name) {
-            foreach ($fileName in @(
-                "egs-programdata.v3.zip", "egs-programdata.v3.index.json"
-            )) {
+            foreach ($fileName in @("egs-state.v4.zip", "egs-state.v4.index.json")) {
                 Remove-PublisherEgsLegacyBundle -Path (Join-Path $mapping.RootPath `
                     ".iscsi-reset\$fileName")
             }
         }
     }
     foreach ($mapping in $VolumeMappings) {
-        foreach ($version in @(1, 2)) {
+        foreach ($version in @(1, 2, 3)) {
             if (Test-Path -LiteralPath (Join-Path $mapping.RootPath `
                 ".iscsi-reset\egs-manifests.v$version.json")) {
                 throw "Legacy Epic Games bundle removal failed for volume $($mapping.Name)"
+            }
+        }
+        foreach ($fileName in @(
+            "egs-programdata.v3.zip", "egs-programdata.v3.index.json"
+        )) {
+            if (Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset\$fileName")) {
+                throw "Legacy Epic Games state removal failed for volume $($mapping.Name)"
+            }
+        }
+        if ([string]$mapping.Name -cne [string]$anchor.Name) {
+            foreach ($fileName in @("egs-state.v4.zip", "egs-state.v4.index.json")) {
+                if (Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                    ".iscsi-reset\$fileName")) {
+                    throw "Epic Games state exists outside the anchor volume"
+                }
             }
         }
     }
     Assert-PublisherEgsAggressivePayload -ArchivePath $archivePath -IndexPath $indexPath `
         -IndexData $indexData
     Assert-EgsLauncherStopped
+    Wait-EgsSharedInstallDbIdle -InstallDbPath $SharedInstallDbPath
     return [pscustomobject]@{
         FileCount = @($indexData.Files).Count
         TotalBytes = [Int64]$indexData.TotalBytes
+        SharedInstallDbFileCount = [int]$indexData.SharedInstallDbFileCount
+        SharedInstallDbTotalBytes = [Int64]$indexData.SharedInstallDbTotalBytes
         ArchiveSha256 = [string]$archiveMetadata.archive_sha256
     }
 }
@@ -1308,7 +1449,9 @@ function Invoke-PublisherDisconnect {
         [string]$EpicManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests",
         [string]$EpicProgramDataPath = "C:\ProgramData\Epic\EpicGamesLauncher\Data",
         [string]$EpicLauncherInstalledPath =
-            "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"
+            "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat",
+        [string]$EpicSharedInstallDbPath =
+            "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems"
     )
     if (Test-Path -LiteralPath $StatePath) {
         $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
@@ -1334,7 +1477,8 @@ function Invoke-PublisherDisconnect {
                 -VolumeMappings $volumeMappings `
                 -ManifestDirectory $EpicManifestDirectory `
                 -ProgramDataPath $EpicProgramDataPath `
-                -LauncherInstalledPath $EpicLauncherInstalledPath | Out-Null
+                -LauncherInstalledPath $EpicLauncherInstalledPath `
+                -SharedInstallDbPath $EpicSharedInstallDbPath | Out-Null
         } else {
             Export-PublisherEgsBundles -Manifest $Manifest -VolumeMappings $volumeMappings `
                 -ManifestDirectory $EpicManifestDirectory `
@@ -1374,7 +1518,8 @@ function Invoke-PublisherMain {
         [Parameter(Mandatory = $true)][string]$SyncConfigPath,
         [Parameter(Mandatory = $true)][string]$EpicManifestDirectory,
         [Parameter(Mandatory = $true)][string]$EpicProgramDataPath,
-        [Parameter(Mandatory = $true)][string]$EpicLauncherInstalledPath
+        [Parameter(Mandatory = $true)][string]$EpicLauncherInstalledPath,
+        [Parameter(Mandatory = $true)][string]$EpicSharedInstallDbPath
     )
     try {
         $manifest = Read-PublisherManifest -Path $PublisherManifestPath
@@ -1383,7 +1528,8 @@ function Invoke-PublisherMain {
             Invoke-PublisherDisconnect -Manifest $manifest -StatePath $StatePath `
                 -EgsSyncMode $egsSyncMode -EpicManifestDirectory $EpicManifestDirectory `
                 -EpicProgramDataPath $EpicProgramDataPath `
-                -EpicLauncherInstalledPath $EpicLauncherInstalledPath
+                -EpicLauncherInstalledPath $EpicLauncherInstalledPath `
+                -EpicSharedInstallDbPath $EpicSharedInstallDbPath
             Write-Host "Publisher disconnected. Create and activate the release in the management UI."
         } else {
             Invoke-PublisherReconnect -Manifest $manifest -StatePath $StatePath
@@ -1404,6 +1550,7 @@ if (-not $NoMain) {
         -SyncConfigPath $EgsSyncConfigPath `
         -EpicManifestDirectory $EgsManifestDirectory `
         -EpicProgramDataPath $EgsProgramDataPath `
-        -EpicLauncherInstalledPath $EgsLauncherInstalledPath
+        -EpicLauncherInstalledPath $EgsLauncherInstalledPath `
+        -EpicSharedInstallDbPath $EgsSharedInstallDbPath
     if ($PassThruExitCode) { Write-Output $exitCode } else { exit $exitCode }
 }

@@ -364,6 +364,20 @@ Describe "Publisher Epic Games manifest bundles" {
         $script:EgsLauncherInstalledPath = Join-Path $TestDrive "LauncherInstalled.dat"
         Remove-Item -LiteralPath $script:EgsLauncherInstalledPath -Force `
             -ErrorAction SilentlyContinue
+        $script:EgsSharedInstallDbPath = Join-Path $TestDrive `
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems"
+        Remove-Item -LiteralPath $script:EgsSharedInstallDbPath -Recurse -Force `
+            -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $script:EgsSharedInstallDbPath `
+            -Force | Out-Null
+        foreach ($appName in @("GTA5", "Fortnite", "GTA5Enhanced")) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $script:EgsSharedInstallDbPath "$appName.json"),
+                [Text.Encoding]::UTF8.GetBytes(
+                    "{`"AppName`":`"$appName`",`"State`":`"Installed`"}"
+                )
+            )
+        }
         $script:EgsMappings = @(
             [pscustomobject]@{ Name = "ssd"; RootPath = (Join-Path $TestDrive "ssd"); Disk = $null },
             [pscustomobject]@{ Name = "hdd"; RootPath = (Join-Path $TestDrive "hdd"); Disk = $null },
@@ -441,7 +455,7 @@ Describe "Publisher Epic Games manifest bundles" {
         }
     }
 
-    It "writes one exact aggressive ProgramData archive for an ordered three-volume release" {
+    It "writes one exact aggressive state archive for an ordered three-volume release" {
         $programDataPath = Join-Path $TestDrive "EpicGamesLauncher/Data"
         $script:EgsManifestDirectory = Join-Path $programDataPath "Manifests"
         New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
@@ -469,42 +483,89 @@ Describe "Publisher Epic Games manifest bundles" {
             )
             UnknownTopLevel = [ordered]@{ machine = "publisher"; value = 42 }
         } | ConvertTo-Json -Depth 8 | Set-Content $script:EgsLauncherInstalledPath
+        foreach ($mapping in $script:EgsMappings) {
+            $metadata = Join-Path $mapping.RootPath ".iscsi-reset"
+            New-Item -ItemType Directory -Path $metadata -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $metadata "egs-manifests.v3.json") `
+                -Value "legacy-v3"
+            Set-Content -LiteralPath (Join-Path $metadata "egs-programdata.v3.zip") `
+                -Value "legacy-v3"
+            Set-Content -LiteralPath (Join-Path $metadata `
+                "egs-programdata.v3.index.json") -Value "legacy-v3"
+        }
 
         $result = Export-PublisherEgsAggressiveBundles -Manifest $script:EgsManifest `
             -VolumeMappings $script:EgsMappings `
             -ManifestDirectory $script:EgsManifestDirectory `
             -ProgramDataPath $programDataPath `
-            -LauncherInstalledPath $script:EgsLauncherInstalledPath
+            -LauncherInstalledPath $script:EgsLauncherInstalledPath `
+            -SharedInstallDbPath $script:EgsSharedInstallDbPath
 
-        $result.FileCount | Should -BeGreaterThan 4
+        $result.FileCount | Should -BeGreaterThan 7
+        $result.SharedInstallDbFileCount | Should -Be 3
         foreach ($mapping in $script:EgsMappings) {
             $bundlePath = Join-Path $mapping.RootPath `
-                ".iscsi-reset/egs-manifests.v3.json"
+                ".iscsi-reset/egs-manifests.v4.json"
             Test-Path -LiteralPath $bundlePath | Should -BeTrue
             $bundle = Get-Content -LiteralPath $bundlePath -Raw | ConvertFrom-Json
-            $bundle.schema_version | Should -Be 3
+            $bundle.schema_version | Should -Be 4
             @($bundle.publisher_volume_names) | Should -Be @("ssd", "hdd", "bonus")
             $bundle.archive.anchor_volume | Should -Be "ssd"
+            foreach ($version in @(1, 2, 3)) {
+                Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                    ".iscsi-reset/egs-manifests.v$version.json") | Should -BeFalse
+            }
             Test-Path -LiteralPath (Join-Path $mapping.RootPath `
-                ".iscsi-reset/egs-manifests.v2.json") | Should -BeFalse
+                ".iscsi-reset/egs-programdata.v3.zip") | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $mapping.RootPath `
+                ".iscsi-reset/egs-programdata.v3.index.json") | Should -BeFalse
         }
         $anchorMetadata = Join-Path $script:EgsMappings[0].RootPath ".iscsi-reset"
-        $archivePath = Join-Path $anchorMetadata "egs-programdata.v3.zip"
-        $indexPath = Join-Path $anchorMetadata "egs-programdata.v3.index.json"
+        $archivePath = Join-Path $anchorMetadata "egs-state.v4.zip"
+        $indexPath = Join-Path $anchorMetadata "egs-state.v4.index.json"
         Test-Path -LiteralPath $archivePath | Should -BeTrue
         Test-Path -LiteralPath $indexPath | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $script:EgsMappings[1].RootPath `
-            ".iscsi-reset/egs-programdata.v3.zip") | Should -BeFalse
+            ".iscsi-reset/egs-state.v4.zip") | Should -BeFalse
         $index = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
+        $index.schema_version | Should -Be 2
         @($index.files.relative_path) |
             Should -Contain "EpicGamesLauncher/Data/Catalog/unknown.bin"
         @($index.files.relative_path) |
             Should -Contain "UnrealEngineLauncher/LauncherInstalled.dat"
+        @($index.files.relative_path) | Should -Contain `
+            "EpicOnlineServicesShared/InstallHelper/InstalledItems/Fortnite.json"
         {
             Get-PublisherEgsAggressiveIndexData -ProgramDataPath $programDataPath `
                 -LauncherInstalledPath $script:EgsLauncherInstalledPath `
+                -SharedInstallDbPath $script:EgsSharedInstallDbPath `
                 -MaximumFileCount 1
         } | Should -Throw "*file count safety limit*"
+    }
+
+    It "rejects an empty shared installation database" {
+        $programDataPath = Join-Path $TestDrive "empty-shared/EpicGamesLauncher/Data"
+        $launcherPath = Join-Path $TestDrive "empty-shared/LauncherInstalled.dat"
+        $sharedPath = Join-Path $TestDrive "empty-shared/Shared/InstalledItems"
+        New-Item -ItemType Directory -Path $programDataPath -Force | Out-Null
+        New-Item -ItemType Directory -Path $sharedPath -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $programDataPath "data.bin") -Value "data"
+        Set-Content -LiteralPath $launcherPath -Value '{"InstallationList":[]}'
+
+        {
+            Get-PublisherEgsAggressiveIndexData -ProgramDataPath $programDataPath `
+                -LauncherInstalledPath $launcherPath -SharedInstallDbPath $sharedPath
+        } | Should -Throw "*shared installation database is empty*"
+    }
+
+    It "blocks while InstallHelper uses the exact shared installation database" {
+        Mock Get-EgsSharedInstallHelperProcesses { return @([pscustomobject]@{ Id = 42 }) }
+        Mock Start-Sleep { }
+
+        {
+            Wait-EgsSharedInstallDbIdle -InstallDbPath $script:EgsSharedInstallDbPath `
+                -TimeoutSeconds 0
+        } | Should -Throw "*shared installation database is still in use*"
     }
 
     It "uses item-only fallback for missing, duplicate, and mismatched registrations" {
