@@ -41,6 +41,15 @@ function Get-EgsSha256Hex {
     }
 }
 
+function ConvertFrom-EgsJsonBytes {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $json = [Text.Encoding]::UTF8.GetString($Bytes)
+    if ($json.Length -gt 0 -and [int]$json[0] -eq 0xFEFF) {
+        $json = $json.Substring(1)
+    }
+    return (ConvertFrom-Json -InputObject $json)
+}
+
 function ConvertTo-EgsCanonicalPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { throw "Epic Games path is empty" }
@@ -247,7 +256,7 @@ function Assert-PublisherEgsBundle {
         if ((Get-EgsSha256Hex $bytes) -ne [string]$entry.sha256) {
             throw "Epic Games bundle hash verification failed for $($entry.app_name)"
         }
-        $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        $item = ConvertFrom-EgsJsonBytes -Bytes $bytes
         if ([string]$item.AppName -ne [string]$entry.app_name -or
             [string]$item.InstallationGuid -ne [string]$entry.installation_guid) {
             throw "Epic Games bundle identity verification failed"
@@ -297,7 +306,7 @@ function Export-PublisherEgsBundles {
     foreach ($file in @(Get-ChildItem -LiteralPath $ManifestDirectory -Filter "*.item" -File | Sort-Object Name)) {
         $bytes = [IO.File]::ReadAllBytes($file.FullName)
         try {
-            $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            $item = ConvertFrom-EgsJsonBytes -Bytes $bytes
         } catch {
             throw "Epic Games manifest is not valid JSON: $($file.FullName)"
         }

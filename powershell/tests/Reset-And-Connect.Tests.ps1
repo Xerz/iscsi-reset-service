@@ -839,7 +839,8 @@ Describe "Epic Games client manifest validation and transaction" {
             [Parameter(Mandatory = $true)][string]$Guid,
             [Parameter(Mandatory = $true)][string]$InstallLocation,
             [string]$Version = "build-1",
-            [string[]]$InstallTags = @("default")
+            [string[]]$InstallTags = @("default"),
+            [switch]$Utf8Bom
         )
         $item = [ordered]@{
             AppName = $AppName
@@ -851,7 +852,10 @@ Describe "Epic Games client manifest validation and transaction" {
             InstallTags = $InstallTags
             LaunchExecutable = "$AppName.exe"
         }
-        return [Text.Encoding]::UTF8.GetBytes(($item | ConvertTo-Json -Depth 5))
+        $encoding = New-Object Text.UTF8Encoding($Utf8Bom.IsPresent)
+        return [byte[]]@($encoding.GetPreamble()) + $encoding.GetBytes(
+            ($item | ConvertTo-Json -Depth 5)
+        )
       }
 
       function New-ClientTestDesired {
@@ -882,6 +886,7 @@ Describe "Epic Games client manifest validation and transaction" {
             [Parameter(Mandatory = $true)][string]$AppName,
             [Parameter(Mandatory = $true)][string]$Guid,
             [string[]]$InstallTags = @("default"),
+            [switch]$Utf8Bom,
             [switch]$OmitComponent
         )
         $installLocation = Join-Path $VolumeRoot $AppName
@@ -894,7 +899,7 @@ Describe "Epic Games client manifest validation and transaction" {
                 -LiteralPath (Join-Path $egstore "$Guid.mancpn")
         }
         $bytes = New-ClientTestItemBytes -AppName $AppName -Guid $Guid `
-            -InstallLocation $installLocation -InstallTags $InstallTags
+            -InstallLocation $installLocation -InstallTags $InstallTags -Utf8Bom:$Utf8Bom
         $bundle = [ordered]@{
             schema_version = 1
             config_revision = $ConfigRevision
@@ -928,18 +933,19 @@ Describe "Epic Games client manifest validation and transaction" {
         New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
     }
 
-    It "validates Fortnite install tags and accepts an empty bundle" {
+    It "validates a BOM-prefixed Fortnite manifest and accepts an empty bundle" {
         $fortniteId = "6CBCB32C02D40E72A7D7C61F8AB8A4A"
         $bundlePath = New-ClientTestBundle -VolumeRoot $script:EgsClientRoot `
             -VolumeName "ssd" -ConfigRevision "rev-1" -AppName "Fortnite" `
             -Guid $fortniteId -InstallTags @("chunk0", "chunk10", "chunk10optional") `
-            -OmitComponent
+            -Utf8Bom -OmitComponent
 
         $items = @(Read-ClientEgsBundle -Path $bundlePath -ConfigRevision "rev-1" `
             -VolumeName "ssd" -VolumeRoot $script:EgsClientRoot)
         $items.Count | Should -Be 1
         $items[0].InstallationGuid | Should -Be $fortniteId
-        $payload = [Text.Encoding]::UTF8.GetString($items[0].Bytes) | ConvertFrom-Json
+        [BitConverter]::ToString($items[0].Bytes[0..2]) | Should -Be "EF-BB-BF"
+        $payload = ConvertFrom-EgsJsonBytes -Bytes $items[0].Bytes
         @($payload.InstallTags) -join "," | Should -Be "chunk0,chunk10,chunk10optional"
 
         $emptyPath = Join-Path $script:EgsClientRoot "empty.json"
@@ -1020,7 +1026,7 @@ Describe "Epic Games client manifest validation and transaction" {
         $oldGame = New-ClientTestItemBytes -AppName "OldGame" -Guid $oldGuid `
             -InstallLocation $oldLocation
         $localGame = New-ClientTestItemBytes -AppName "LocalGame" -Guid $localGuid `
-            -InstallLocation $localLocation
+            -InstallLocation $localLocation -Utf8Bom
         [IO.File]::WriteAllBytes((Join-Path $script:EgsManifestDirectory "$fortniteGuid.item"), $oldFortnite)
         [IO.File]::WriteAllBytes((Join-Path $script:EgsManifestDirectory "$oldGuid.item"), $oldGame)
         [IO.File]::WriteAllBytes((Join-Path $script:EgsManifestDirectory "$localGuid.item"), $localGame)
@@ -1049,7 +1055,8 @@ Describe "Epic Games client manifest validation and transaction" {
         Get-EgsSha256Hex ([IO.File]::ReadAllBytes(
             (Join-Path $script:EgsManifestDirectory "$localGuid.item")
         )) | Should -Be $localHash
-        @(Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests.Count | Should -Be 1
+        @((Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests).Count |
+            Should -Be 1
     }
 
     It "rolls back after the first manifest mutation and succeeds on retry" {
@@ -1116,7 +1123,8 @@ Describe "Epic Games client manifest validation and transaction" {
             Should -Be $newFortnite.Sha256
         Test-Path -LiteralPath (Join-Path $script:EgsManifestDirectory "$gtaGuid.item") |
             Should -BeTrue
-        @(Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests.Count | Should -Be 2
+        @((Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests).Count |
+            Should -Be 2
     }
 
     It "refuses to overwrite an unmanaged local AppName collision" {

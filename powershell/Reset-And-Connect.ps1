@@ -84,6 +84,15 @@ function Get-EgsSha256Hex {
     }
 }
 
+function ConvertFrom-EgsJsonBytes {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $json = [Text.Encoding]::UTF8.GetString($Bytes)
+    if ($json.Length -gt 0 -and [int]$json[0] -eq 0xFEFF) {
+        $json = $json.Substring(1)
+    }
+    return (ConvertFrom-Json -InputObject $json)
+}
+
 function ConvertTo-EgsCanonicalPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { throw "Epic Games path is empty" }
@@ -899,7 +908,7 @@ function Read-ClientEgsBundle {
             throw "Epic Games bundle hash verification failed for $($entry.app_name)"
         }
         try {
-            $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            $item = ConvertFrom-EgsJsonBytes -Bytes $bytes
         } catch {
             throw "Epic Games bundle payload is not valid JSON for $($entry.app_name)"
         }
@@ -923,7 +932,7 @@ function Read-ExistingEgsManifests {
     foreach ($file in @(Get-ChildItem -LiteralPath $ManifestDirectory -Filter "*.item" -File)) {
         $bytes = [IO.File]::ReadAllBytes($file.FullName)
         try {
-            $item = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            $item = ConvertFrom-EgsJsonBytes -Bytes $bytes
         } catch {
             throw "Existing Epic Games manifest is not valid JSON: $($file.FullName)"
         }

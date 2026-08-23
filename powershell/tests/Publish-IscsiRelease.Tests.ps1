@@ -278,6 +278,7 @@ Describe "Publisher Epic Games manifest bundles" {
                 [Parameter(Mandatory = $true)][string]$Guid,
                 [Parameter(Mandatory = $true)][string]$VolumeRoot,
                 [Parameter(Mandatory = $true)][string[]]$InstallTags,
+                [switch]$Utf8Bom,
                 [switch]$OmitComponent
             )
             $installLocation = Join-Path $VolumeRoot $AppName
@@ -304,7 +305,10 @@ Describe "Publisher Epic Games manifest bundles" {
                 LaunchExecutable = "$AppName.exe"
             }
             $path = Join-Path $script:EgsManifestDirectory "$Guid.item"
-            $item | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $path -Encoding UTF8
+            $json = $item | ConvertTo-Json -Depth 5
+            $encoding = New-Object Text.UTF8Encoding($Utf8Bom.IsPresent)
+            $bytes = [byte[]]@($encoding.GetPreamble()) + $encoding.GetBytes($json)
+            [IO.File]::WriteAllBytes($path, $bytes)
             return $path
         }
     }
@@ -338,7 +342,7 @@ Describe "Publisher Epic Games manifest bundles" {
             -Guid $fortniteId `
             -VolumeRoot $script:EgsMappings[1].RootPath `
             -InstallTags @("chunk0", "chunk10", "chunk10optional") `
-            -OmitComponent | Out-Null
+            -Utf8Bom -OmitComponent | Out-Null
 
         Export-PublisherEgsBundles -Manifest $script:EgsManifest `
             -VolumeMappings $script:EgsMappings -ManifestDirectory $script:EgsManifestDirectory
@@ -354,7 +358,8 @@ Describe "Publisher Epic Games manifest bundles" {
         @($hdd.manifests).Count | Should -Be 1
         @($bonus.manifests).Count | Should -Be 0
         $fortniteBytes = [Convert]::FromBase64String($hdd.manifests[0].payload_base64)
-        $fortnite = [Text.Encoding]::UTF8.GetString($fortniteBytes) | ConvertFrom-Json
+        [BitConverter]::ToString($fortniteBytes[0..2]) | Should -Be "EF-BB-BF"
+        $fortnite = ConvertFrom-EgsJsonBytes -Bytes $fortniteBytes
         $fortnite.InstallationGuid | Should -Be $fortniteId
         @($fortnite.InstallTags) | Should -Be @("chunk0", "chunk10", "chunk10optional")
     }

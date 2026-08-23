@@ -17,16 +17,30 @@ Publisher и клиентом. Schema v3, Reset/Management API, SQLite и TrueNA
   обязательность `.mancpn` для каждой игры. Hotfix принимает безопасный hex ID длиной 16–64,
   сохраняет точное совпадение `.item`/`.manifest` и строго проверяет `.mancpn`, когда он есть.
 
+### GitHub Actions regression после EGS hotfix
+
+- В [CI run `32639018247`](https://github.com/Xerz/iscsi-reset-service/actions/runs/32639018247)
+  для commit `dbb62a3` Python и interaction jobs прошли, а Windows PowerShell 5.1/Pester
+  завершился с **74 passed, 3 failed** из 77. Два Publisher-теста обнаружили, что Windows
+  PowerShell 5.1 пишет UTF-8 BOM через `Set-Content -Encoding UTF8`, который прежний разбор
+  exact-byte `.item` не принимал. Client-тест обнаружил отличие PS 5.1 при чтении `.Count`
+  у scalar manifest entry.
+- Текущий hotfix удаляет только начальный `U+FEFF` из строки перед `ConvertFrom-Json`; исходные
+  байты не меняются и по-прежнему используются для SHA-256 и Base64 bundle. Publisher/client
+  regression fixtures теперь детерминированно включают BOM, а managed-state assertions явно
+  оборачивают `manifests` в массив. Повторная проверка настоящим Windows PowerShell 5.1 ожидает
+  GitHub Actions после push.
+
 ### Локальные автоматические проверки
 
 - PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — syntax passed для всех
   production и test `.ps1`.
 - Pester 5.7.1 в том же Linux PowerShell-контейнере — **76 passed, 0 failed, 1 skipped** из 77.
   Покрыты Enabled/Disabled, graceful/forced EGS close, GTA/Fortnite с разными `InstallTags`,
-  наблюдавшийся 31-символьный Fortnite ID без `.mancpn`, 32-символьный ID с `.mancpn`, три
+  BOM-prefixed 31-символьный Fortnite ID без `.mancpn`, 32-символьный ID с `.mancpn`, три
   произвольных тома и пустой bundle, неверные ID/path/hash/config revision, unmanaged
-  `AppName`, сохранение посторонней игры, частичная запись, rollback и успешный retry. Пропущен
-  существующий Windows-only ACL object test.
+  `AppName`, сохранение BOM-prefixed посторонней игры, частичная запись, rollback и успешный
+  retry. Пропущен существующий Windows-only ACL object test.
 - `ruff check src tests` — passed.
 - `pytest -q` — **133 passed** за 1.91 секунды.
 - `docker compose config --quiet` — passed.
