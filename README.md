@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.6
+# iSCSI Reset Service v0.4.7
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -799,15 +799,31 @@ master-дисков по NAA helper проверяет `AppName`, непрозр
 тома и сверяет его с редакцией Reset API, именем тома, фактическими путями и `.egstore`
 metadata. Затем он транзакционно меняет `.item` в
 `C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests` и ведёт защищённый
-`C:\ProgramData\IscsiReset\egs-managed-apps.v1.json`. Удаляются только точные stale-записи из
-этого managed-state; посторонние локальные игры сохраняются. Любой unmanaged конфликт
-`AppName`, ошибка проверки или неполный rollback завершается кодом `40`, оставляет журнал для
-восстановления при необходимости и отключает только iSCSI-session текущего запуска.
+`C:\ProgramData\IscsiReset\egs-managed-apps.v1.json`. При включённом режиме AppName из
+проверенных bundle авторитетны: на первом запуске helper принимает существующую регистрацию
+той же игры, в том числе с другим
+локальным GUID или путём, и переключает её на точный сетевой `.item`. Вытесненные байты
+сохраняются по SHA-256 в защищённом каталоге `egs-displaced-registrations` рядом с
+managed-state; игровые каталоги и их содержимое никогда не удаляются. Посторонние AppName
+сохраняются.
+
+Локальный `LauncherInstalled.dat` не копируется с Publisher и новые недокументированные записи
+в нём не синтезируются. Если он существует, helper сохраняет точную резервную копию, оставляет
+неизвестные поля и посторонние игры, сохраняет не более одной записи управляемого AppName с
+совпадающими сетевым путём и версией и удаляет только несовпадающие/дублирующиеся регистрации.
+EGS может восстановить запись из установленного `.item` при следующем запуске. Внутренний
+transaction journal v2 восстанавливает `.item`, managed-state и `LauncherInstalled.dat`;
+оставшийся journal v1 от v0.4.6 также поддерживается.
+
+Коллизия, где целевой GUID-файл принадлежит другому AppName, повреждённый локальный JSON,
+ошибка проверки или неполный rollback завершается кодом `40`, не пишет `ready` и отключает
+только iSCSI-session текущего запуска. Успешный takeover пишет
+`egs_registration_takeover`, затем `egs_manifest_sync_ready` и только после этого `ready`.
 
 Версия v1 требует одинаковых букв и полных путей игр на Publisher и клиентах. Она не копирует
-`LauncherInstalled.dat`, LocalAppData, webcache, настройки аккаунта или авторизацию. Все ПК
-должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite build,
-ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
+Publisher `LauncherInstalled.dat`, LocalAppData, webcache, настройки аккаунта или авторизацию.
+Все ПК должны иметь нужные Epic entitlements. Если активный снимок содержит прежний Fortnite
+build, ожидаемый результат — `Update`, а не `Install`; размер зависит также от сохранённых
 `InstallTags` и [выбранных компонентов Fortnite](https://www.epicgames.com/help/c-202300000001636/c-202300000001690/a202300000015197?lang=en-US).
 Чтобы обновление не скачивалось во временный clone, [отключите Auto Update для сетевой игры
 штатным переключателем EGS](https://www.epicgames.com/help/c-202300000001639/c-202300000001731/a202300000013237?lang=en-US).
@@ -920,6 +936,16 @@ session того же ПК блокирует и создание, и актив
 `TRUENAS_DISCOVERY_API_USERNAME`, срок действия ключа, роли и URL API. Успешный вход в панель
 не доказывает доступность TrueNAS. После исправления нажмите повторное обновление; до успешного
 обнаружения проверка, сохранение и выпуск заблокированы.
+
+### `Local Epic installation is not managed by iSCSI reset`
+
+Такой `CLIENT_ERROR` создавал клиент v0.4.6, если до первой синхронизации EGS уже имел `.item`
+с тем же AppName. При этом helper отключал созданную session до `ready`, а
+`egs-managed-apps.v1.json` не появлялся. Установите client helper v0.4.7 и повторите reset:
+режим `Enabled` архивирует старую регистрацию, переключает AppName на проверенный сетевой
+bundle и оставляет игровые файлы прежней локальной установки нетронутыми. В успешном журнале
+при takeover ожидаются подряд `egs_registration_takeover`, `egs_manifest_sync_ready` и
+`ready`.
 
 ### `Live state unavailable: A management dependency is unavailable`
 

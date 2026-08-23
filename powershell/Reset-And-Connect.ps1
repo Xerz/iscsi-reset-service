@@ -828,7 +828,7 @@ function Assert-ClientEgsItem {
         $guid -ne [string]$Entry.installation_guid) {
         throw "Epic Games bundle entry identity does not match its payload"
     }
-    Get-RequiredEgsString -Item $Item -Name "AppVersionString" | Out-Null
+    $appVersion = Get-RequiredEgsString -Item $Item -Name "AppVersionString"
     if ($Item.PSObject.Properties.Name -notcontains "InstallTags") {
         throw "$appName manifest has no InstallTags"
     }
@@ -884,6 +884,7 @@ function Assert-ClientEgsItem {
     }
     return [pscustomobject]@{
         AppName = $appName
+        AppVersion = $appVersion
         InstallationGuid = $guid
         InstallLocation = $installLocation
     }
@@ -926,6 +927,7 @@ function Read-ClientEgsBundle {
         $identity = Assert-ClientEgsItem -Item $item -Entry $entry -VolumeRoot $VolumeRoot
         $result += [pscustomobject]@{
             AppName = $identity.AppName
+            AppVersion = $identity.AppVersion
             InstallationGuid = $identity.InstallationGuid
             InstallLocation = $identity.InstallLocation
             Sha256 = $sha
@@ -1010,6 +1012,8 @@ function New-ClientEgsSyncPlan {
 
     $affected = @{}
     $remove = @{}
+    $displaced = @{}
+    $adoptedApps = @{}
     foreach ($desiredEntry in $Desired) {
         $sameName = @($Existing | Where-Object { $_.AppName -eq $desiredEntry.AppName })
         $sameTarget = @($Existing | Where-Object {
@@ -1021,8 +1025,15 @@ function New-ClientEgsSyncPlan {
             }
         }
         if (-not $managedByApp.ContainsKey($desiredEntry.AppName)) {
-            if ($sameName.Count -gt 0 -or $sameTarget.Count -gt 0) {
-                throw "Local Epic installation is not managed by iSCSI reset: $($desiredEntry.AppName)"
+            if ($sameName.Count -gt 0) {
+                $adoptedApps[$desiredEntry.AppName] = $true
+                foreach ($entry in $sameName) {
+                    $affected[$entry.FileName] = $true
+                    $displaced[$entry.FileName] = $true
+                    if ($entry.FileName -ne $desiredEntry.TargetFileName) {
+                        $remove[$entry.FileName] = $true
+                    }
+                }
             }
         } else {
             $managedEntry = $managedByApp[$desiredEntry.AppName]
@@ -1051,9 +1062,12 @@ function New-ClientEgsSyncPlan {
             $unexpectedSameName = @($sameName | Where-Object {
                 $_.FileName -ne $managedFileName
             })
-            if ($unexpectedSameName.Count -gt 0 -or
-                ($sameTarget.Count -gt 0 -and $managedFileName -ne $desiredEntry.TargetFileName)) {
-                throw "Local Epic installation conflicts with managed AppName: $($desiredEntry.AppName)"
+            foreach ($entry in $unexpectedSameName) {
+                $affected[$entry.FileName] = $true
+                $displaced[$entry.FileName] = $true
+                if ($entry.FileName -ne $desiredEntry.TargetFileName) {
+                    $remove[$entry.FileName] = $true
+                }
             }
         }
         $affected[$desiredEntry.TargetFileName] = $true
@@ -1086,6 +1100,119 @@ function New-ClientEgsSyncPlan {
         PreviouslyManagedAppNames = @($managedByApp.Keys)
         AffectedFileNames = @($affected.Keys | Sort-Object)
         RemoveFileNames = @($remove.Keys | Sort-Object)
+        DisplacedFileNames = @($displaced.Keys | Sort-Object)
+        AdoptedAppNames = @($adoptedApps.Keys | Sort-Object)
+    }
+}
+
+function Test-ClientEgsLauncherEntryMatches {
+    param(
+        [Parameter(Mandatory = $true)]$Entry,
+        [Parameter(Mandatory = $true)]$Desired
+    )
+    if ($Entry.PSObject.Properties.Name -notcontains "InstallLocation" -or
+        $Entry.PSObject.Properties.Name -notcontains "AppVersion") {
+        return $false
+    }
+    try {
+        $location = ConvertTo-EgsCanonicalPath ([string]$Entry.InstallLocation)
+    } catch {
+        return $false
+    }
+    return $location.Equals(
+        [string]$Desired.InstallLocation,
+        [StringComparison]::OrdinalIgnoreCase
+    ) -and [string]::Equals(
+        [string]$Entry.AppVersion,
+        [string]$Desired.AppVersion,
+        [StringComparison]::Ordinal
+    )
+}
+
+function New-ClientEgsLauncherInstalledPlan {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$Desired
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Path = $Path
+            Desired = @($Desired)
+            RequiresWrite = $false
+            Bytes = $null
+            RemovedEntryCount = 0
+            SourceSha256 = ""
+        }
+    }
+
+    $sourceBytes = [IO.File]::ReadAllBytes($Path)
+    $sourceSha = Get-EgsSha256Hex $sourceBytes
+    try {
+        $launcher = ConvertFrom-EgsJsonBytes -Bytes $sourceBytes
+    } catch {
+        throw "Epic Games LauncherInstalled.dat is not valid JSON: $Path"
+    }
+    if ($launcher.PSObject.Properties.Name -notcontains "InstallationList") {
+        throw "Epic Games LauncherInstalled.dat has no InstallationList: $Path"
+    }
+
+    $desiredByApp = @{}
+    foreach ($entry in $Desired) {
+        $desiredByApp[[string]$entry.AppName] = $entry
+    }
+    $kept = @()
+    $matchingApps = @{}
+    $removedCount = 0
+    foreach ($entry in @($launcher.InstallationList)) {
+        if ($null -eq $entry) {
+            $kept += $null
+            continue
+        }
+        $appName = ""
+        if ($entry.PSObject.Properties.Name -contains "AppName") {
+            $appName = [string]$entry.AppName
+        }
+        if (-not $desiredByApp.ContainsKey($appName)) {
+            $kept += $entry
+            continue
+        }
+        if (-not $matchingApps.ContainsKey($appName) -and
+            (Test-ClientEgsLauncherEntryMatches -Entry $entry -Desired $desiredByApp[$appName])) {
+            $matchingApps[$appName] = $true
+            $kept += $entry
+        } else {
+            $removedCount++
+        }
+    }
+
+    if ($removedCount -eq 0) {
+        return [pscustomobject]@{
+            Path = $Path
+            Desired = @($Desired)
+            RequiresWrite = $false
+            Bytes = $sourceBytes
+            RemovedEntryCount = 0
+            SourceSha256 = $sourceSha
+        }
+    }
+    $launcher.InstallationList = @($kept)
+    $json = $launcher | ConvertTo-Json -Depth 20
+    return [pscustomobject]@{
+        Path = $Path
+        Desired = @($Desired)
+        RequiresWrite = $true
+        Bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        RemovedEntryCount = $removedCount
+        SourceSha256 = $sourceSha
+    }
+}
+
+function Assert-ClientEgsLauncherInstalledResult {
+    param([Parameter(Mandatory = $true)]$Plan)
+    $verification = New-ClientEgsLauncherInstalledPlan -Path $Plan.Path `
+        -Desired $Plan.Desired
+    if ($verification.RequiresWrite) {
+        throw "Epic Games LauncherInstalled.dat still contains conflicting registrations"
     }
 }
 
@@ -1094,7 +1221,8 @@ function Start-ClientEgsTransaction {
         [Parameter(Mandatory = $true)][string]$ManifestDirectory,
         [Parameter(Mandatory = $true)][string]$StatePath,
         [Parameter(Mandatory = $true)][string]$TransactionPath,
-        [Parameter(Mandatory = $true)]$AffectedFileNames
+        [Parameter(Mandatory = $true)]$AffectedFileNames,
+        [Parameter(Mandatory = $true)]$LauncherInstalledPlan
     )
     if (Test-Path -LiteralPath $TransactionPath) {
         throw "An unrecovered Epic Games manifest transaction already exists"
@@ -1137,13 +1265,40 @@ function Start-ClientEgsTransaction {
             $stateSha = Get-EgsSha256Hex $stateBytes
             [IO.File]::WriteAllBytes((Join-Path $backupDirectory "state.bak"), $stateBytes)
         }
+
+        $launcherMutated = [bool]$LauncherInstalledPlan.RequiresWrite
+        $launcherPath = [string]$LauncherInstalledPlan.Path
+        $launcherExists = $false
+        $launcherSha = ""
+        if ($launcherMutated) {
+            if ([string]::IsNullOrWhiteSpace($launcherPath)) {
+                throw "Epic Games LauncherInstalled.dat transaction path is empty"
+            }
+            $launcherExists = Test-Path -LiteralPath $launcherPath -PathType Leaf
+            if (-not $launcherExists) {
+                throw "Epic Games LauncherInstalled.dat changed before transaction"
+            }
+            $launcherBytes = [IO.File]::ReadAllBytes($launcherPath)
+            $launcherSha = Get-EgsSha256Hex $launcherBytes
+            if ($launcherSha -ne [string]$LauncherInstalledPlan.SourceSha256) {
+                throw "Epic Games LauncherInstalled.dat changed before transaction"
+            }
+            [IO.File]::WriteAllBytes(
+                (Join-Path $backupDirectory "launcher-installed.bak"),
+                $launcherBytes
+            )
+        }
         $journal = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             manifest_directory = $ManifestDirectory
             state_path = $StatePath
             files = $files
             state_existed = $stateExists
             state_sha256 = $stateSha
+            launcher_installed_mutated = $launcherMutated
+            launcher_installed_path = $launcherPath
+            launcher_installed_existed = $launcherExists
+            launcher_installed_sha256 = $launcherSha
         }
         $journalPath = Join-Path $TransactionPath "journal.json"
         [IO.File]::WriteAllText(
@@ -1157,6 +1312,70 @@ function Start-ClientEgsTransaction {
     }
 }
 
+function Write-ClientEgsArchiveBytes {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$Sha256
+    )
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        if ((Get-EgsSha256Hex ([IO.File]::ReadAllBytes($Path))) -ne $Sha256) {
+            throw "Epic Games displaced registration archive hash collision"
+        }
+        return
+    }
+    Write-EgsBytesAtomic -Path $Path -Bytes $Bytes
+    if ((Get-EgsSha256Hex ([IO.File]::ReadAllBytes($Path))) -ne $Sha256) {
+        throw "Epic Games displaced registration archive verification failed"
+    }
+}
+
+function Save-ClientEgsDisplacedRegistrations {
+    param(
+        [Parameter(Mandatory = $true)][string]$TransactionPath,
+        [Parameter(Mandatory = $true)][string]$ArchiveDirectory,
+        [Parameter(Mandatory = $true)]$DisplacedFileNames,
+        [Parameter(Mandatory = $true)]$LauncherInstalledPlan
+    )
+    $journalPath = Join-Path $TransactionPath "journal.json"
+    $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+    if ([int]$journal.schema_version -ne 2) {
+        throw "Epic Games archive requires a version 2 transaction journal"
+    }
+    $backupDirectory = Join-Path $TransactionPath "backup"
+    $displaced = @{}
+    foreach ($fileName in $DisplacedFileNames) { $displaced[[string]$fileName] = $true }
+
+    foreach ($entry in @($journal.files)) {
+        $fileName = [string]$entry.file_name
+        if (-not $displaced.ContainsKey($fileName) -or -not [bool]$entry.existed) { continue }
+        $bytes = [IO.File]::ReadAllBytes(
+            (Join-Path $backupDirectory ([string]$entry.backup_name))
+        )
+        $sha = [string]$entry.sha256
+        if ((Get-EgsSha256Hex $bytes) -ne $sha) {
+            throw "Epic Games displaced manifest backup hash mismatch"
+        }
+        $archivePath = Join-Path (Join-Path $ArchiveDirectory "items") "$sha.item"
+        Write-ClientEgsArchiveBytes -Path $archivePath -Bytes $bytes -Sha256 $sha
+    }
+
+    if ($LauncherInstalledPlan.RequiresWrite -and
+        [bool]$journal.launcher_installed_existed) {
+        $bytes = [IO.File]::ReadAllBytes(
+            (Join-Path $backupDirectory "launcher-installed.bak")
+        )
+        $sha = [string]$journal.launcher_installed_sha256
+        if ((Get-EgsSha256Hex $bytes) -ne $sha) {
+            throw "Epic Games LauncherInstalled.dat backup hash mismatch"
+        }
+        $archivePath = Join-Path (
+            Join-Path $ArchiveDirectory "launcher-installed"
+        ) "$sha.dat"
+        Write-ClientEgsArchiveBytes -Path $archivePath -Bytes $bytes -Sha256 $sha
+    }
+}
+
 function Restore-ClientEgsTransaction {
     param([Parameter(Mandatory = $true)][string]$TransactionPath)
     Assert-EgsLauncherStopped
@@ -1165,7 +1384,8 @@ function Restore-ClientEgsTransaction {
         throw "Epic Games manifest transaction journal is missing"
     }
     $journal = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
-    if ([int]$journal.schema_version -ne 1) {
+    $journalVersion = [int]$journal.schema_version
+    if ($journalVersion -notin @(1, 2)) {
         throw "Epic Games manifest transaction journal version is unsupported"
     }
     $manifestDirectory = [string]$journal.manifest_directory
@@ -1212,6 +1432,32 @@ function Restore-ClientEgsTransaction {
     } catch {
         $errors += "managed state: $($_.Exception.Message)"
     }
+    if ($journalVersion -eq 2 -and [bool]$journal.launcher_installed_mutated) {
+        try {
+            $launcherPath = [string]$journal.launcher_installed_path
+            if ([string]::IsNullOrWhiteSpace($launcherPath)) {
+                throw "LauncherInstalled.dat rollback path is empty"
+            }
+            if ([bool]$journal.launcher_installed_existed) {
+                $bytes = [IO.File]::ReadAllBytes(
+                    (Join-Path $backupDirectory "launcher-installed.bak")
+                )
+                if ((Get-EgsSha256Hex $bytes) -ne
+                    [string]$journal.launcher_installed_sha256) {
+                    throw "LauncherInstalled.dat backup hash mismatch"
+                }
+                Write-EgsBytesAtomic -Path $launcherPath -Bytes $bytes
+                if ((Get-EgsSha256Hex ([IO.File]::ReadAllBytes($launcherPath))) -ne
+                    [string]$journal.launcher_installed_sha256) {
+                    throw "Restored LauncherInstalled.dat hash mismatch"
+                }
+            } elseif (Test-Path -LiteralPath $launcherPath) {
+                Remove-Item -LiteralPath $launcherPath -Force
+            }
+        } catch {
+            $errors += "LauncherInstalled.dat: $($_.Exception.Message)"
+        }
+    }
     if ($errors.Count -gt 0) {
         throw ("Epic Games manifest rollback is incomplete: " + ($errors -join "; "))
     }
@@ -1243,7 +1489,8 @@ function Assert-ClientEgsSyncResult {
     param(
         [Parameter(Mandatory = $true)]$Plan,
         [Parameter(Mandatory = $true)][string]$ManifestDirectory,
-        [Parameter(Mandatory = $true)][string]$StatePath
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)]$LauncherInstalledPlan
     )
     $current = @(Read-ExistingEgsManifests -ManifestDirectory $ManifestDirectory)
     foreach ($desired in $Plan.Desired) {
@@ -1279,6 +1526,7 @@ function Assert-ClientEgsSyncResult {
             throw "Epic Games managed state verification failed for $($desired.AppName)"
         }
     }
+    Assert-ClientEgsLauncherInstalledResult -Plan $LauncherInstalledPlan
 }
 
 function Invoke-ClientEgsTransaction {
@@ -1286,12 +1534,19 @@ function Invoke-ClientEgsTransaction {
         [Parameter(Mandatory = $true)]$Plan,
         [Parameter(Mandatory = $true)][string]$ManifestDirectory,
         [Parameter(Mandatory = $true)][string]$StatePath,
-        [Parameter(Mandatory = $true)][string]$TransactionPath
+        [Parameter(Mandatory = $true)][string]$TransactionPath,
+        [Parameter(Mandatory = $true)][string]$ArchiveDirectory,
+        [Parameter(Mandatory = $true)]$LauncherInstalledPlan
     )
     Start-ClientEgsTransaction -ManifestDirectory $ManifestDirectory -StatePath $StatePath `
-        -TransactionPath $TransactionPath -AffectedFileNames $Plan.AffectedFileNames
+        -TransactionPath $TransactionPath -AffectedFileNames $Plan.AffectedFileNames `
+        -LauncherInstalledPlan $LauncherInstalledPlan
     try {
         Assert-EgsLauncherStopped
+        Save-ClientEgsDisplacedRegistrations -TransactionPath $TransactionPath `
+            -ArchiveDirectory $ArchiveDirectory `
+            -DisplacedFileNames $Plan.DisplacedFileNames `
+            -LauncherInstalledPlan $LauncherInstalledPlan
         foreach ($desired in $Plan.Desired) {
             Write-EgsBytesAtomic -Path (Join-Path $ManifestDirectory $desired.TargetFileName) `
                 -Bytes $desired.Bytes
@@ -1300,10 +1555,14 @@ function Invoke-ClientEgsTransaction {
             $path = Join-Path $ManifestDirectory $fileName
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
         }
+        if ($LauncherInstalledPlan.RequiresWrite) {
+            Write-EgsBytesAtomic -Path $LauncherInstalledPlan.Path `
+                -Bytes $LauncherInstalledPlan.Bytes
+        }
         Write-ClientEgsManagedState -Path $StatePath -Desired $Plan.Desired
         Assert-EgsLauncherStopped
         Assert-ClientEgsSyncResult -Plan $Plan -ManifestDirectory $ManifestDirectory `
-            -StatePath $StatePath
+            -StatePath $StatePath -LauncherInstalledPlan $LauncherInstalledPlan
         Assert-EgsLauncherStopped
         Remove-Item -LiteralPath $TransactionPath -Recurse -Force
     } catch {
@@ -1323,12 +1582,15 @@ function Invoke-ClientEgsManifestSync {
         [Parameter(Mandatory = $true)]$ExpectedVolumes,
         [Parameter(Mandatory = $true)][string]$ConfigRevision,
         [Parameter(Mandatory = $true)][string]$SyncConfigPath,
-        [string]$ManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests"
+        [string]$ManifestDirectory = "C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests",
+        [string]$LauncherInstalledPath =
+            "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat"
     )
     Stop-EgsLauncherProcesses
     $installRoot = Split-Path $SyncConfigPath -Parent
     $statePath = Join-Path $installRoot "egs-managed-apps.v1.json"
     $transactionPath = Join-Path $installRoot "egs-sync-transaction"
+    $archiveDirectory = Join-Path $installRoot "egs-displaced-registrations"
     if (Test-Path -LiteralPath $transactionPath) {
         Restore-ClientEgsTransaction -TransactionPath $transactionPath
     }
@@ -1347,9 +1609,17 @@ function Invoke-ClientEgsManifestSync {
     $existing = @(Read-ExistingEgsManifests -ManifestDirectory $ManifestDirectory)
     $managed = Read-ClientEgsManagedState -Path $statePath
     $plan = New-ClientEgsSyncPlan -Desired $desired -Existing $existing -ManagedState $managed
+    $launcherPlan = New-ClientEgsLauncherInstalledPlan -Path $LauncherInstalledPath `
+        -Desired $desired
     Invoke-ClientEgsTransaction -Plan $plan -ManifestDirectory $ManifestDirectory `
-        -StatePath $statePath -TransactionPath $transactionPath
-    return @($desired).Count
+        -StatePath $statePath -TransactionPath $transactionPath `
+        -ArchiveDirectory $archiveDirectory -LauncherInstalledPlan $launcherPlan
+    return [pscustomobject]@{
+        ManifestCount = @($desired).Count
+        AdoptedAppCount = @($plan.AdoptedAppNames).Count
+        DisplacedManifestCount = @($plan.DisplacedFileNames).Count
+        LauncherEntryRemovalCount = [int]$launcherPlan.RemovedEntryCount
+    }
 }
 
 function Invoke-ResetMain {
@@ -1414,13 +1684,24 @@ function Invoke-ResetMain {
             -RequestId $requestId
         if ($egsSyncEnabled) {
             $stage = "egs_manifest_sync"
-            $manifestCount = Invoke-ClientEgsManifestSync `
+            $syncResult = Invoke-ClientEgsManifestSync `
                 -ExpectedVolumes @($prepared.volumes) `
                 -ConfigRevision ([string]$health.config_revision) `
                 -SyncConfigPath $SyncConfigPath
+            if ($syncResult.AdoptedAppCount -gt 0 -or
+                $syncResult.DisplacedManifestCount -gt 0 -or
+                $syncResult.LauncherEntryRemovalCount -gt 0) {
+                Write-ResetProgress -RequestId $requestId -Event "egs_registration_takeover" `
+                    -Message "Epic Games registrations were switched to the mounted release" `
+                    -Details @{
+                        adopted_app_count = [int]$syncResult.AdoptedAppCount
+                        displaced_manifest_count = [int]$syncResult.DisplacedManifestCount
+                        launcher_entry_removal_count = [int]$syncResult.LauncherEntryRemovalCount
+                    }
+            }
             Write-ResetProgress -RequestId $requestId -Event "egs_manifest_sync_ready" `
                 -Message "Epic Games manifests match the mounted release" -Details @{
-                    manifest_count = $manifestCount
+                    manifest_count = [int]$syncResult.ManifestCount
                 }
         }
         Write-ResetLog -Level "INFO" -Event "ready" -RequestId $requestId `

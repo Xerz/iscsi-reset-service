@@ -1,5 +1,62 @@
 # Verification record
 
+## Epic Games first-run takeover v0.4.7 — 2026-08-23
+
+`EpicGamesManifestSync Enabled` теперь авторитетно переключает уже зарегистрированный AppName
+на проверенный сетевой bundle. Локальные каталоги игры не удаляются; вытесненные `.item` и
+изменяемый локальный `LauncherInstalled.dat` архивируются по SHA-256. Schema v3,
+Reset/Management API, SQLite, TrueNAS backend, bundle v1, managed-state v1 и `egs-sync.json`
+не менялись.
+
+### Операторские данные реального Fortnite client
+
+- На реальном игровом ПК `.item` и `LauncherInstalled.dat` одновременно указывали на
+  `E:\EpicGames\Fortnite` и build
+  `++Fortnite+Release-42.00-CL-56878558-Windows`; регистрации Fortnite на системном диске в
+  этих источниках не было.
+- SHA-256 локального `.item` отличался от точного payload нового bundle, но сравнение JSON
+  показало единственное отличающееся поле `BaseURLs`. GUID, сетевой путь, build и остальные
+  проверенные поля совпадали.
+- В реальном JSONL отсутствовал `egs_manifest_sync_ready`. Три запуска завершились
+  `CLIENT_ERROR` на стадии `egs_manifest_sync` с сообщением
+  `Local Epic installation is not managed by iSCSI reset`; созданные session отключались, а
+  `egs-managed-apps.v1.json` не создавался. Это подтверждает fail-closed поведение v0.4.6 и
+  локализует 10 GiB симптом до успешной синхронизации регистрации.
+
+### Реализация и локальные автоматические проверки
+
+- First-run takeover принимает unmanaged тот же AppName, включая другой GUID/локальный путь и
+  отличие только `BaseURLs`. Целевой GUID-файл другого AppName по-прежнему отклоняется.
+- Transaction journal v2 восстанавливает `.item`, managed-state и `LauncherInstalled.dat`;
+  recovery оставшегося journal v1 от v0.4.6 сохранён. Архив создаётся и проверяется до замены
+  регистрации, а unrelated AppName/поля и marker локальной игры сохраняются.
+- PowerShell parser из `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — passed для всех
+  production и test `.ps1`.
+- Pester 5.7.1 в том же Linux PowerShell-контейнере — **87 passed, 0 failed, 1 skipped** из 88.
+  Покрыты `Enabled`/`Disabled`, BaseURLs-only adoption, локальный другой GUID/путь,
+  `LauncherInstalled.dat` missing/matching/duplicate/invalid, архивы, посторонние игры,
+  target-file collision, изменение launcher-файла после planning, rollback после manifest и
+  launcher mutations, retry, journal v1 и порядок `egs_registration_takeover` →
+  `egs_manifest_sync_ready` → `ready`. Пропущен только
+  существующий Windows-only ACL object test.
+- `ruff check src tests` — passed; `pytest -q` — **133 passed** за 1.96 секунды;
+  JavaScript syntax/static presentation tests — passed.
+- `docker compose config --quiet` — passed.
+- `docker compose up --build --abort-on-container-exit --exit-code-from
+  windows-simulation` — passed на локальном arm64 Docker host. Оба сервиса сообщили version
+  `0.4.7`, итог — `Interaction suite passed`. Затем выполнен `docker compose down --volumes`;
+  контейнеры, сеть и три тестовых volume удалены.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Windows PowerShell 5.1/Pester 5.7.1 GitHub Actions после push;
+- повтор реального client reset с событиями takeover → sync ready → ready и точным
+  managed-state;
+- подтверждение, что EGS показывает сетевой путь, локальные файлы сохранены и актуальный
+  Fortnite build показывает `Launch` без загрузки 10 GiB;
+- если после доказанно успешной регистрации остаётся `Update`, отдельная проверка фактических
+  `.egstore`/компонентов snapshot без маскировки настоящего обновления.
+
 ## Epic Games manifest sync v0.4.6 — 2026-08-23
 
 В рабочем дереве добавлена локальная opt-in синхронизация точных Epic Games `.item` между

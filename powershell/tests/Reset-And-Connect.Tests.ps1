@@ -686,9 +686,13 @@ Describe "Startup flow failure handling" {
                 )
             }
         }
+        $syncConfig = Join-Path $TestDrive "egs-sync-disabled.json"
+        @{ schema_version = 1; enabled = $false } | ConvertTo-Json |
+            Set-Content -LiteralPath $syncConfig
+        Mock Invoke-ClientEgsManifestSync { throw "disabled sync must not run" }
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" `
-            -ClientTokenPath $script:tokenPath -TimeoutSeconds 2
+            -ClientTokenPath $script:tokenPath -SyncConfigPath $syncConfig -TimeoutSeconds 2
 
         $code | Should -Be 0
         $logPath = Join-Path $TestDrive "client.log.jsonl"
@@ -704,6 +708,7 @@ Describe "Startup flow failure handling" {
             $events | Should -Contain $event
         }
         Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
         $raw | Should -Not -Match "test-token|Authorization|Bearer"
     }
 
@@ -846,6 +851,59 @@ Describe "Startup flow failure handling" {
         $events | Should -Contain "CLIENT_ERROR"
         $events | Should -Not -Contain "ready"
     }
+
+    It "logs registration takeover before manifest sync readiness" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $syncConfig = Join-Path $TestDrive "egs-sync.json"
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json | Set-Content $syncConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientEgsManifestSync {
+            return [pscustomobject]@{
+                ManifestCount = 2
+                AdoptedAppCount = 1
+                DisplacedManifestCount = 1
+                LauncherEntryRemovalCount = 0
+            }
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:tokenPath `
+            -SyncConfigPath $syncConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        $logPath = Join-Path $TestDrive "client.log.jsonl"
+        $records = @(Get-Content -LiteralPath $logPath | ForEach-Object {
+            $_ | ConvertFrom-Json
+        })
+        $events = @($records.event)
+        [Array]::IndexOf($events, "egs_registration_takeover") |
+            Should -BeLessThan ([Array]::IndexOf($events, "egs_manifest_sync_ready"))
+        [Array]::IndexOf($events, "egs_manifest_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "ready"))
+        $takeover = $records | Where-Object event -eq "egs_registration_takeover"
+        $takeover.adopted_app_count | Should -Be 1
+        $takeover.displaced_manifest_count | Should -Be 1
+        (Get-Content -LiteralPath $logPath -Raw) |
+            Should -Not -Match "BaseURLs|publisher.invalid|client.invalid"
+    }
 }
 
 Describe "Epic Games client manifest validation and transaction" {
@@ -857,6 +915,7 @@ Describe "Epic Games client manifest validation and transaction" {
             [Parameter(Mandatory = $true)][string]$InstallLocation,
             [string]$Version = "build-1",
             [string[]]$InstallTags = @("default"),
+            [string[]]$BaseURLs = @("https://publisher.invalid/egs"),
             [switch]$Utf8Bom
         )
         $item = [ordered]@{
@@ -867,6 +926,7 @@ Describe "Epic Games client manifest validation and transaction" {
             ManifestLocation = (Join-Path $InstallLocation ".egstore")
             StagingLocation = (Join-Path $InstallLocation ".egstore/bps")
             InstallTags = $InstallTags
+            BaseURLs = $BaseURLs
             LaunchExecutable = "$AppName.exe"
         }
         $encoding = New-Object Text.UTF8Encoding($Utf8Bom.IsPresent)
@@ -881,12 +941,15 @@ Describe "Epic Games client manifest validation and transaction" {
             [Parameter(Mandatory = $true)][string]$Guid,
             [Parameter(Mandatory = $true)][string]$InstallLocation,
             [string]$Version = "build-1",
-            [string[]]$InstallTags = @("default")
+            [string[]]$InstallTags = @("default"),
+            [string[]]$BaseURLs = @("https://publisher.invalid/egs")
         )
         $bytes = New-ClientTestItemBytes -AppName $AppName -Guid $Guid `
-            -InstallLocation $InstallLocation -Version $Version -InstallTags $InstallTags
+            -InstallLocation $InstallLocation -Version $Version -InstallTags $InstallTags `
+            -BaseURLs $BaseURLs
         return [pscustomobject]@{
             AppName = $AppName
+            AppVersion = $Version
             InstallationGuid = $Guid
             InstallLocation = (ConvertTo-EgsCanonicalPath $InstallLocation)
             Sha256 = Get-EgsSha256Hex $bytes
@@ -932,6 +995,18 @@ Describe "Epic Games client manifest validation and transaction" {
         $bundle | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $bundlePath
         return $bundlePath
       }
+
+      function Set-ClientTestLauncherInstalled {
+        param(
+            [Parameter(Mandatory = $true)][string]$Path,
+            [Parameter(Mandatory = $true)]$InstallationList,
+            [string]$UnknownValue = "preserve-me"
+        )
+        [ordered]@{
+            InstallationList = @($InstallationList)
+            UnknownTopLevel = $UnknownValue
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path
+      }
     }
 
     BeforeEach {
@@ -939,12 +1014,18 @@ Describe "Epic Games client manifest validation and transaction" {
         $script:EgsManifestDirectory = Join-Path $TestDrive "ProgramData-Manifests"
         $script:EgsStatePath = Join-Path $TestDrive "egs-managed-apps.v1.json"
         $script:EgsTransactionPath = Join-Path $TestDrive "egs-sync-transaction"
+        $script:EgsLauncherInstalledPath = Join-Path $TestDrive "LauncherInstalled.dat"
+        $script:EgsArchiveDirectory = Join-Path $TestDrive "egs-displaced-registrations"
         Remove-Item -LiteralPath $script:EgsClientRoot -Recurse -Force `
             -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $script:EgsManifestDirectory -Recurse -Force `
             -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $script:EgsStatePath -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $script:EgsTransactionPath -Recurse -Force `
+            -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:EgsLauncherInstalledPath -Force `
+            -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:EgsArchiveDirectory -Recurse -Force `
             -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Path $script:EgsClientRoot -Force | Out-Null
         New-Item -ItemType Directory -Path $script:EgsManifestDirectory -Force | Out-Null
@@ -1061,9 +1142,13 @@ Describe "Epic Games client manifest validation and transaction" {
         $managed = Read-ClientEgsManagedState -Path $script:EgsStatePath
         $plan = New-ClientEgsSyncPlan -Desired @($newFortnite) `
             -Existing $existing -ManagedState $managed
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($newFortnite)
         Invoke-ClientEgsTransaction -Plan $plan `
             -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
-            -TransactionPath $script:EgsTransactionPath
+            -TransactionPath $script:EgsTransactionPath `
+            -ArchiveDirectory $script:EgsArchiveDirectory `
+            -LauncherInstalledPlan $launcherPlan
 
         Get-EgsSha256Hex ([IO.File]::ReadAllBytes(
             (Join-Path $script:EgsManifestDirectory "$fortniteGuid.item")
@@ -1120,10 +1205,14 @@ Describe "Epic Games client manifest validation and transaction" {
         $managed = Read-ClientEgsManagedState -Path $script:EgsStatePath
         $plan = New-ClientEgsSyncPlan -Desired @($newFortnite, $gta) `
             -Existing $existing -ManagedState $managed
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($newFortnite, $gta)
         {
             Invoke-ClientEgsTransaction -Plan $plan `
                 -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
-                -TransactionPath $script:EgsTransactionPath
+                -TransactionPath $script:EgsTransactionPath `
+                -ArchiveDirectory $script:EgsArchiveDirectory `
+                -LauncherInstalledPlan $launcherPlan
         } | Should -Throw "*injected after first mutation*"
 
         Get-EgsSha256Hex ([IO.File]::ReadAllBytes($fortnitePath)) | Should -Be $oldHash
@@ -1134,7 +1223,9 @@ Describe "Epic Games client manifest validation and transaction" {
         $script:InjectEgsWriteFailure = $false
         Invoke-ClientEgsTransaction -Plan $plan `
             -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
-            -TransactionPath $script:EgsTransactionPath
+            -TransactionPath $script:EgsTransactionPath `
+            -ArchiveDirectory $script:EgsArchiveDirectory `
+            -LauncherInstalledPlan $launcherPlan
 
         Get-EgsSha256Hex ([IO.File]::ReadAllBytes($fortnitePath)) |
             Should -Be $newFortnite.Sha256
@@ -1144,38 +1235,315 @@ Describe "Epic Games client manifest validation and transaction" {
             Should -Be 2
     }
 
-    It "refuses to overwrite an unmanaged local AppName collision" {
+    It "adopts an unmanaged Fortnite manifest that differs only in BaseURLs" {
         $guid = "cccccccccccccccccccccccccccccccc"
-        $localLocation = Join-Path $TestDrive "local-fortnite"
         $networkLocation = Join-Path $script:EgsClientRoot "Fortnite"
+        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $guid `
+            -InstallLocation $networkLocation -BaseURLs @("https://publisher.invalid/fortnite")
         $localBytes = New-ClientTestItemBytes -AppName "Fortnite" -Guid $guid `
-            -InstallLocation $localLocation
-        [IO.File]::WriteAllBytes((Join-Path $script:EgsManifestDirectory "$guid.item"), $localBytes)
-        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $guid `
-            -InstallLocation $networkLocation
-        $existing = @(Read-ExistingEgsManifests -ManifestDirectory $script:EgsManifestDirectory)
-
-        {
-            New-ClientEgsSyncPlan -Desired @($desired) -Existing $existing `
-                -ManagedState ([pscustomobject]@{ schema_version = 1; manifests = @() })
-        } | Should -Throw "*not managed*"
-    }
-
-    It "refuses to adopt an exact unmanaged Epic manifest" {
-        $guid = "dddddddddddddddddddddddddddddddd"
-        $networkLocation = Join-Path $script:EgsClientRoot "Fortnite"
-        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $guid `
-            -InstallLocation $networkLocation
+            -InstallLocation $networkLocation -BaseURLs @("https://client.invalid/fortnite")
         [IO.File]::WriteAllBytes(
             (Join-Path $script:EgsManifestDirectory "$guid.item"),
-            $desired.Bytes
+            $localBytes
         )
+        Set-ClientTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @([ordered]@{
+                AppName = "Fortnite"
+                InstallLocation = $networkLocation
+                AppVersion = "build-1"
+                ArtifactId = "Fortnite"
+            })
+        $launcherHash = Get-EgsSha256Hex (
+            [IO.File]::ReadAllBytes($script:EgsLauncherInstalledPath)
+        )
+        $existing = @(Read-ExistingEgsManifests -ManifestDirectory $script:EgsManifestDirectory)
+        $plan = New-ClientEgsSyncPlan -Desired @($desired) -Existing $existing `
+            -ManagedState ([pscustomobject]@{ schema_version = 1; manifests = @() })
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        Mock Assert-EgsLauncherStopped { }
+
+        Invoke-ClientEgsTransaction -Plan $plan `
+            -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
+            -TransactionPath $script:EgsTransactionPath `
+            -ArchiveDirectory $script:EgsArchiveDirectory `
+            -LauncherInstalledPlan $launcherPlan
+
+        @($plan.AdoptedAppNames) | Should -Be @("Fortnite")
+        @($plan.DisplacedFileNames) | Should -Be @("$guid.item")
+        $launcherPlan.RequiresWrite | Should -BeFalse
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes(
+            (Join-Path $script:EgsManifestDirectory "$guid.item")
+        )) | Should -Be $desired.Sha256
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes($script:EgsLauncherInstalledPath)) |
+            Should -Be $launcherHash
+        $localSha = Get-EgsSha256Hex $localBytes
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes(
+            (Join-Path (Join-Path $script:EgsArchiveDirectory "items") "$localSha.item")
+        )) | Should -Be $localSha
+        @((Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests).Count |
+            Should -Be 1
+    }
+
+    It "takes over a local registration without deleting local game files" {
+        $localGuid = "dddddddddddddddddddddddddddddddd"
+        $networkGuid = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        $localLocation = Join-Path $TestDrive "local-fortnite"
+        $networkLocation = Join-Path $script:EgsClientRoot "Fortnite"
+        New-Item -ItemType Directory -Path $localLocation -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $localLocation "keep.bin") -Value "keep"
+        $localBytes = New-ClientTestItemBytes -AppName "Fortnite" -Guid $localGuid `
+            -InstallLocation $localLocation -Version "local-build"
+        [IO.File]::WriteAllBytes(
+            (Join-Path $script:EgsManifestDirectory "$localGuid.item"),
+            $localBytes
+        )
+        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $networkGuid `
+            -InstallLocation $networkLocation -Version "network-build"
+        Set-ClientTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @(
+                [ordered]@{
+                    AppName = "Fortnite"
+                    InstallLocation = $localLocation
+                    AppVersion = "local-build"
+                    ArtifactId = "Fortnite"
+                },
+                [ordered]@{
+                    AppName = "Fortnite"
+                    InstallLocation = $networkLocation
+                    AppVersion = "network-build"
+                    ArtifactId = "Fortnite"
+                },
+                [ordered]@{
+                    AppName = "Fortnite"
+                    InstallLocation = $networkLocation
+                    AppVersion = "network-build"
+                    ArtifactId = "duplicate"
+                },
+                [ordered]@{
+                    AppName = "LocalGame"
+                    InstallLocation = (Join-Path $TestDrive "local-game")
+                    AppVersion = "other-build"
+                    UnknownEntryField = "preserve-entry"
+                }
+            )
+        $launcherSourceHash = Get-EgsSha256Hex (
+            [IO.File]::ReadAllBytes($script:EgsLauncherInstalledPath)
+        )
+        $existing = @(Read-ExistingEgsManifests -ManifestDirectory $script:EgsManifestDirectory)
+        $plan = New-ClientEgsSyncPlan -Desired @($desired) -Existing $existing `
+            -ManagedState ([pscustomobject]@{ schema_version = 1; manifests = @() })
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        Mock Assert-EgsLauncherStopped { }
+
+        Invoke-ClientEgsTransaction -Plan $plan `
+            -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
+            -TransactionPath $script:EgsTransactionPath `
+            -ArchiveDirectory $script:EgsArchiveDirectory `
+            -LauncherInstalledPlan $launcherPlan
+
+        $launcherPlan.RemovedEntryCount | Should -Be 2
+        Test-Path -LiteralPath (Join-Path $localLocation "keep.bin") | Should -BeTrue
+        Test-Path -LiteralPath (
+            Join-Path $script:EgsManifestDirectory "$localGuid.item"
+        ) | Should -BeFalse
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes(
+            (Join-Path $script:EgsManifestDirectory "$networkGuid.item")
+        )) | Should -Be $desired.Sha256
+        $localSha = Get-EgsSha256Hex $localBytes
+        Test-Path -LiteralPath (
+            Join-Path (Join-Path $script:EgsArchiveDirectory "items") "$localSha.item"
+        ) | Should -BeTrue
+        Test-Path -LiteralPath (
+            Join-Path (Join-Path $script:EgsArchiveDirectory "launcher-installed") `
+                "$launcherSourceHash.dat"
+        ) | Should -BeTrue
+        $launcher = Get-Content -LiteralPath $script:EgsLauncherInstalledPath -Raw |
+            ConvertFrom-Json
+        @($launcher.InstallationList | Where-Object AppName -eq "Fortnite").Count |
+            Should -Be 1
+        @($launcher.InstallationList | Where-Object AppName -eq "LocalGame").Count |
+            Should -Be 1
+        ($launcher.InstallationList | Where-Object AppName -eq "LocalGame").UnknownEntryField |
+            Should -Be "preserve-entry"
+        $launcher.UnknownTopLevel | Should -Be "preserve-me"
+    }
+
+    It "fails closed when the target item filename belongs to another AppName" {
+        $guid = "ffffffffffffffffffffffffffffffff"
+        $otherBytes = New-ClientTestItemBytes -AppName "GTA5" -Guid $guid `
+            -InstallLocation (Join-Path $TestDrive "gta")
+        [IO.File]::WriteAllBytes(
+            (Join-Path $script:EgsManifestDirectory "$guid.item"),
+            $otherBytes
+        )
+        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $guid `
+            -InstallLocation (Join-Path $script:EgsClientRoot "Fortnite")
         $existing = @(Read-ExistingEgsManifests -ManifestDirectory $script:EgsManifestDirectory)
 
         {
             New-ClientEgsSyncPlan -Desired @($desired) -Existing $existing `
                 -ManagedState ([pscustomobject]@{ schema_version = 1; manifests = @() })
-        } | Should -Throw "*not managed*"
+        } | Should -Throw "*belongs to another local application*"
+    }
+
+    It "accepts a missing LauncherInstalled.dat and rejects invalid JSON" {
+        $desired = New-ClientTestDesired -AppName "Fortnite" `
+            -Guid "abababababababababababababababab" `
+            -InstallLocation (Join-Path $script:EgsClientRoot "Fortnite")
+        $missing = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        $missing.RequiresWrite | Should -BeFalse
+
+        Set-Content -LiteralPath $script:EgsLauncherInstalledPath -Value "not-json"
+        {
+            New-ClientEgsLauncherInstalledPlan `
+                -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        } | Should -Throw "*not valid JSON*"
+    }
+
+    It "fails before mutations when LauncherInstalled.dat changes after planning" {
+        $desired = New-ClientTestDesired -AppName "Fortnite" `
+            -Guid "10101010101010101010101010101010" `
+            -InstallLocation (Join-Path $script:EgsClientRoot "Fortnite")
+        Set-ClientTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @([ordered]@{
+                AppName = "Fortnite"
+                InstallLocation = (Join-Path $TestDrive "local-fortnite")
+                AppVersion = "local-build"
+            })
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        Set-Content -LiteralPath $script:EgsLauncherInstalledPath -Value "changed"
+
+        {
+            Start-ClientEgsTransaction -ManifestDirectory $script:EgsManifestDirectory `
+                -StatePath $script:EgsStatePath `
+                -TransactionPath $script:EgsTransactionPath `
+                -AffectedFileNames @($desired.TargetFileName) `
+                -LauncherInstalledPlan $launcherPlan
+        } | Should -Throw "*changed before transaction*"
+        Test-Path -LiteralPath $script:EgsTransactionPath | Should -BeFalse
+        Test-Path -LiteralPath (
+            Join-Path $script:EgsManifestDirectory $desired.TargetFileName
+        ) | Should -BeFalse
+    }
+
+    It "rolls back item, state, and LauncherInstalled.dat after the launcher mutation" {
+        $localGuid = "12121212121212121212121212121212"
+        $networkGuid = "34343434343434343434343434343434"
+        $localLocation = Join-Path $TestDrive "local-fortnite"
+        $networkLocation = Join-Path $script:EgsClientRoot "Fortnite"
+        New-Item -ItemType Directory -Path $localLocation -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $localLocation "keep.bin") -Value "keep"
+        $localBytes = New-ClientTestItemBytes -AppName "Fortnite" -Guid $localGuid `
+            -InstallLocation $localLocation -Version "local-build"
+        $localItemPath = Join-Path $script:EgsManifestDirectory "$localGuid.item"
+        [IO.File]::WriteAllBytes($localItemPath, $localBytes)
+        $desired = New-ClientTestDesired -AppName "Fortnite" -Guid $networkGuid `
+            -InstallLocation $networkLocation -Version "network-build"
+        Set-ClientTestLauncherInstalled -Path $script:EgsLauncherInstalledPath `
+            -InstallationList @([ordered]@{
+                AppName = "Fortnite"
+                InstallLocation = $localLocation
+                AppVersion = "local-build"
+            })
+        $launcherHash = Get-EgsSha256Hex (
+            [IO.File]::ReadAllBytes($script:EgsLauncherInstalledPath)
+        )
+        $existing = @(Read-ExistingEgsManifests -ManifestDirectory $script:EgsManifestDirectory)
+        $plan = New-ClientEgsSyncPlan -Desired @($desired) -Existing $existing `
+            -ManagedState ([pscustomobject]@{ schema_version = 1; manifests = @() })
+        $launcherPlan = New-ClientEgsLauncherInstalledPlan `
+            -Path $script:EgsLauncherInstalledPath -Desired @($desired)
+        Mock Assert-EgsLauncherStopped { }
+        Mock Stop-EgsLauncherProcesses { }
+        $script:InjectStateWriteFailure = $true
+        Mock Write-EgsBytesAtomic {
+            if ($script:InjectStateWriteFailure -and $Path -eq $script:EgsStatePath) {
+                $script:InjectStateWriteFailure = $false
+                throw "injected after LauncherInstalled.dat mutation"
+            }
+            $parent = Split-Path $Path -Parent
+            if (-not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            [IO.File]::WriteAllBytes($Path, $Bytes)
+        }
+
+        {
+            Invoke-ClientEgsTransaction -Plan $plan `
+                -ManifestDirectory $script:EgsManifestDirectory `
+                -StatePath $script:EgsStatePath `
+                -TransactionPath $script:EgsTransactionPath `
+                -ArchiveDirectory $script:EgsArchiveDirectory `
+                -LauncherInstalledPlan $launcherPlan
+        } | Should -Throw "*injected after LauncherInstalled.dat mutation*"
+
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes($localItemPath)) |
+            Should -Be (Get-EgsSha256Hex $localBytes)
+        Test-Path -LiteralPath (
+            Join-Path $script:EgsManifestDirectory "$networkGuid.item"
+        ) | Should -BeFalse
+        Test-Path -LiteralPath $script:EgsStatePath | Should -BeFalse
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes($script:EgsLauncherInstalledPath)) |
+            Should -Be $launcherHash
+        Test-Path -LiteralPath (Join-Path $localLocation "keep.bin") | Should -BeTrue
+        Test-Path -LiteralPath $script:EgsTransactionPath | Should -BeFalse
+
+        Invoke-ClientEgsTransaction -Plan $plan `
+            -ManifestDirectory $script:EgsManifestDirectory -StatePath $script:EgsStatePath `
+            -TransactionPath $script:EgsTransactionPath `
+            -ArchiveDirectory $script:EgsArchiveDirectory `
+            -LauncherInstalledPlan $launcherPlan
+        Test-Path -LiteralPath (
+            Join-Path $script:EgsManifestDirectory "$networkGuid.item"
+        ) | Should -BeTrue
+        @((Read-ClientEgsManagedState -Path $script:EgsStatePath).manifests).Count |
+            Should -Be 1
+    }
+
+    It "restores a version 1 transaction journal left by v0.4.6" {
+        $guid = "56565656565656565656565656565656"
+        $location = Join-Path $script:EgsClientRoot "Fortnite"
+        $originalBytes = New-ClientTestItemBytes -AppName "Fortnite" -Guid $guid `
+            -InstallLocation $location -Version "original"
+        $changedBytes = New-ClientTestItemBytes -AppName "Fortnite" -Guid $guid `
+            -InstallLocation $location -Version "changed"
+        $itemPath = Join-Path $script:EgsManifestDirectory "$guid.item"
+        [IO.File]::WriteAllBytes($itemPath, $changedBytes)
+        $originalState = [Text.Encoding]::UTF8.GetBytes(
+            (@{ schema_version = 1; manifests = @() } | ConvertTo-Json)
+        )
+        [IO.File]::WriteAllBytes($script:EgsStatePath, [Text.Encoding]::UTF8.GetBytes("changed"))
+        $backupDirectory = Join-Path $script:EgsTransactionPath "backup"
+        New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $backupDirectory "0.bak"), $originalBytes)
+        [IO.File]::WriteAllBytes((Join-Path $backupDirectory "state.bak"), $originalState)
+        [ordered]@{
+            schema_version = 1
+            manifest_directory = $script:EgsManifestDirectory
+            state_path = $script:EgsStatePath
+            files = @([ordered]@{
+                file_name = "$guid.item"
+                existed = $true
+                sha256 = Get-EgsSha256Hex $originalBytes
+                backup_name = "0.bak"
+            })
+            state_existed = $true
+            state_sha256 = Get-EgsSha256Hex $originalState
+        } | ConvertTo-Json -Depth 6 | Set-Content `
+            -LiteralPath (Join-Path $script:EgsTransactionPath "journal.json")
+        Mock Assert-EgsLauncherStopped { }
+
+        Restore-ClientEgsTransaction -TransactionPath $script:EgsTransactionPath
+
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes($itemPath)) |
+            Should -Be (Get-EgsSha256Hex $originalBytes)
+        Get-EgsSha256Hex ([IO.File]::ReadAllBytes($script:EgsStatePath)) |
+            Should -Be (Get-EgsSha256Hex $originalState)
+        Test-Path -LiteralPath $script:EgsTransactionPath | Should -BeFalse
     }
 
     It "gracefully requests close and force-stops remaining launcher processes" {
