@@ -1,5 +1,54 @@
 # Verification record
 
+## Majestic Launcher settings sync v0.4.13 — 2026-08-25
+
+### Реализация
+
+- Publisher и client installers получили независимый opt-in
+  `-MajesticLauncherSettingsSync Enabled|Disabled`, по умолчанию `Disabled`. Оба всегда
+  сохраняют SID и путь профиля текущего пользователя в защищённый `majestic-sync.json`, а
+  startup-задача клиента остаётся под `SYSTEM`.
+- Publisher перед `Disconnect` останавливает `Majestic Launcher.exe`, захватывает точные bytes
+  `prefs.latest.json` размером не более 1 MiB и два разрешённых `REG_SZ`, затем атомарно пишет
+  одинаковый bundle schema 1 на каждый master-том. Disabled удаляет прежние helper-owned
+  bundles. Capture/write failure очищает bundles и даёт warning; неподтверждённая очистка
+  останавливает flow до pending/offline/disconnect.
+- Client после проверки и монтирования полного набора томов требует одинаковый bundle на всех
+  своих томах, останавливает Launcher, пишет только через `HKEY_USERS` сохранённого SID,
+  временно загружает `NTUSER.DAT` при необходимости и атомарно заменяет prefs после registry
+  mutations. Ошибка даёт `majestic_settings_sync_warning`, сохраняет проверенную iSCSI-session
+  и не блокирует `ready`; успех даёт `majestic_settings_sync_ready` до Epic-событий и `ready`.
+- Bundle не содержит SID, пути профиля, авторизацию или cache. YAML schema, SQLite, storage
+  backend и Reset API не менялись.
+
+### Автоматически проверено
+
+- `ruff check src tests` — успешно.
+- `pytest -q -p no:cacheprovider` в Python 3.12 venv — **133 passed** за 1.75 секунды.
+- PowerShell parser из закреплённого
+  `mcr.microsoft.com/powershell@sha256:042240d57ec9e47e511033b92625a8d95875ee5860af3015992c248b58a8be81`
+  прошёл для всех production и test `.ps1`. Контейнер `linux/amd64` выполнялся через эмуляцию
+  на локальном `arm64` Docker host.
+- Полный Pester 5.7.1 в том же Linux PowerShell-контейнере — **138 passed, 0 failed,
+  1 skipped** из 139 за 14.56 секунды. Пропущена только существующая Windows-only проверка
+  создания ACL object. Majestic-тесты покрывают точные bytes/REG_SZ, три произвольно названных
+  тома, одинаковые и повреждённые bundles, atomic replace/cleanup, loaded/offline user hive,
+  partial registry retry, остановку Launcher, Disabled, warning-only startup и порядок событий
+  без содержимого prefs в JSONL.
+- `docker compose config --quiet` — успешно.
+- `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed**; после проверки выполнен `docker compose down --volumes`.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Полный Pester на настоящем Windows PowerShell 5.1, включая ACL, Windows Registry provider,
+  `reg.exe load/unload`, реальный `NTUSER.DAT` и остановку `Majestic Launcher.exe`.
+- Физический Publisher → `Disconnect` → stage → activate → client reset с реальными TrueNAS,
+  NTFS и iSCSI. Нужно подтвердить точные bytes prefs, оба `REG_SZ` в профиле игрового
+  пользователя, буквальный `game_disk` и выбранные настройки в интерфейсе Majestic Launcher.
+- Авторизация, Cookies, Session Storage, cache и состояние проверки игры этой версией намеренно
+  не синхронизируются и не объявляются проверенными.
+
 ## Epic Games EOS Shared Install DB v0.4.12 — 2026-08-24
 
 ### Операторские данные реального клиента и InstallHelper

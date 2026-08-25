@@ -10,6 +10,7 @@ param(
         "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat",
     [string]$EgsSharedInstallDbPath =
         "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems",
+    [string]$MajesticSyncConfigPath = "",
     [switch]$PassThruExitCode,
     [switch]$NoMain
 )
@@ -17,6 +18,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $script:DefaultPublisherEgsSyncConfigPath = Join-Path $PSScriptRoot "egs-sync.json"
+$script:DefaultPublisherMajesticSyncConfigPath = Join-Path $PSScriptRoot "majestic-sync.json"
 
 function Resolve-PublisherEgsSyncConfigPath {
     param([AllowEmptyString()][string]$Path)
@@ -27,6 +29,17 @@ function Resolve-PublisherEgsSyncConfigPath {
 }
 
 $EgsSyncConfigPath = Resolve-PublisherEgsSyncConfigPath -Path $EgsSyncConfigPath
+
+function Resolve-PublisherMajesticSyncConfigPath {
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $script:DefaultPublisherMajesticSyncConfigPath
+    }
+    return $Path
+}
+
+$MajesticSyncConfigPath = Resolve-PublisherMajesticSyncConfigPath `
+    -Path $MajesticSyncConfigPath
 
 function Normalize-PublisherDiskId {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -57,6 +70,155 @@ function Get-EgsManifestSyncMode {
 function Get-EgsManifestSyncEnabled {
     param([Parameter(Mandatory = $true)][string]$Path)
     return (Get-EgsManifestSyncMode -Path $Path) -ne "Disabled"
+}
+
+function Get-MajesticSyncConfig {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Present = $false
+            Enabled = $false
+            UserSid = ""
+            ProfilePath = ""
+        }
+    }
+    $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ([int]$config.schema_version -ne 1 -or
+        [string]$config.mode -notin @("disabled", "enabled")) {
+        throw "Majestic Launcher settings sync config is invalid: $Path"
+    }
+    $enabled = [string]$config.mode -eq "enabled"
+    $sid = [string]$config.user_sid
+    $profilePath = [string]$config.profile_path
+    if ($enabled -and
+        ($sid -notmatch '^S-1-[0-9]+(?:-[0-9]+)+$' -or
+        $sid -eq "S-1-5-18" -or
+        [string]::IsNullOrWhiteSpace($profilePath) -or
+        -not [IO.Path]::IsPathRooted($profilePath))) {
+        throw "Majestic Launcher settings sync user profile is invalid"
+    }
+    return [pscustomobject]@{
+        Present = $true
+        Enabled = $enabled
+        UserSid = $sid
+        ProfilePath = $profilePath
+    }
+}
+
+function Stop-MajesticLauncherProcesses {
+    param([int]$GraceSeconds = 15)
+    $running = @(Get-Process -Name "Majestic Launcher" -ErrorAction SilentlyContinue)
+    foreach ($process in $running) {
+        try { $process.CloseMainWindow() | Out-Null } catch { }
+    }
+    for ($second = 0; $second -lt $GraceSeconds; $second++) {
+        if (@(Get-Process -Name "Majestic Launcher" `
+            -ErrorAction SilentlyContinue).Count -eq 0) { return }
+        Start-Sleep -Seconds 1
+    }
+    foreach ($process in @(Get-Process -Name "Majestic Launcher" `
+        -ErrorAction SilentlyContinue)) {
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    if (@(Get-Process -Name "Majestic Launcher" `
+        -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw "Majestic Launcher processes could not be stopped"
+    }
+}
+
+function Assert-MajesticLauncherStopped {
+    if (@(Get-Process -Name "Majestic Launcher" `
+        -ErrorAction SilentlyContinue).Count -ne 0) {
+        throw "Majestic Launcher restarted during settings export"
+    }
+}
+
+function Open-MajesticUserHive {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserSid,
+        [Parameter(Mandatory = $true)][string]$ProfilePath
+    )
+    if (Test-Path -LiteralPath "Registry::HKEY_USERS\$UserSid") {
+        return [pscustomobject]@{ RootName = $UserSid; LoadedByHelper = $false }
+    }
+    $hivePath = Join-Path $ProfilePath "NTUSER.DAT"
+    if (-not (Test-Path -LiteralPath $hivePath -PathType Leaf)) {
+        throw "Majestic Launcher user NTUSER.DAT does not exist"
+    }
+    $hiveFile = Get-Item -LiteralPath $hivePath -Force
+    if (([int]$hiveFile.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Majestic Launcher user NTUSER.DAT must not be a reparse point"
+    }
+    $rootName = "IscsiResetMajestic_" + [Guid]::NewGuid().ToString("N")
+    & reg.exe load "HKU\$rootName" $hivePath | Out-Null
+    if ($LASTEXITCODE -ne 0 -or
+        -not (Test-Path -LiteralPath "Registry::HKEY_USERS\$rootName")) {
+        throw "Majestic Launcher user registry hive could not be loaded"
+    }
+    return [pscustomobject]@{ RootName = $rootName; LoadedByHelper = $true }
+}
+
+function Close-MajesticUserHive {
+    param([Parameter(Mandatory = $true)]$Hive)
+    if (-not [bool]$Hive.LoadedByHelper) { return }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    & reg.exe unload "HKU\$($Hive.RootName)" | Out-Null
+    if ($LASTEXITCODE -ne 0 -or
+        (Test-Path -LiteralPath "Registry::HKEY_USERS\$($Hive.RootName)")) {
+        throw "Majestic Launcher user registry hive could not be unloaded"
+    }
+}
+
+function Get-MajesticRegistryValuesFromRoot {
+    param([Parameter(Mandatory = $true)][string]$RootName)
+    $users = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::Users,
+        [Microsoft.Win32.RegistryView]::Default
+    )
+    $key = $null
+    try {
+        $key = $users.OpenSubKey("$RootName\Software\MAJESTIC-LAUNCHER", $false)
+        if ($null -eq $key) { throw "Majestic Launcher registry key does not exist" }
+        $values = [ordered]@{}
+        foreach ($name in @("lastVisitedServerID", "game_disk")) {
+            if ($key.GetValueKind($name) -ne [Microsoft.Win32.RegistryValueKind]::String) {
+                throw "Majestic Launcher registry value is not REG_SZ: $name"
+            }
+            $value = [string]$key.GetValue(
+                $name,
+                $null,
+                [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+            )
+            if ([string]::IsNullOrWhiteSpace($value) -or $value.Length -gt 1024) {
+                throw "Majestic Launcher registry value is invalid: $name"
+            }
+            $values[$name] = $value
+        }
+        return [pscustomobject]$values
+    } finally {
+        if ($null -ne $key) { $key.Dispose() }
+        $users.Dispose()
+    }
+}
+
+function Get-MajesticRegistryValues {
+    param([Parameter(Mandatory = $true)]$Config)
+    $hive = Open-MajesticUserHive -UserSid $Config.UserSid `
+        -ProfilePath $Config.ProfilePath
+    $failure = $null
+    try {
+        return Get-MajesticRegistryValuesFromRoot -RootName $hive.RootName
+    } catch {
+        $failure = $_
+        throw
+    } finally {
+        try { Close-MajesticUserHive -Hive $hive } catch {
+            if ($null -eq $failure) { throw }
+        }
+    }
 }
 
 function Get-EgsSha256Hex {
@@ -259,7 +421,7 @@ function Wait-EgsSharedInstallDbIdle {
     throw "Epic Games shared installation database is still in use"
 }
 
-function Get-PublisherEgsVolumeMappings {
+function Get-PublisherVolumeMappings {
     param(
         [Parameter(Mandatory = $true)]$ExpectedVolumes,
         [Parameter(Mandatory = $true)]$Disks
@@ -271,7 +433,7 @@ function Get-PublisherEgsVolumeMappings {
             (Normalize-PublisherDiskId ([string]$_.UniqueId)) -eq $expectedId
         })
         if ($matches.Count -ne 1) {
-            throw "Expected exactly one Publisher disk for EGS volume $($expected.name)"
+            throw "Expected exactly one Publisher disk for volume $($expected.name)"
         }
         $partitions = @(Get-Partition -DiskNumber $matches[0].Number | Where-Object {
             $_.Type -notin @("Reserved", "System", "Recovery")
@@ -291,6 +453,125 @@ function Get-PublisherEgsVolumeMappings {
         }
     }
     return $mappings
+}
+
+function Get-PublisherEgsVolumeMappings {
+    param(
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)]$Disks
+    )
+    return @(Get-PublisherVolumeMappings -ExpectedVolumes $ExpectedVolumes -Disks $Disks)
+}
+
+function Get-PublisherMajesticBundlePath {
+    param([Parameter(Mandatory = $true)]$VolumeMapping)
+    return Join-Path $VolumeMapping.RootPath `
+        ".iscsi-reset\majestic-launcher-settings.v1.json"
+}
+
+function Get-PublisherMajesticBundleBytes {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)][string]$ConfigRevision
+    )
+    $profile = Get-Item -LiteralPath $Config.ProfilePath -Force -ErrorAction Stop
+    if (-not $profile.PSIsContainer -or
+        (([int]$profile.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher profile path is unsafe"
+    }
+    $prefsPath = Join-Path $Config.ProfilePath `
+        "AppData\Roaming\majestic-launcher\prefs.latest.json"
+    $prefs = Get-Item -LiteralPath $prefsPath -Force -ErrorAction Stop
+    if ($prefs.PSIsContainer -or
+        (([int]$prefs.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        [Int64]$prefs.Length -lt 1 -or [Int64]$prefs.Length -gt 1MB) {
+        throw "Majestic Launcher prefs.latest.json is unsafe or exceeds 1 MiB"
+    }
+    $prefsBytes = [IO.File]::ReadAllBytes($prefs.FullName)
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $strictUtf8.GetString($prefsBytes) | ConvertFrom-Json | Out-Null
+    } catch {
+        throw "Majestic Launcher prefs.latest.json is not valid UTF-8 JSON"
+    }
+    $registry = Get-MajesticRegistryValues -Config $Config
+    Assert-MajesticLauncherStopped
+    $bundle = [ordered]@{
+        schema_version = 1
+        config_revision = $ConfigRevision
+        prefs_latest_length = [Int64]$prefsBytes.Length
+        prefs_latest_sha256 = Get-EgsSha256Hex $prefsBytes
+        prefs_latest_base64 = [Convert]::ToBase64String($prefsBytes)
+        registry = [ordered]@{
+            lastVisitedServerID = [string]$registry.lastVisitedServerID
+            game_disk = [string]$registry.game_disk
+        }
+    }
+    $json = $bundle | ConvertTo-Json -Depth 6 -Compress
+    return (New-Object Text.UTF8Encoding($false)).GetBytes($json)
+}
+
+function Remove-PublisherMajesticBundles {
+    param([Parameter(Mandatory = $true)]$VolumeMappings)
+    foreach ($mapping in $VolumeMappings) {
+        $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+        if (Test-Path -LiteralPath $path) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+    foreach ($mapping in $VolumeMappings) {
+        if (Test-Path -LiteralPath (
+            Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+        )) {
+            throw "Stale Majestic Launcher settings bundle could not be removed"
+        }
+    }
+}
+
+function Export-PublisherMajesticBundles {
+    param(
+        [Parameter(Mandatory = $true)]$VolumeMappings,
+        [Parameter(Mandatory = $true)][byte[]]$BundleBytes
+    )
+    $expectedSha = Get-EgsSha256Hex $BundleBytes
+    foreach ($mapping in $VolumeMappings) {
+        $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+        Write-PublisherEgsBytesAtomic -Path $path -Bytes $BundleBytes
+        $written = [IO.File]::ReadAllBytes($path)
+        if ((Get-EgsSha256Hex $written) -ne $expectedSha -or
+            $written.Length -ne $BundleBytes.Length) {
+            throw "Majestic Launcher settings bundle verification failed"
+        }
+    }
+    Assert-MajesticLauncherStopped
+}
+
+function Invoke-PublisherMajesticSync {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$Manifest,
+        [Parameter(Mandatory = $true)]$VolumeMappings
+    )
+    if (-not $Config.Present) { return }
+    if (-not $Config.Enabled) {
+        Remove-PublisherMajesticBundles -VolumeMappings $VolumeMappings
+        return
+    }
+    try {
+        Stop-MajesticLauncherProcesses
+        $bytes = Get-PublisherMajesticBundleBytes -Config $Config `
+            -ConfigRevision ([string]$Manifest.config_revision)
+        Export-PublisherMajesticBundles -VolumeMappings $VolumeMappings `
+            -BundleBytes $bytes
+    } catch {
+        $captureFailure = $_
+        try {
+            Remove-PublisherMajesticBundles -VolumeMappings $VolumeMappings
+        } catch {
+            throw "Majestic Launcher settings export failed and stale bundle cleanup failed"
+        }
+        Write-Warning "Majestic Launcher settings were not exported: $($captureFailure.Exception.Message)"
+    }
 }
 
 function Assert-PublisherEgsItem {
@@ -1451,7 +1732,8 @@ function Invoke-PublisherDisconnect {
         [string]$EpicLauncherInstalledPath =
             "C:\ProgramData\Epic\UnrealEngineLauncher\LauncherInstalled.dat",
         [string]$EpicSharedInstallDbPath =
-            "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems"
+            "C:\ProgramData\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems",
+        [string]$MajesticSettingsConfigPath = ""
     )
     if (Test-Path -LiteralPath $StatePath) {
         $pending = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
@@ -1468,6 +1750,7 @@ function Invoke-PublisherDisconnect {
     if ($EgsSyncEnabled -and $EgsSyncMode -eq "Disabled") {
         $EgsSyncMode = "Enabled"
     }
+    $volumeMappings = @()
     if ($EgsSyncMode -ne "Disabled") {
         Stop-EgsLauncherProcesses
         $volumeMappings = @(Get-PublisherEgsVolumeMappings `
@@ -1484,6 +1767,15 @@ function Invoke-PublisherDisconnect {
                 -ManifestDirectory $EpicManifestDirectory `
                 -LauncherInstalledPath $EpicLauncherInstalledPath
         }
+    }
+    $majesticConfig = Get-MajesticSyncConfig -Path $MajesticSettingsConfigPath
+    if ($majesticConfig.Present) {
+        if ($volumeMappings.Count -eq 0) {
+            $volumeMappings = @(Get-PublisherVolumeMappings `
+                -ExpectedVolumes @($Manifest.volumes) -Disks $matched)
+        }
+        Invoke-PublisherMajesticSync -Config $majesticConfig -Manifest $Manifest `
+            -VolumeMappings $volumeMappings
     }
     Save-PublisherPending -Path $StatePath -Manifest $Manifest
     Set-PublisherDisksOffline -Disks $matched
@@ -1519,7 +1811,8 @@ function Invoke-PublisherMain {
         [Parameter(Mandatory = $true)][string]$EpicManifestDirectory,
         [Parameter(Mandatory = $true)][string]$EpicProgramDataPath,
         [Parameter(Mandatory = $true)][string]$EpicLauncherInstalledPath,
-        [Parameter(Mandatory = $true)][string]$EpicSharedInstallDbPath
+        [Parameter(Mandatory = $true)][string]$EpicSharedInstallDbPath,
+        [Parameter(Mandatory = $true)][string]$MajesticSettingsConfigPath
     )
     try {
         $manifest = Read-PublisherManifest -Path $PublisherManifestPath
@@ -1529,7 +1822,8 @@ function Invoke-PublisherMain {
                 -EgsSyncMode $egsSyncMode -EpicManifestDirectory $EpicManifestDirectory `
                 -EpicProgramDataPath $EpicProgramDataPath `
                 -EpicLauncherInstalledPath $EpicLauncherInstalledPath `
-                -EpicSharedInstallDbPath $EpicSharedInstallDbPath
+                -EpicSharedInstallDbPath $EpicSharedInstallDbPath `
+                -MajesticSettingsConfigPath $MajesticSettingsConfigPath
             Write-Host "Publisher disconnected. Create and activate the release in the management UI."
         } else {
             Invoke-PublisherReconnect -Manifest $manifest -StatePath $StatePath
@@ -1551,6 +1845,7 @@ if (-not $NoMain) {
         -EpicManifestDirectory $EgsManifestDirectory `
         -EpicProgramDataPath $EgsProgramDataPath `
         -EpicLauncherInstalledPath $EgsLauncherInstalledPath `
-        -EpicSharedInstallDbPath $EgsSharedInstallDbPath
+        -EpicSharedInstallDbPath $EgsSharedInstallDbPath `
+        -MajesticSettingsConfigPath $MajesticSyncConfigPath
     if ($PassThruExitCode) { Write-Output $exitCode } else { exit $exitCode }
 }

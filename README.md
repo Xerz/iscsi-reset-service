@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.12
+# iSCSI Reset Service v0.4.13
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -693,6 +693,18 @@ Set-ExecutionPolicy -Scope Process Bypass
   -EpicGamesManifestSync Aggressive
 ```
 
+Чтобы включить перенос настроек Majestic Launcher, установите Publisher с отдельным opt-in:
+
+```powershell
+./Install-IscsiReleasePublisher.ps1 `
+  -ManifestSourcePath ./publisher.json `
+  -MajesticLauncherSettingsSync Enabled
+```
+
+Установщик всегда сохраняет SID и путь профиля текущего интерактивного Windows-пользователя в
+защищённый `majestic-sync.json`, даже когда opt-in оставлен в `Disabled`. Его профиль и
+`NTUSER.DAT` должны уже существовать; запуск установщика от `SYSTEM` запрещён.
+
 Установщик копирует `publisher.json` и вспомогательный скрипт в
 `C:\ProgramData\IscsiResetPublisher`, закрывает ACL по SID системной учётной записи и
 встроенной группы администраторов и не сохраняет сетевые учётные данные. После изменения
@@ -747,6 +759,19 @@ Set-ExecutionPolicy -Scope Process Bypass
   -EpicGamesManifestSync Aggressive
 ```
 
+Для применения настроек Majestic Launcher установите клиент из повышенной PowerShell именно
+под той игровой учётной записью, в профиль которой должны попасть настройки:
+
+```powershell
+./Install-IscsiResetClient.ps1 `
+  -CaCertificatePath ./reset-ca.crt `
+  -ResetApiIp 10.20.40.10 `
+  -MajesticLauncherSettingsSync Enabled
+```
+
+Параметр должен быть одинаково включён на Publisher и клиентах. Он независим от режима Epic
+Games и по умолчанию равен `Disabled`.
+
 Reset API всегда используется по `https://<введённый-IP>:8443`; hostname и IPv6 установщик
 отклоняет. Установщик сначала закрывает ACL каталога
 `C:\ProgramData\IscsiReset` по неизменяемым SID системной учётной записи и встроенной группы
@@ -792,6 +817,33 @@ Reset API возвращает только portal, собственную це�
 `{lun, disk_unique_id, drive_letter, label}`. Имя релиза, пути снимков и чужие цели клиенту не
 выдаются. Скрипт не использует `Initialize-Disk`, `Format-Volume`, `Clear-Disk`, удаление
 разделов или другие команды подготовки диска.
+
+### Синхронизация настроек Majestic Launcher
+
+Режим `-MajesticLauncherSettingsSync Enabled` переносит только точные bytes файла
+`%APPDATA%\majestic-launcher\prefs.latest.json` и два строковых значения
+`HKCU\Software\MAJESTIC-LAUNCHER`: `lastVisitedServerID` и `game_disk`. Содержимое JSON и
+буква `game_disk` не преобразуются: Publisher и игровые ПК должны использовать одинаковые
+буквы игровых дисков. Размер prefs ограничен 1 MiB.
+
+Перед `Disconnect` Publisher корректно закрывает `Majestic Launcher.exe`, при необходимости
+завершает оставшийся процесс и записывает одинаковый проверенный
+`.iscsi-reset\majestic-launcher-settings.v1.json` на каждый master-том. Bundle содержит
+Base64/SHA-256 точного prefs и два разрешённых значения, но не содержит SID, пути профиля,
+Cookies, Session Storage или авторизацию. При отключённом режиме старые helper-generated
+Majestic bundles удаляются.
+
+Клиент применяет bundle после доказанной проверки и монтирования iSCSI-томов, но до
+синхронизации Epic и локального события `ready`. Startup-задача остаётся под `SYSTEM`: helper
+пишет в сохранённый SID игрового пользователя через `HKEY_USERS`, а до его входа временно
+загружает `NTUSER.DAT`. Файл заменяется атомарно только после записи и проверки реестра. Успех
+даёт `majestic_settings_sync_ready`; отсутствующий, различающийся или повреждённый bundle,
+ошибка профиля либо невозможность остановить Launcher дают `majestic_settings_sync_warning`,
+но не отключают проверенную iSCSI-session и не блокируют `ready`. Следующий запуск повторяет
+операцию идемпотентно.
+
+Этот режим не переносит авторизацию или состояние проверки игры. Их нельзя добавлять в bundle
+без отдельного анализа формата и привязки защищённых данных к пользователю или машине.
 
 ### Синхронизация Epic Games Launcher
 

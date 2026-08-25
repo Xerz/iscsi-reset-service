@@ -51,6 +51,7 @@ Describe "iSCSI reset client installer inputs" {
 
         $parameterNames | Should -Contain "ResetApiIp"
         $parameterNames | Should -Contain "EpicGamesManifestSync"
+        $parameterNames | Should -Contain "MajesticLauncherSettingsSync"
         $parameterNames | Should -Not -Contain "Token"
         $parameterNames | Should -Not -Contain "ApiBaseUrl"
     }
@@ -124,6 +125,31 @@ Describe "iSCSI reset client installer inputs" {
         $arguments | Should -Match '-TokenPath "C:\\ProgramData\\IscsiReset\\client\.token"'
         $arguments | Should -Not -Match 'one-time-client-token|Authorization|Bearer'
     }
+
+    It "accepts an existing non-SYSTEM Majestic user profile" {
+        $profile = Join-Path $TestDrive "game-user"
+        New-Item -ItemType Directory -Path $profile | Out-Null
+        Set-Content -LiteralPath (Join-Path $profile "NTUSER.DAT") -Value "hive"
+
+        $resolved = Get-MajesticSyncUserProfile `
+            -Sid "S-1-5-21-100-200-300-1001" -ProfilePath $profile
+
+        $resolved.Sid | Should -Be "S-1-5-21-100-200-300-1001"
+        $resolved.ProfilePath | Should -Be (Get-Item $profile).FullName
+    }
+
+    It "rejects SYSTEM and a Majestic user profile without NTUSER.DAT" {
+        $profile = Join-Path $TestDrive "missing-hive"
+        New-Item -ItemType Directory -Path $profile | Out-Null
+
+        {
+            Get-MajesticSyncUserProfile -Sid "S-1-5-18" -ProfilePath $profile
+        } | Should -Throw "*not SYSTEM*"
+        {
+            Get-MajesticSyncUserProfile `
+                -Sid "S-1-5-21-100-200-300-1001" -ProfilePath $profile
+        } | Should -Throw "*NTUSER.DAT*"
+    }
 }
 
 Describe "Installer secret and ACL regression" {
@@ -172,6 +198,17 @@ Describe "Installer secret and ACL regression" {
                 'mode = \$EpicGamesManifestSync\.ToLowerInvariant\(\)'
             $installerSource | Should -Match `
                 'ValidateSet\("Enabled", "Disabled", "Aggressive"\)'
+            $installerSource | Should -Match `
+                'MajesticLauncherSettingsSync = "Disabled"'
+            $installerSource | Should -Match 'schema_version = 1'
+            $installerSource | Should -Match `
+                'mode = \$MajesticLauncherSettingsSync\.ToLowerInvariant\(\)'
+            $installerSource | Should -Match 'user_sid'
+            $installerSource | Should -Match 'profile_path'
+            $installerSource | Should -Match `
+                '\$majesticProfile = Get-MajesticSyncUserProfile'
+            $installerSource | Should -Match 'user_sid = \$majesticProfile\.Sid'
+            $installerSource | Should -Match 'profile_path = \$majesticProfile\.ProfilePath'
         }
     }
 

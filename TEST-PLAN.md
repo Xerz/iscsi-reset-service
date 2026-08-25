@@ -248,7 +248,37 @@
     показывают `Продолжить`, сохранить launcher debug logs для отдельного анализа. LocalAppData,
     `webcache*`, account/session, authorization и non-shared EOS state в этот тест не копировать.
 
-## 8. Один dual-role Publisher/client ПК
+## 8. Majestic Launcher settings sync
+
+1. На Publisher и выделенном клиенте из повышенной Windows PowerShell 5.1 переустановить
+   helper с `-MajesticLauncherSettingsSync Enabled` под соответствующим игровым пользователем.
+   Проверить schema 1 `majestic-sync.json`, точные SID/profile и ACL только для SYSTEM и
+   Administrators. Повторить с `Disabled` и убедиться, что startup-задача остаётся SYSTEM.
+2. На Publisher задать `prefs.latest.json`, `lastVisitedServerID=ro3` и `game_disk=E:`, открыть
+   `Majestic Launcher.exe` и выполнить `Disconnect` с тремя произвольно названными master-томами.
+   Helper должен запросить graceful close, ограниченно завершить остаток процесса и записать
+   одинаковый `.iscsi-reset\majestic-launcher-settings.v1.json` на каждый том.
+3. Декодировать bundle и сверить точные bytes/размер/SHA-256 prefs и оба `REG_SZ`. SID, путь
+   профиля, Cookies, Session Storage, account и authorization state должны отсутствовать.
+4. Выполнить полный Publisher → stage → activate → client reset до входа игрового пользователя.
+   SYSTEM должен временно загрузить его `NTUSER.DAT`, записать оба значения через `HKEY_USERS`,
+   атомарно заменить prefs и выгрузить hive. После входа Launcher должен показать сервер и
+   настройки Publisher без преобразования `E:`.
+5. Повторить reset при уже загруженном hive пользователя. `reg load/unload` не вызываются,
+   точные файл и значения сохраняются, а журнал содержит `majestic_settings_sync_ready` перед
+   Epic-событиями и `ready` без содержимого prefs.
+6. Поочерёдно удалить bundle одного тома, изменить его bytes, config revision, Base64 и prefs
+   hash, а также заблокировать профиль или перезапустить Launcher во время sync. Каждый случай
+   должен дать `majestic_settings_sync_warning`, оставить проверенную session подключённой и
+   завершиться `ready` без частичного копирования файла.
+7. Имитировать отказ после записи `lastVisitedServerID`. Текущий запуск может оставить
+   повторяемое частичное пользовательское состояние, но следующий reset обязан согласовать оба
+   значения и точные prefs без ручной очистки.
+8. Переключить Publisher в `Disabled`: следующий Disconnect должен удалить только
+   helper-generated Majestic bundles со всех master-томов. Client в `Disabled` не должен
+   закрывать Launcher, читать bundles или менять профиль.
+
+## 9. Один dual-role Publisher/client ПК
 
 1. Настроить один клиент с той же полной парой SAN IP/IQN, что у Publisher, но с отдельными
    client target, extent и associations. Убедиться, что обе target имеют точный IQN и тот же
@@ -264,7 +294,7 @@
 6. Проверить частичное совпадение только IP, только IQN и постороннюю target: это должна быть
    красная ошибка `identity conflict`, а не ожидаемое предупреждение о другой роли.
 
-## 9. Комплект GitHub Release
+## 10. Комплект GitHub Release
 
 1. Скачать семь assets: YAML, `image-digest.txt`, `SHA256SUMS` и четыре операторских `.ps1`.
 2. Убедиться, что `publisher.json` и тестовые PowerShell-файлы в выпуск не попали.
@@ -275,7 +305,7 @@
 5. Проверить, что workflow artifact и GitHub Release содержат одинаковый комплект файлов.
 6. На опубликованном tag дождаться Python, Compose и Windows PowerShell 5.1 CI.
 
-## 10. Чек-лист результата
+## 11. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
@@ -286,6 +316,7 @@
 | Restart revisions | После restart startup = saved |  | ☐ |
 | Publisher Disconnect | Exact session/NAA, pending до mutations |  | ☐ |
 | Epic Games sync | Exact bundles, managed `.item`, rollback/retry |  | ☐ |
+| Majestic settings sync | Exact prefs/REG_SZ, user hive, warning/retry |  | ☐ |
 | Stage | Fail-closed, immutable полный mapping |  | ☐ |
 | Incomplete retry | Исходный request ID, без удаления snapshots |  | ☐ |
 | Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |

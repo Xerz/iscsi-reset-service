@@ -5,7 +5,9 @@ param(
     [string]$InstallRoot = "C:\ProgramData\IscsiReset",
     [string]$ClientScriptPath = "",
     [ValidateSet("Enabled", "Disabled", "Aggressive")]
-    [string]$EpicGamesManifestSync = "Disabled"
+    [string]$EpicGamesManifestSync = "Disabled",
+    [ValidateSet("Enabled", "Disabled")]
+    [string]$MajesticLauncherSettingsSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -99,6 +101,43 @@ function New-RestrictedFileSystemAcl {
     return $acl
 }
 
+function Get-MajesticSyncUserProfile {
+    param(
+        [AllowEmptyString()][string]$Sid = "",
+        [AllowEmptyString()][string]$ProfilePath = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Sid)) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($null -eq $identity.User) {
+            throw "The installer user has no Windows SID"
+        }
+        $Sid = $identity.User.Value
+    }
+    if ($Sid -eq "S-1-5-18") {
+        throw "Majestic Launcher settings require an interactive Windows user, not SYSTEM"
+    }
+    if ([string]::IsNullOrWhiteSpace($ProfilePath)) {
+        $ProfilePath = [Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::UserProfile
+        )
+    }
+    if ([string]::IsNullOrWhiteSpace($ProfilePath) -or
+        -not [IO.Path]::IsPathRooted($ProfilePath) -or
+        -not (Test-Path -LiteralPath $ProfilePath -PathType Container) -or
+        -not (Test-Path -LiteralPath (Join-Path $ProfilePath "NTUSER.DAT") -PathType Leaf)) {
+        throw "The installer user profile and NTUSER.DAT must already exist"
+    }
+    $profile = Get-Item -LiteralPath $ProfilePath -Force
+    if (([int]$profile.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The installer user profile must not be a reparse point"
+    }
+    return [pscustomobject]@{
+        Sid = $Sid
+        ProfilePath = $profile.FullName
+    }
+}
+
 function New-ClientRequestHeaders {
     param([Parameter(Mandatory = $true)][string]$ClientToken)
 
@@ -142,6 +181,7 @@ function Invoke-IscsiResetClientInstall {
         $installedScript = Join-Path $InstallRoot "Reset-And-Connect.ps1"
         $tokenPath = Join-Path $InstallRoot "client.token"
         $egsConfigPath = Join-Path $InstallRoot "egs-sync.json"
+        $majesticConfigPath = Join-Path $InstallRoot "majestic-sync.json"
         Copy-Item -LiteralPath $ClientScriptPath -Destination $installedScript -Force
         Set-Acl -LiteralPath $installedScript -AclObject (New-RestrictedFileSystemAcl)
         [System.IO.File]::WriteAllText(
@@ -155,6 +195,14 @@ function Invoke-IscsiResetClientInstall {
             mode = $EpicGamesManifestSync.ToLowerInvariant()
         } | ConvertTo-Json | Set-Content -LiteralPath $egsConfigPath -Encoding UTF8
         Set-Acl -LiteralPath $egsConfigPath -AclObject (New-RestrictedFileSystemAcl)
+        $majesticProfile = Get-MajesticSyncUserProfile
+        [ordered]@{
+            schema_version = 1
+            mode = $MajesticLauncherSettingsSync.ToLowerInvariant()
+            user_sid = $majesticProfile.Sid
+            profile_path = $majesticProfile.ProfilePath
+        } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfigPath -Encoding UTF8
+        Set-Acl -LiteralPath $majesticConfigPath -AclObject (New-RestrictedFileSystemAcl)
 
         Import-Certificate -FilePath $CaCertificatePath `
             -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
@@ -187,6 +235,7 @@ function Invoke-IscsiResetClientInstall {
 
         Write-Host "Installed iSCSI reset client for Reset API $($api.Ip):8443."
         Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
+        Write-Host "Majestic Launcher settings sync: $MajesticLauncherSettingsSync."
         Write-Host "Reboot to run the first reset and non-persistent login."
     }
     finally {

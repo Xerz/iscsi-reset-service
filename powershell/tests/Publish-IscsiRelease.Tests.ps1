@@ -159,6 +159,189 @@ Describe "Publisher target discovery" {
     }
 }
 
+Describe "Publisher Majestic Launcher settings bundles" {
+    BeforeEach {
+        $script:MajesticProfile = Join-Path $TestDrive "publisher-profile"
+        $prefsDirectory = Join-Path $script:MajesticProfile `
+            "AppData/Roaming/majestic-launcher"
+        New-Item -ItemType Directory -Path $prefsDirectory -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:MajesticProfile "NTUSER.DAT") `
+            -Value "hive"
+        $script:MajesticPrefsBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"volume":0.25,"fullscreen":true,"gameDisk":"E:"}'
+        )
+        [IO.File]::WriteAllBytes(
+            (Join-Path $prefsDirectory "prefs.latest.json"),
+            $script:MajesticPrefsBytes
+        )
+        $script:MajesticConfig = [pscustomobject]@{
+            Present = $true
+            Enabled = $true
+            UserSid = "S-1-5-21-100-200-300-1001"
+            ProfilePath = $script:MajesticProfile
+        }
+        $script:MajesticManifest = [pscustomobject]@{
+            config_revision = "majestic-revision"
+        }
+        $script:MajesticMappings = @(
+            [pscustomobject]@{ Name = "nvme"; RootPath = (Join-Path $TestDrive "nvme") }
+            [pscustomobject]@{ Name = "archive"; RootPath = (Join-Path $TestDrive "archive") }
+            [pscustomobject]@{ Name = "bonus"; RootPath = (Join-Path $TestDrive "bonus") }
+        )
+        foreach ($mapping in $script:MajesticMappings) {
+            New-Item -ItemType Directory -Path $mapping.RootPath -Force | Out-Null
+        }
+        Mock Get-MajesticRegistryValues {
+            return [pscustomobject]@{
+                lastVisitedServerID = "ro3"
+                game_disk = "E:"
+            }
+        }
+        Mock Get-Process { return @() } -ParameterFilter { $Name -eq "Majestic Launcher" }
+    }
+
+    It "reads a strict enabled profile config and treats a missing config as legacy disabled" {
+        $missing = Get-MajesticSyncConfig -Path (Join-Path $TestDrive "missing.json")
+        $missing.Present | Should -BeFalse
+        $missing.Enabled | Should -BeFalse
+
+        $path = Join-Path $TestDrive "majestic-sync.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = $script:MajesticConfig.UserSid
+            profile_path = $script:MajesticProfile
+        } | ConvertTo-Json | Set-Content -LiteralPath $path
+        $enabled = Get-MajesticSyncConfig -Path $path
+        $enabled.Present | Should -BeTrue
+        $enabled.Enabled | Should -BeTrue
+        $enabled.UserSid | Should -Be $script:MajesticConfig.UserSid
+    }
+
+    It "writes identical exact-byte bundles to three arbitrary volumes" {
+        $bytes = Get-PublisherMajesticBundleBytes -Config $script:MajesticConfig `
+            -ConfigRevision $script:MajesticManifest.config_revision
+
+        foreach ($mapping in $script:MajesticMappings) {
+            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
+                -Force | Out-Null
+            Set-Content -LiteralPath $path -Value "stale"
+        }
+        Export-PublisherMajesticBundles -VolumeMappings $script:MajesticMappings `
+            -BundleBytes $bytes
+
+        $hashes = @()
+        foreach ($mapping in $script:MajesticMappings) {
+            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            $written = [IO.File]::ReadAllBytes($path)
+            $hashes += Get-EgsSha256Hex $written
+            $bundle = [Text.Encoding]::UTF8.GetString($written) | ConvertFrom-Json
+            (Get-EgsSha256Hex ([Convert]::FromBase64String(
+                [string]$bundle.prefs_latest_base64
+            ))) | Should -Be (Get-EgsSha256Hex $script:MajesticPrefsBytes)
+            $bundle.registry.lastVisitedServerID | Should -Be "ro3"
+            $bundle.registry.game_disk | Should -Be "E:"
+            $bundle.PSObject.Properties.Name | Should -Not -Contain "profile_path"
+            $bundle.PSObject.Properties.Name | Should -Not -Contain "user_sid"
+        }
+        @($hashes | Select-Object -Unique).Count | Should -Be 1
+    }
+
+    It "removes all helper-owned bundles when sync is disabled" {
+        foreach ($mapping in $script:MajesticMappings) {
+            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
+                -Force | Out-Null
+            Set-Content -LiteralPath $path -Value "stale"
+        }
+        $disabled = [pscustomobject]@{
+            Present = $true
+            Enabled = $false
+        }
+
+        Invoke-PublisherMajesticSync -Config $disabled `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+
+        foreach ($mapping in $script:MajesticMappings) {
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            ) | Should -BeFalse
+        }
+    }
+
+    It "cleans a partial bundle write and a retry can reconcile every volume" {
+        Mock Get-PublisherMajesticBundleBytes {
+            return [Text.Encoding]::UTF8.GetBytes('{"schema_version":1}')
+        }
+        $script:MajesticExportCalls = 0
+        Mock Export-PublisherMajesticBundles {
+            $script:MajesticExportCalls++
+            if ($script:MajesticExportCalls -eq 1) {
+                $path = Get-PublisherMajesticBundlePath `
+                    -VolumeMapping $script:MajesticMappings[0]
+                New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
+                    -Force | Out-Null
+                Set-Content -LiteralPath $path -Value "partial"
+                throw "injected after first bundle"
+            }
+            foreach ($mapping in $VolumeMappings) {
+                $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+                New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
+                    -Force | Out-Null
+                [IO.File]::WriteAllBytes($path, $BundleBytes)
+            }
+        }
+
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+
+        foreach ($mapping in $script:MajesticMappings) {
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            ) | Should -BeFalse
+        }
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+        foreach ($mapping in $script:MajesticMappings) {
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            ) | Should -BeTrue
+        }
+    }
+
+    It "fails before disconnect when stale bundle cleanup cannot be confirmed" {
+        Mock Get-PublisherMajesticBundleBytes { throw "capture failed" }
+        Mock Remove-PublisherMajesticBundles { throw "cleanup failed" }
+
+        {
+            Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+                -Manifest $script:MajesticManifest `
+                -VolumeMappings $script:MajesticMappings
+        } | Should -Throw "*stale bundle cleanup failed*"
+    }
+
+    It "gracefully closes and then force-stops Majestic Launcher" {
+        $process = [pscustomobject]@{ Id = 42; ProcessName = "Majestic Launcher" }
+        $process | Add-Member -MemberType ScriptMethod -Name CloseMainWindow `
+            -Value { return $true }
+        $script:MajesticProcessQueries = 0
+        Mock Get-Process {
+            $script:MajesticProcessQueries++
+            if ($script:MajesticProcessQueries -le 2) { return @($process) }
+            return @()
+        } -ParameterFilter { $Name -eq "Majestic Launcher" }
+        Mock Start-Sleep { }
+        Mock Stop-Process { }
+
+        Stop-MajesticLauncherProcesses -GraceSeconds 0
+
+        Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter {
+            $Id -eq 42 -and $Force
+        }
+    }
+}
+
 Describe "Publisher local disconnect and reconnect" {
     BeforeEach {
         $script:Manifest = [pscustomobject]@{

@@ -770,6 +770,249 @@ Describe "iSCSI failure cleanup" {
     }
 }
 
+Describe "Majestic Launcher client settings sync" {
+    BeforeAll {
+        if ($null -eq (Get-Command reg.exe -ErrorAction SilentlyContinue)) {
+            function global:reg.exe { }
+        }
+    }
+
+    BeforeEach {
+        $script:MajesticClientProfile = Join-Path $TestDrive "client-profile"
+        New-Item -ItemType Directory -Path $script:MajesticClientProfile -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:MajesticClientProfile "NTUSER.DAT") `
+            -Value "hive"
+        $script:MajesticClientConfig = [pscustomobject]@{
+            Present = $true
+            Enabled = $true
+            UserSid = "S-1-5-21-100-200-300-1001"
+            ProfilePath = $script:MajesticClientProfile
+        }
+        $script:MajesticClientPrefs = [Text.Encoding]::UTF8.GetBytes(
+            '{"volume":0.25,"fullscreen":true,"gameDisk":"E:"}'
+        )
+        $script:MajesticClientVolumes = @(
+            [pscustomobject]@{ name = "nvme"; drive_letter = "S"; TestRoot = (Join-Path $TestDrive "nvme") }
+            [pscustomobject]@{ name = "archive"; drive_letter = "H"; TestRoot = (Join-Path $TestDrive "archive") }
+            [pscustomobject]@{ name = "bonus"; drive_letter = "T"; TestRoot = (Join-Path $TestDrive "bonus") }
+        )
+        $bundle = [ordered]@{
+            schema_version = 1
+            config_revision = "majestic-revision"
+            prefs_latest_length = $script:MajesticClientPrefs.Length
+            prefs_latest_sha256 = Get-EgsSha256Hex $script:MajesticClientPrefs
+            prefs_latest_base64 = [Convert]::ToBase64String($script:MajesticClientPrefs)
+            registry = [ordered]@{
+                lastVisitedServerID = "ro3"
+                game_disk = "E:"
+            }
+        } | ConvertTo-Json -Depth 6
+        $script:MajesticClientBundleBytes = [Text.Encoding]::UTF8.GetBytes($bundle)
+        foreach ($volume in $script:MajesticClientVolumes) {
+            $directory = Join-Path $volume.TestRoot ".iscsi-reset"
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            [IO.File]::WriteAllBytes(
+                (Join-Path $directory "majestic-launcher-settings.v1.json"),
+                $script:MajesticClientBundleBytes
+            )
+        }
+        Mock Get-MajesticVolumeRoot { return $ExpectedVolume.TestRoot }
+        Mock Get-Process { return @() } -ParameterFilter { $Name -eq "Majestic Launcher" }
+    }
+
+    It "accepts identical bundles from three arbitrary mounted volumes" {
+        $result = Get-ClientMajesticBundle `
+            -ExpectedVolumes $script:MajesticClientVolumes `
+            -ConfigRevision "majestic-revision"
+
+        (Get-EgsSha256Hex $result.PrefsBytes) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientPrefs)
+        $result.Registry.lastVisitedServerID | Should -Be "ro3"
+        $result.Registry.game_disk | Should -Be "E:"
+    }
+
+    It "rejects a missing, mismatched, or wrong-revision bundle" {
+        $firstPath = Join-Path $script:MajesticClientVolumes[0].TestRoot `
+            ".iscsi-reset/majestic-launcher-settings.v1.json"
+        Remove-Item -LiteralPath $firstPath -Force
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*missing*"
+
+        [IO.File]::WriteAllBytes($firstPath, $script:MajesticClientBundleBytes)
+        Add-Content -LiteralPath $firstPath -Value "different"
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*do not match*"
+
+        [IO.File]::WriteAllBytes($firstPath, $script:MajesticClientBundleBytes)
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "other-revision"
+        } | Should -Throw "*metadata*"
+
+        $corrupt = [Text.Encoding]::UTF8.GetBytes('{not-json')
+        foreach ($volume in $script:MajesticClientVolumes) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $volume.TestRoot `
+                    ".iscsi-reset/majestic-launcher-settings.v1.json"),
+                $corrupt
+            )
+        }
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*not valid UTF-8 JSON*"
+    }
+
+    It "stages prefs, writes the exact registry values, and atomically replaces the file" {
+        Mock Set-MajesticRegistryValues { }
+        $targetDirectory = Join-Path $script:MajesticClientProfile `
+            "AppData/Roaming/majestic-launcher"
+        New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+        $target = Join-Path $targetDirectory "prefs.latest.json"
+        [IO.File]::WriteAllBytes($target, [Text.Encoding]::UTF8.GetBytes('{"stale":true}'))
+
+        $result = Invoke-ClientMajesticSettingsSync `
+            -Config $script:MajesticClientConfig `
+            -ExpectedVolumes $script:MajesticClientVolumes `
+            -ConfigRevision "majestic-revision"
+
+        (Get-EgsFileSha256Hex $target) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientPrefs)
+        $result.RegistryValueCount | Should -Be 2
+        Should -Invoke Set-MajesticRegistryValues -Times 1 -Exactly `
+            -ParameterFilter {
+                $RegistryValues.lastVisitedServerID -eq "ro3" -and
+                $RegistryValues.game_disk -eq "E:"
+            }
+    }
+
+    It "does not mutate the profile when Majestic Launcher cannot be stopped" {
+        Mock Get-ClientMajesticBundle {
+            return [pscustomobject]@{
+                PrefsBytes = $script:MajesticClientPrefs
+                Registry = [pscustomobject]@{
+                    lastVisitedServerID = "ro3"
+                    game_disk = "E:"
+                }
+                BundleSha256 = "bundle"
+            }
+        }
+        Mock Stop-MajesticLauncherProcesses { throw "launcher remained running" }
+        Mock Get-MajesticPrefsTargetPath { throw "profile mutation must not start" }
+        Mock Set-MajesticRegistryValues { throw "registry mutation must not start" }
+
+        {
+            Invoke-ClientMajesticSettingsSync `
+                -Config $script:MajesticClientConfig `
+                -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*remained running*"
+
+        Should -Invoke Get-MajesticPrefsTargetPath -Times 0 -Exactly
+        Should -Invoke Set-MajesticRegistryValues -Times 0 -Exactly
+    }
+
+    It "gracefully closes and then force-stops Majestic Launcher" {
+        $process = [pscustomobject]@{ Id = 43; ProcessName = "Majestic Launcher" }
+        $process | Add-Member -MemberType ScriptMethod -Name CloseMainWindow `
+            -Value { return $true }
+        $script:MajesticClientProcessQueries = 0
+        Mock Get-Process {
+            $script:MajesticClientProcessQueries++
+            if ($script:MajesticClientProcessQueries -le 2) { return @($process) }
+            return @()
+        } -ParameterFilter { $Name -eq "Majestic Launcher" }
+        Mock Start-Sleep { }
+        Mock Stop-Process { }
+
+        Stop-MajesticLauncherProcesses -GraceSeconds 0
+
+        Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter {
+            $Id -eq 43 -and $Force
+        }
+    }
+
+    It "uses an already-loaded SID hive without loading or unloading it" {
+        Mock Test-Path { return $true } -ParameterFilter {
+            $LiteralPath -eq "Registry::HKEY_USERS\S-1-5-21-100-200-300-1001"
+        }
+        Mock reg.exe { throw "reg.exe must not run" }
+
+        $hive = Open-MajesticUserHive `
+            -UserSid "S-1-5-21-100-200-300-1001" `
+            -ProfilePath $script:MajesticClientProfile
+        Close-MajesticUserHive -Hive $hive
+
+        $hive.RootName | Should -Be "S-1-5-21-100-200-300-1001"
+        $hive.LoadedByHelper | Should -BeFalse
+        Should -Invoke reg.exe -Times 0 -Exactly
+    }
+
+    It "loads and unloads NTUSER.DAT when the SID hive is offline" {
+        $script:MajesticHiveMounted = $false
+        Mock Test-Path {
+            if ($LiteralPath -eq (Join-Path $script:MajesticClientProfile "NTUSER.DAT")) {
+                return $true
+            }
+            if ($LiteralPath -like "Registry::HKEY_USERS\IscsiResetMajestic_*") {
+                return $script:MajesticHiveMounted
+            }
+            return $false
+        }
+        Mock reg.exe {
+            if ($args[0] -eq "load") {
+                $script:MajesticHiveMounted = $true
+            } elseif ($args[0] -eq "unload") {
+                $script:MajesticHiveMounted = $false
+            }
+            $global:LASTEXITCODE = 0
+        }
+
+        $hive = Open-MajesticUserHive `
+            -UserSid "S-1-5-21-100-200-300-1001" `
+            -ProfilePath $script:MajesticClientProfile
+        $hive.LoadedByHelper | Should -BeTrue
+        Close-MajesticUserHive -Hive $hive
+
+        $script:MajesticHiveMounted | Should -BeFalse
+        Should -Invoke reg.exe -Times 2 -Exactly
+    }
+
+    It "retries idempotently after failing after the first registry mutation" {
+        $script:MajesticRegistryAttempt = 1
+        $script:MajesticRegistrySetCalls = 0
+        Mock Open-MajesticUserHive {
+            return [pscustomobject]@{ RootName = "test"; LoadedByHelper = $false }
+        }
+        Mock Close-MajesticUserHive { }
+        Mock Set-MajesticRegistryStringValue {
+            $script:MajesticRegistrySetCalls++
+            if ($script:MajesticRegistryAttempt -eq 1 -and $Name -eq "game_disk") {
+                throw "injected after first registry mutation"
+            }
+        }
+        Mock Get-MajesticRegistryValuesFromRoot {
+            return [pscustomobject]@{ lastVisitedServerID = "ro3"; game_disk = "E:" }
+        }
+        $values = [pscustomobject]@{ lastVisitedServerID = "ro3"; game_disk = "E:" }
+
+        {
+            Set-MajesticRegistryValues -Config $script:MajesticClientConfig `
+                -RegistryValues $values
+        } | Should -Throw "*first registry mutation*"
+        $script:MajesticRegistryAttempt = 2
+        Set-MajesticRegistryValues -Config $script:MajesticClientConfig `
+            -RegistryValues $values
+
+        Should -Invoke Close-MajesticUserHive -Times 2 -Exactly
+        $script:MajesticRegistrySetCalls | Should -Be 4
+    }
+}
+
 Describe "Startup flow failure handling" {
     BeforeEach {
         $script:SimulationStatePath = Join-Path $TestDrive "startup-state.json"
@@ -1152,6 +1395,168 @@ Describe "Startup flow failure handling" {
         $sharedDb.total_bytes | Should -Be 789
         Should -Invoke Invoke-ClientEgsAggressiveSync -Times 1 -Exactly
         Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
+    }
+
+    It "logs Majestic readiness before Epic events and final ready" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $egsConfig = Join-Path $TestDrive "egs-enabled.json"
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json |
+            Set-Content -LiteralPath $egsConfig
+        $majesticConfig = Join-Path $TestDrive "majestic-enabled.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientMajesticSettingsSync {
+            return [pscustomobject]@{
+                PrefsLength = 555
+                RegistryValueCount = 2
+            }
+        }
+        Mock Invoke-ClientEgsManifestSync {
+            return [pscustomobject]@{
+                ManifestCount = 2
+                AdoptedAppCount = 0
+                DisplacedManifestCount = 0
+                LauncherEntryRemovalCount = 0
+                LauncherEntryImportCount = 2
+                LauncherFallbackAppCount = 0
+                IncompleteWarningCount = 0
+            }
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath -SyncConfigPath $egsConfig `
+            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        $logPath = Join-Path $TestDrive "client.log.jsonl"
+        $records = @(Get-Content -LiteralPath $logPath | ForEach-Object {
+            $_ | ConvertFrom-Json
+        })
+        $events = @($records.event)
+        [Array]::IndexOf($events, "majestic_settings_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "egs_manifest_sync_ready"))
+        [Array]::IndexOf($events, "egs_manifest_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "ready"))
+        $majestic = $records | Where-Object event -eq "majestic_settings_sync_ready"
+        $majestic.prefs_bytes | Should -Be 555
+        $majestic.registry_value_count | Should -Be 2
+        (Get-Content -LiteralPath $logPath -Raw) | Should -Not -Match `
+            'prefs_latest_base64|lastVisitedServerID|game_disk|ro3|E:'
+    }
+
+    It "keeps the session and ready when enabled Majestic sync warns" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $majesticConfig = Join-Path $TestDrive "majestic-enabled.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientMajesticSettingsSync {
+            throw "bundle verification failed"
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath `
+            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        @((Read-SimulationState).sessions).Count | Should -Be 1
+        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { ($_ | ConvertFrom-Json).event })
+        $events | Should -Contain "majestic_settings_sync_warning"
+        $events | Should -Contain "ready"
+        $events | Should -Not -Contain "target_disconnected_after_error"
+    }
+
+    It "does not invoke Majestic synchronization when the opt-in is disabled" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $majesticConfig = Join-Path $TestDrive "majestic-disabled.json"
+        @{
+            schema_version = 1
+            mode = "disabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientMajesticSettingsSync {
+            throw "disabled synchronization must not run"
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath `
+            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        Should -Invoke Invoke-ClientMajesticSettingsSync -Times 0 -Exactly
+        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { ($_ | ConvertFrom-Json).event })
+        $events | Should -Contain "ready"
+        $events | Should -Not -Contain "majestic_settings_sync_ready"
+        $events | Should -Not -Contain "majestic_settings_sync_warning"
     }
 }
 
