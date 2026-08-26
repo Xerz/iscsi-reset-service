@@ -48,8 +48,11 @@
 - Первый запуск publish workflow для tag `v0.5.0` (`33003589865`) остановился в новом validate
   step до reusable verification, сборки образа и создания GitHub Release. Удалённый ref
   отдельно подтверждён как annotated tag, указывающий на release commit с версией `0.5.0` и
-  непустыми highlights. Для повторного запуска checkout получил явный `fetch-tags`, а validate
-  проверяет `GITHUB_REF_TYPE`, tag object по `GITHUB_REF` и непустой body без shell pipeline.
+  непустыми highlights. Второй запуск (`33004212838`) остановился на том же step. Оба запуска
+  не создали release artifacts. Validate переведён в один Python step: он явно fetch-ит точный
+  remote tag ref, проверяет его тип, commit SHA, непустую аннотацию и версию, затем записывает
+  image/version outputs без shell tag parsing. Точный validator локально успешно выполнен
+  против опубликованного remote tag и записал ожидаемые `0.5.0` и GHCR repository outputs.
 
 ## Majestic Launcher verification state v0.4.14 — 2026-08-26
 

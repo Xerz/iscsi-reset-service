@@ -26,28 +26,42 @@ jobs:
         name: Validate tag and image repository
         shell: bash
         run: |
-          version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
-          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match project version v${version}" >&2
-            exit 1
-          fi
-          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "Release workflow requires a tag ref" >&2
-            exit 1
-          fi
-          tag_type="$(git cat-file -t "${GITHUB_REF}" 2>/dev/null || true)"
-          if [[ "${tag_type}" != "tag" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} must be annotated" >&2
-            exit 1
-          fi
-          tag_body="$(git for-each-ref --format='%(contents)' "${GITHUB_REF}")"
-          if [[ ! "${tag_body}" =~ [^[:space:]] ]]; then
-            echo "Annotated tag ${GITHUB_REF_NAME} must contain release highlights" >&2
-            exit 1
-          fi
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          echo "image_repository=ghcr.io/${owner}/iscsi-reset-service" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          python - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+          import tomllib
+
+          def git(*args: str) -> str:
+              return subprocess.check_output(["git", *args], text=True).strip()
+
+          ref_name = os.environ["GITHUB_REF_NAME"]
+          if os.environ["GITHUB_REF_TYPE"] != "tag":
+              raise SystemExit("Release workflow requires a tag ref")
+
+          tag_ref = f"refs/tags/{ref_name}"
+          subprocess.run(
+              ["git", "fetch", "--force", "origin", f"{tag_ref}:{tag_ref}"],
+              check=True,
+          )
+          if git("cat-file", "-t", tag_ref) != "tag":
+              raise SystemExit(f"Tag {ref_name} must be annotated")
+          if git("rev-list", "-n", "1", tag_ref) != os.environ["GITHUB_SHA"]:
+              raise SystemExit(f"Tag {ref_name} does not point to GITHUB_SHA")
+          if not git("for-each-ref", "--format=%(contents)", tag_ref):
+              raise SystemExit(f"Annotated tag {ref_name} must contain release highlights")
+
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"][
+              "version"
+          ]
+          if ref_name != f"v{version}":
+              raise SystemExit(f"Tag {ref_name} does not match project version v{version}")
+
+          owner = os.environ["GITHUB_REPOSITORY_OWNER"].lower()
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"image_repository=ghcr.io/{owner}/iscsi-reset-service\n")
+              output.write(f"version={version}\n")
+          PY
 
   verification:
     needs: validate
