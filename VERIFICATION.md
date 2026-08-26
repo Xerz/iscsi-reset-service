@@ -56,9 +56,21 @@
 - Третий publish workflow (`33004548418`) успешно завершил validate, Python, interaction,
   Windows PowerShell 5.1 и publish и создал семь assets. При проверке GitHub Release раздел
   «Что нового» содержал subject release commit: отдельный checkout publish job представил tag
-  ref как commit. Release пока не принят. Notes step теперь явно fetch-ит и проверяет remote
-  annotated tag перед чтением highlights; следующий publish обновит существующий release и
-  заменит assets через `--clobber`.
+  ref как commit. Notes step получил явный fetch и проверку remote annotated tag перед чтением
+  highlights.
+- Финальный publish workflow `33005051674` — успешно для validate, Python, interaction,
+  настоящего Windows PowerShell 5.1 и publish. Отдельный CI run `33005009413` также завершён
+  успешно. GitHub Release опубликован как обычный release `v0.5.0`: четыре ручных highlights,
+  шесть хронологических SHA-ссылок от `v0.4.12` и ровно семь assets.
+- Финальные assets скачаны в отдельный временный каталог. Все шесть записей `SHA256SUMS`
+  прошли `shasum -a 256 -c`; четыре PowerShell-файла byte-for-byte совпали с release tag.
+  TrueNAS YAML прошёл `docker compose config`, содержит ровно два сервиса, два одинаковых
+  digest-pinned image и два management IP placeholder.
+- `image-digest.txt`, оба `image:` в YAML и release body совпадают:
+  `ghcr.io/xerz/iscsi-reset-service@sha256:c7e63c03c3156d2df81403db8299d39db38d83cdacbab3b5c1f4b66988892dfb`.
+  Анонимный GHCR manifest inspect вернул `403`, поэтому registry manifest локально не скачан.
+  Публичная GitHub SLSA provenance attestation найдена и содержит точный subject name и этот
+  SHA-256 digest.
 
 ## Majestic Launcher verification state v0.4.14 — 2026-08-26
 
