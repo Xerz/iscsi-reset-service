@@ -16,6 +16,8 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -26,6 +28,15 @@ jobs:
           version="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match project version v${version}" >&2
+            exit 1
+          fi
+          if [[ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} must be annotated" >&2
+            exit 1
+          fi
+          if ! git for-each-ref --format='%(contents)' "refs/tags/${GITHUB_REF_NAME}" |
+            grep -q '[^[:space:]]'; then
+            echo "Annotated tag ${GITHUB_REF_NAME} must contain release highlights" >&2
             exit 1
           fi
           owner="${GITHUB_REPOSITORY_OWNER,,}"
@@ -49,6 +60,8 @@ jobs:
       IMAGE_REPOSITORY: ${{ needs.validate.outputs.image_repository }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -115,16 +128,37 @@ jobs:
           IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
         shell: bash
         run: |
-          printf '%s\n' \
-            "Контейнер: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" \
-            "" \
-            "Скачайте все семь приложенных файлов в один каталог и до установки обязательно выполните: sha256sum --check SHA256SUMS" \
-            "Файл ${BUNDLE_NAME} уже содержит неизменяемый digest образа; перед установкой замените management IP и пути /mnt/tank для своей системы." \
-            "image-digest.txt содержит полную ссылку на тот же образ, а SHA256SUMS проверяет YAML, digest-файл и четыре PowerShell-скрипта." \
-            "" \
-            "Для компьютера-издателя нужны Install-IscsiReleasePublisher.ps1 и Publish-IscsiRelease.ps1. Файл publisher.json не входит в релиз: скачайте его из панели управления своей установки." \
-            "Для каждого игрового ПК нужны Install-IscsiResetClient.ps1 и Reset-And-Connect.ps1." \
-            > dist/release-notes.md
+          current_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          previous_tag="$(
+            git tag --merged "${current_commit}" --sort=-version:refname |
+              awk -v current="${GITHUB_REF_NAME}" \
+                '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != current { print; exit }'
+          )"
+          if [[ -z "${previous_tag}" ]]; then
+            echo "No previous semver tag found in ${GITHUB_REF_NAME} history" >&2
+            exit 1
+          fi
+
+          {
+            printf '%s\n\n' "## Что нового"
+            git for-each-ref --format='%(contents)' "refs/tags/${GITHUB_REF_NAME}"
+            printf '\n%s\n\n' "## Коммиты"
+            while IFS=$'\t' read -r sha subject; do
+              short_sha="${sha:0:7}"
+              printf -- '- [`%s`](%s/%s/commit/%s) %s\n' \
+                "${short_sha}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${sha}" "${subject}"
+            done < <(git log --reverse --format='%H%x09%s' "${previous_tag}..${current_commit}")
+            printf '\n%s\n\n' "## Комплект выпуска"
+            printf '%s\n' \
+              "Контейнер: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" \
+              "" \
+              "Скачайте все семь приложенных файлов в один каталог и выполните: \`sha256sum --check SHA256SUMS\`." \
+              "Файл \`${BUNDLE_NAME}\` содержит неизменяемый digest образа; перед установкой замените management IP и пути \`/mnt/tank\` для своей системы." \
+              "Файл \`image-digest.txt\` содержит полную ссылку на тот же образ, а \`SHA256SUMS\` проверяет YAML, digest-файл и четыре PowerShell-скрипта." \
+              "" \
+              "Publisher: \`Install-IscsiReleasePublisher.ps1\` и \`Publish-IscsiRelease.ps1\`. Файл \`publisher.json\` скачивается из Management UI своей установки." \
+              "Клиент: \`Install-IscsiResetClient.ps1\` и \`Reset-And-Connect.ps1\`."
+          } > dist/release-notes.md
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \
               --title "iSCSI Reset Service ${GITHUB_REF_NAME}" \

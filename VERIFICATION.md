@@ -1,5 +1,51 @@
 # Verification record
 
+## Release preparation v0.5.0 — 2026-08-27
+
+### Физическое подтверждение оператора
+
+- После внедрения постоянного Majestic backup junction оператор проверил актуальную сборку на
+  игровом компьютере: Majestic Launcher и игра запускаются, повторная загрузка или полная
+  проверка игровых файлов не выполняется. Это подтверждение относится к проверенному
+  оператором сценарию и не заменяет остальные Windows/TrueNAS случаи из `TEST-PLAN.md`.
+
+### Изменения выпуска
+
+- README сокращён и переведён на прямые инструкции. Оставлены по одному полному примеру
+  установки Publisher и клиента с Epic `Aggressive` и Majestic `Enabled`; 13 диагностических
+  случаев оформлены отдельными раскрывающимися блоками.
+- Версия проекта повышена до `0.5.0`. Publish workflow требует непустой annotated tag,
+  использует его содержимое как release highlights и автоматически добавляет хронологический
+  список коммитов после предыдущего semver-тега.
+
+### Проверки подготовки выпуска
+
+- Структурная проверка README — успешно: ровно один вызов каждого установщика, оба содержат
+  Epic `Aggressive` и Majestic `Enabled`; 13 пар `<details>/<summary>` сбалансированы, все
+  относительные Markdown-ссылки существуют. Обе внешние ссылки на документацию TrueNAS 25.10
+  успешно открыты с `curl --location --fail`.
+- Версия `0.5.0` совпадает в `pyproject.toml`, package `__version__` и заголовке README;
+  `.github/workflows/publish.yml` успешно разобран YAML parser. Алгоритм истории выпуска выбрал
+  `v0.4.12` предыдущим semver-тегом и вернул два текущих функциональных коммита в
+  хронологическом порядке. `v0.4.12` подтверждён как annotated tag.
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  1.95 секунды.
+- `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose config --quiet` — успешно.
+- Локально сгенерированный v0.5.0 TrueNAS YAML успешно прошёл `docker compose config`; в нём
+  подтверждены два сервиса, два одинаковых digest-pinned `image` и два management IP
+  placeholder.
+- Parser всех production/test `.ps1` и полный Pester 5.7.1 в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`
+  (`sha256:4be726730a1f69796dfc86d2531ddbdf662bebbaa4edc47c4111c2463fe32b9a`) —
+  **156 passed, 0 failed, 1 skipped** из 157 за 17.6 секунды. Linux/amd64 PowerShell
+  выполнялся через эмуляцию на arm64 Docker host; пропущена Windows-only ACL проверка. Это не
+  Windows PowerShell 5.1.
+- `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed** с версией `0.5.0`; после проверки выполнен
+  `docker compose down --volumes`.
+
 ## Majestic Launcher verification state v0.4.14 — 2026-08-26
 
 ### Реализация
