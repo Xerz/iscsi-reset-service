@@ -53,6 +53,12 @@
   remote tag ref, проверяет его тип, commit SHA, непустую аннотацию и версию, затем записывает
   image/version outputs без shell tag parsing. Точный validator локально успешно выполнен
   против опубликованного remote tag и записал ожидаемые `0.5.0` и GHCR repository outputs.
+- Третий publish workflow (`33004548418`) успешно завершил validate, Python, interaction,
+  Windows PowerShell 5.1 и publish и создал семь assets. При проверке GitHub Release раздел
+  «Что нового» содержал subject release commit: отдельный checkout publish job представил tag
+  ref как commit. Release пока не принят. Notes step теперь явно fetch-ит и проверяет remote
+  annotated tag перед чтением highlights; следующий publish обновит существующий release и
+  заменит assets через `--clobber`.
 
 ## Majestic Launcher verification state v0.4.14 — 2026-08-26
 
