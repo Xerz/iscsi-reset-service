@@ -449,6 +449,7 @@ function Get-PublisherVolumeMappings {
         $mappings += [pscustomobject]@{
             Name = [string]$expected.name
             Disk = $matches[0]
+            DriveLetter = $letter
             RootPath = "$letter`:\"
         }
     }
@@ -464,9 +465,268 @@ function Get-PublisherEgsVolumeMappings {
 }
 
 function Get-PublisherMajesticBundlePath {
-    param([Parameter(Mandatory = $true)]$VolumeMapping)
+    param(
+        [Parameter(Mandatory = $true)]$VolumeMapping,
+        [ValidateSet(1, 2)][int]$SchemaVersion = 2
+    )
     return Join-Path $VolumeMapping.RootPath `
-        ".iscsi-reset\majestic-launcher-settings.v1.json"
+        ".iscsi-reset\majestic-launcher-settings.v$SchemaVersion.json"
+}
+
+function Get-PublisherMajesticBackupPayloadPath {
+    param(
+        [Parameter(Mandatory = $true)]$VolumeMapping,
+        [ValidateSet("active", "staging")][string]$Kind = "active"
+    )
+    $leaf = switch ($Kind) {
+        "active" { "majestic-launcher-backup" }
+        "staging" { ".majestic-launcher-backup.staging" }
+    }
+    return Join-Path $VolumeMapping.RootPath (".iscsi-reset\" + $leaf)
+}
+
+function Get-PublisherMajesticBackupPreviousPath {
+    param([Parameter(Mandatory = $true)][string]$BackupPath)
+    return Join-Path (Split-Path $BackupPath -Parent) `
+        ".iscsi-reset-majestic-backup.previous"
+}
+
+function Assert-PublisherMajesticHelperDirectory {
+    param(
+        [Parameter(Mandatory = $true)]$VolumeMapping,
+        [switch]$Create
+    )
+    $path = Join-Path $VolumeMapping.RootPath ".iscsi-reset"
+    if (-not (Test-Path -LiteralPath $path)) {
+        if (-not $Create) { return }
+        New-Item -ItemType Directory -Path $path | Out-Null
+    }
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher helper-owned root is unsafe"
+    }
+}
+
+function Test-MajesticBackupLeafName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 255 -or
+        $Name -in @(".", "..") -or $Name -match '[\\/:]' -or
+        [IO.Path]::GetFileName($Name) -cne $Name) {
+        return $false
+    }
+    return $true
+}
+
+function Get-PublisherMajesticFileBytes {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][Int64]$MaximumBytes,
+        [switch]$RequireJson
+    )
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        [Int64]$item.Length -lt 1 -or [Int64]$item.Length -gt $MaximumBytes) {
+        throw "Majestic Launcher $Description is unsafe or exceeds its size limit"
+    }
+    $bytes = [IO.File]::ReadAllBytes($item.FullName)
+    if ($RequireJson) {
+        try {
+            $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+            $strictUtf8.GetString($bytes) | ConvertFrom-Json | Out-Null
+        } catch {
+            throw "Majestic Launcher $Description is not valid UTF-8 JSON"
+        }
+    }
+    return $bytes
+}
+
+function New-PublisherMajesticFilePayload {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    return [ordered]@{
+        length = [Int64]$Bytes.Length
+        sha256 = Get-EgsSha256Hex $Bytes
+        base64 = [Convert]::ToBase64String($Bytes)
+    }
+}
+
+function Get-PublisherMajesticPrefsCapture {
+    param([Parameter(Mandatory = $true)]$Config)
+    $path = Join-Path $Config.ProfilePath `
+        "AppData\Roaming\majestic-launcher\prefs.latest.json"
+    $bytes = Get-PublisherMajesticFileBytes -Path $path `
+        -Description "prefs.latest.json" -MaximumBytes 1MB -RequireJson
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $prefs = $strictUtf8.GetString($bytes) | ConvertFrom-Json
+    } catch {
+        throw "Majestic Launcher prefs.latest.json is not valid UTF-8 JSON"
+    }
+    $gameDisk = ([string]$prefs.gameDisk).Trim().ToUpperInvariant()
+    if ($gameDisk -notmatch '^[D-Z]:$') {
+        throw "Majestic Launcher prefs.latest.json gameDisk is missing or invalid"
+    }
+    return [pscustomobject]@{ Bytes = $bytes; GameDisk = $gameDisk }
+}
+
+function Get-PublisherMajesticAnchorVolume {
+    param(
+        [Parameter(Mandatory = $true)]$VolumeMappings,
+        [Parameter(Mandatory = $true)][string]$GameDisk
+    )
+    $letter = $GameDisk.Substring(0, 1)
+    $matches = @($VolumeMappings | Where-Object {
+        $candidate = ([string]$_.DriveLetter).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            $root = [string]$_.RootPath
+            if ($root -match '^([D-Zd-z]):[\\/]') {
+                $candidate = $Matches[1].ToUpperInvariant()
+            }
+        }
+        $candidate -ceq $letter
+    })
+    if ($matches.Count -ne 1) {
+        throw "Majestic Launcher gameDisk must match exactly one Publisher volume"
+    }
+    return $matches[0]
+}
+
+function Get-PublisherMajesticBackupIndex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$MaximumFileCount = 64,
+        [Int64]$MaximumTotalBytes = 8GB,
+        [Int64]$MaximumFileBytes = 4GB
+    )
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or
+        (([int]$root.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher backup directory is unsafe"
+    }
+    $children = @(Get-ChildItem -LiteralPath $root.FullName -Force | Sort-Object Name)
+    if ($children.Count -lt 1 -or $children.Count -gt $MaximumFileCount) {
+        throw "Majestic Launcher backup directory file count is invalid"
+    }
+    $files = @()
+    $seen = @{}
+    $total = [Int64]0
+    foreach ($item in $children) {
+        $name = [string]$item.Name
+        if ($item.PSIsContainer) {
+            throw "Majestic Launcher backup directory contains an unsafe entry"
+        }
+        $length = [Int64]$item.Length
+        if (-not (Test-MajesticBackupLeafName $name) -or
+            $seen.ContainsKey($name) -or
+            (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $length -lt 0 -or $length -gt $MaximumFileBytes) {
+            throw "Majestic Launcher backup directory contains an unsafe entry"
+        }
+        $seen[$name] = $true
+        $total += $length
+        if ($total -gt $MaximumTotalBytes) {
+            throw "Majestic Launcher backup directory exceeds its size limit"
+        }
+        $files += [pscustomobject][ordered]@{
+            name = $name
+            length = $length
+            sha256 = Get-EgsFileSha256Hex -Path $item.FullName
+            creation_time_utc_ticks = [Int64]$item.CreationTimeUtc.Ticks
+            last_write_time_utc_ticks = [Int64]$item.LastWriteTimeUtc.Ticks
+        }
+    }
+    return [pscustomobject]@{
+        SourcePath = $root.FullName
+        Files = @($files)
+        FileCount = [int]$files.Count
+        TotalBytes = $total
+    }
+}
+
+function Get-PublisherMajesticBackupMetadata {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$MaximumFileCount = 64,
+        [Int64]$MaximumTotalBytes = 8GB,
+        [Int64]$MaximumFileBytes = 4GB
+    )
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or
+        (([int]$root.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher backup payload directory is unsafe"
+    }
+    $children = @(Get-ChildItem -LiteralPath $root.FullName -Force | Sort-Object Name)
+    if ($children.Count -lt 1 -or $children.Count -gt $MaximumFileCount) {
+        throw "Majestic Launcher backup directory file count is invalid"
+    }
+    $files = @{}
+    $total = [Int64]0
+    foreach ($item in $children) {
+        $name = [string]$item.Name
+        $length = [Int64]$item.Length
+        if ($item.PSIsContainer -or -not (Test-MajesticBackupLeafName $name) -or
+            $files.ContainsKey($name) -or
+            (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $length -lt 0 -or $length -gt $MaximumFileBytes) {
+            throw "Majestic Launcher backup directory contains an unsafe entry"
+        }
+        $files[$name] = $length
+        $total += $length
+        if ($total -gt $MaximumTotalBytes) {
+            throw "Majestic Launcher backup directory exceeds its size limit"
+        }
+    }
+    return [pscustomobject]@{
+        Path = $root.FullName
+        Files = $files
+        FileCount = [int]$children.Count
+        TotalBytes = $total
+    }
+}
+
+function Assert-PublisherMajesticBackupMap {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$ExpectedBackupPath,
+        [Parameter(Mandatory = $true)]$BackupMetadata
+    )
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $map = $strictUtf8.GetString($Bytes) | ConvertFrom-Json
+    } catch {
+        throw "Majestic Launcher backupMap.json is not valid UTF-8 JSON"
+    }
+    if ([int]$map.version -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$map.backupDir) -or
+        $null -eq $map.files) {
+        throw "Majestic Launcher backupMap.json metadata is invalid"
+    }
+    $declaredBackupPath = ConvertTo-EgsCanonicalPath ([string]$map.backupDir)
+    $capturedBackupPath = ConvertTo-EgsCanonicalPath $ExpectedBackupPath
+    if (-not $declaredBackupPath.Equals(
+        $capturedBackupPath, [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Majestic Launcher backupMap.json points to another backup directory"
+    }
+    $properties = @($map.files.PSObject.Properties)
+    if ($properties.Count -lt 1 -or $properties.Count -gt $BackupMetadata.FileCount) {
+        throw "Majestic Launcher backupMap.json file set is invalid"
+    }
+    foreach ($property in $properties) {
+        $name = [string]$property.Name
+        $metadata = $property.Value
+        $mtime = [Int64]0
+        if (-not (Test-MajesticBackupLeafName $name) -or
+            -not $BackupMetadata.Files.ContainsKey($name) -or
+            [Int64]$metadata.size -ne [Int64]$BackupMetadata.Files[$name] -or
+            -not [Int64]::TryParse([string]$metadata.mtimeNs, [ref]$mtime) -or
+            [string]$metadata.finalHash -notmatch '^[0-9A-Fa-f]{16}$') {
+            throw "Majestic Launcher backupMap.json contains invalid file metadata"
+        }
+    }
+    return $map
 }
 
 function Get-PublisherMajesticBundleBytes {
@@ -479,51 +739,318 @@ function Get-PublisherMajesticBundleBytes {
         (([int]$profile.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
         throw "Majestic Launcher profile path is unsafe"
     }
-    $prefsPath = Join-Path $Config.ProfilePath `
-        "AppData\Roaming\majestic-launcher\prefs.latest.json"
-    $prefs = Get-Item -LiteralPath $prefsPath -Force -ErrorAction Stop
-    if ($prefs.PSIsContainer -or
-        (([int]$prefs.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
-        [Int64]$prefs.Length -lt 1 -or [Int64]$prefs.Length -gt 1MB) {
-        throw "Majestic Launcher prefs.latest.json is unsafe or exceeds 1 MiB"
+    $launcherRoot = Join-Path $Config.ProfilePath "AppData\Roaming\majestic-launcher"
+    $prefsCapture = Get-PublisherMajesticPrefsCapture -Config $Config
+    $prefsBytes = $prefsCapture.Bytes
+    $majesticBytes = Get-PublisherMajesticFileBytes `
+        -Path (Join-Path $launcherRoot "Multiplayer\majestic.json") `
+        -Description "Multiplayer\majestic.json" -MaximumBytes 1MB -RequireJson
+    $hashMapBytes = Get-PublisherMajesticFileBytes `
+        -Path (Join-Path $launcherRoot "hashMap_v3_RO.json") `
+        -Description "hashMap_v3_RO.json" -MaximumBytes 16MB -RequireJson
+    $hashMapGeneralBytes = Get-PublisherMajesticFileBytes `
+        -Path (Join-Path $launcherRoot "hashMap_v3.json") `
+        -Description "hashMap_v3.json" -MaximumBytes 16MB -RequireJson
+    $backupMapBytes = Get-PublisherMajesticFileBytes `
+        -Path (Join-Path $launcherRoot "backupMap.json") `
+        -Description "backupMap.json" -MaximumBytes 1MB -RequireJson
+    $backupPath = Join-Path $launcherRoot "Multiplayer\backup"
+    $backupItem = Get-Item -LiteralPath $backupPath -Force -ErrorAction Stop
+    if (-not $backupItem.PSIsContainer -or
+        (([int]$backupItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        throw "Majestic Launcher Publisher backup junction is not active"
     }
-    $prefsBytes = [IO.File]::ReadAllBytes($prefs.FullName)
-    try {
-        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
-        $strictUtf8.GetString($prefsBytes) | ConvertFrom-Json | Out-Null
-    } catch {
-        throw "Majestic Launcher prefs.latest.json is not valid UTF-8 JSON"
+    $backupMetadata = Get-PublisherMajesticBackupMetadata `
+        -Path (Get-PublisherMajesticLinkTarget -Path $backupPath)
+    $backupMap = Assert-PublisherMajesticBackupMap -Bytes $backupMapBytes `
+        -ExpectedBackupPath $backupPath -BackupMetadata $backupMetadata
+    $safeBackupFiles = [ordered]@{}
+    foreach ($property in @($backupMap.files.PSObject.Properties)) {
+        $safeBackupFiles[[string]$property.Name] = [ordered]@{
+            size = [Int64]$property.Value.size
+            mtimeNs = [string]$property.Value.mtimeNs
+            finalHash = [string]$property.Value.finalHash
+        }
     }
     $registry = Get-MajesticRegistryValues -Config $Config
     Assert-MajesticLauncherStopped
     $bundle = [ordered]@{
-        schema_version = 1
+        schema_version = 2
         config_revision = $ConfigRevision
-        prefs_latest_length = [Int64]$prefsBytes.Length
-        prefs_latest_sha256 = Get-EgsSha256Hex $prefsBytes
-        prefs_latest_base64 = [Convert]::ToBase64String($prefsBytes)
+        files = [ordered]@{
+            prefs_latest_json = New-PublisherMajesticFilePayload -Bytes $prefsBytes
+            multiplayer_majestic_json = New-PublisherMajesticFilePayload `
+                -Bytes $majesticBytes
+            hash_map_v3_ro_json = New-PublisherMajesticFilePayload -Bytes $hashMapBytes
+            hash_map_v3_json = New-PublisherMajesticFilePayload -Bytes $hashMapGeneralBytes
+        }
+        backup_map = [ordered]@{
+            version = [int]$backupMap.version
+            files = $safeBackupFiles
+        }
         registry = [ordered]@{
             lastVisitedServerID = [string]$registry.lastVisitedServerID
             game_disk = [string]$registry.game_disk
         }
     }
-    $json = $bundle | ConvertTo-Json -Depth 6 -Compress
+    $json = $bundle | ConvertTo-Json -Depth 8 -Compress
     return (New-Object Text.UTF8Encoding($false)).GetBytes($json)
+}
+
+function Remove-PublisherMajesticOwnedDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher helper-owned backup path is unsafe"
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "Majestic Launcher helper-owned backup path could not be removed"
+    }
+}
+
+function Remove-PublisherMajesticLinkStage {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        throw "Majestic Launcher Publisher junction staging path is unsafe"
+    }
+    [IO.Directory]::Delete($item.FullName, $false)
+    if ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        throw "Majestic Launcher Publisher junction staging path could not be removed"
+    }
+}
+
+function New-PublisherMajesticBackupJunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+    $itemType = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        "Junction"
+    } else {
+        "SymbolicLink"
+    }
+    New-Item -ItemType $itemType -Path $Path -Target $Target -ErrorAction Stop |
+        Out-Null
+}
+
+function Get-PublisherMajesticLinkTarget {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        throw "Majestic Launcher backup path is not a directory junction"
+    }
+    $target = [string](@($item.Target)[0])
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        throw "Majestic Launcher backup junction target cannot be read"
+    }
+    if (-not [IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path (Split-Path $item.FullName -Parent) $target
+    }
+    return ConvertTo-EgsCanonicalPath $target
+}
+
+function Assert-PublisherMajesticBackupCopy {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$BackupIndex
+    )
+    $metadata = Get-PublisherMajesticBackupMetadata -Path $Path
+    if ($metadata.FileCount -ne $BackupIndex.FileCount -or
+        $metadata.TotalBytes -ne $BackupIndex.TotalBytes) {
+        throw "Majestic Launcher backup copy verification failed"
+    }
+    foreach ($entry in @($BackupIndex.Files)) {
+        $target = Join-Path $Path ([string]$entry.name)
+        $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+        if ([Int64]$item.Length -ne [Int64]$entry.length -or
+            (Get-EgsFileSha256Hex -Path $target) -ne [string]$entry.sha256 -or
+            [Int64]$item.LastWriteTimeUtc.Ticks -ne
+                [Int64]$entry.last_write_time_utc_ticks -or
+            ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and
+                [Int64]$item.CreationTimeUtc.Ticks -ne
+                    [Int64]$entry.creation_time_utc_ticks)) {
+            throw "Majestic Launcher backup copy verification failed"
+        }
+    }
+    return $metadata
+}
+
+function Copy-PublisherMajesticBackupOnce {
+    param(
+        [Parameter(Mandatory = $true)]$BackupIndex,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    New-Item -ItemType Directory -Path $Destination -ErrorAction Stop | Out-Null
+    foreach ($entry in @($BackupIndex.Files)) {
+        $source = Join-Path $BackupIndex.SourcePath ([string]$entry.name)
+        $target = Join-Path $Destination ([string]$entry.name)
+        [IO.File]::Copy($source, $target, $false)
+        [IO.File]::SetLastWriteTimeUtc(
+            $target, [DateTime]::new([Int64]$entry.last_write_time_utc_ticks, [DateTimeKind]::Utc)
+        )
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+            [IO.File]::SetCreationTimeUtc(
+                $target,
+                [DateTime]::new([Int64]$entry.creation_time_utc_ticks, [DateTimeKind]::Utc)
+            )
+        }
+    }
+    Assert-PublisherMajesticBackupCopy -Path $Destination `
+        -BackupIndex $BackupIndex | Out-Null
+}
+
+function Ensure-PublisherMajesticBackupJunction {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$AnchorVolume
+    )
+    Assert-PublisherMajesticHelperDirectory -VolumeMapping $AnchorVolume -Create
+    $profileDirectory = [string]$Config.ProfilePath
+    foreach ($segment in @("", "AppData", "Roaming", "majestic-launcher", "Multiplayer")) {
+        if (-not [string]::IsNullOrEmpty($segment)) {
+            $profileDirectory = Join-Path $profileDirectory $segment
+        }
+        $profileItem = Get-Item -LiteralPath $profileDirectory -Force -ErrorAction Stop
+        if (-not $profileItem.PSIsContainer -or
+            (([int]$profileItem.Attributes -band
+                [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Majestic Launcher Publisher profile directory is unsafe"
+        }
+    }
+    $launcherRoot = Join-Path $Config.ProfilePath "AppData\Roaming\majestic-launcher"
+    $source = Join-Path $launcherRoot "Multiplayer\backup"
+    $active = Get-PublisherMajesticBackupPayloadPath -VolumeMapping $AnchorVolume
+    $staging = Get-PublisherMajesticBackupPayloadPath `
+        -VolumeMapping $AnchorVolume -Kind "staging"
+    $previous = Get-PublisherMajesticBackupPreviousPath -BackupPath $source
+    $junctionStage = Join-Path (Split-Path $source -Parent) `
+        ".iscsi-reset-majestic-backup.junction.staging"
+    $sourceItem = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+
+    if ($null -ne $sourceItem -and
+        (([int]$sourceItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        $target = Get-PublisherMajesticLinkTarget -Path $source
+        $expected = ConvertTo-EgsCanonicalPath $active
+        if (-not $target.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Majestic Launcher Publisher backup junction points to another directory"
+        }
+        $metadata = Get-PublisherMajesticBackupMetadata -Path $active
+        Remove-PublisherMajesticOwnedDirectory -Path $staging
+        Remove-PublisherMajesticLinkStage -Path $junctionStage
+        Remove-PublisherMajesticOwnedDirectory -Path $previous
+        return $metadata
+    }
+
+    if ($null -eq $sourceItem) {
+        $previousItem = Get-Item -LiteralPath $previous -Force -ErrorAction SilentlyContinue
+        if ($null -eq $previousItem) {
+            throw "Majestic Launcher Publisher backup migration state is incomplete"
+        }
+        if (-not $previousItem.PSIsContainer -or
+            (([int]$previousItem.Attributes -band
+                [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "Majestic Launcher Publisher backup recovery path is unsafe"
+        }
+        $sourceItem = $previousItem
+    } elseif (-not $sourceItem.PSIsContainer) {
+        throw "Majestic Launcher Publisher backup path is unsafe"
+    } elseif (Test-Path -LiteralPath $previous) {
+        throw "Majestic Launcher Publisher backup migration state is ambiguous"
+    }
+
+    $backupIndex = Get-PublisherMajesticBackupIndex -Path $sourceItem.FullName
+    Remove-PublisherMajesticOwnedDirectory -Path $staging
+    Remove-PublisherMajesticLinkStage -Path $junctionStage
+    $activeReady = $false
+    if (Test-Path -LiteralPath $active) {
+        try {
+            Assert-PublisherMajesticBackupCopy -Path $active `
+                -BackupIndex $backupIndex | Out-Null
+            $activeReady = $true
+        } catch {
+            Remove-PublisherMajesticOwnedDirectory -Path $active
+        }
+    }
+    if (-not $activeReady) {
+        Copy-PublisherMajesticBackupOnce -BackupIndex $backupIndex `
+            -Destination $staging
+        [IO.Directory]::Move($staging, $active)
+        Assert-PublisherMajesticBackupCopy -Path $active `
+            -BackupIndex $backupIndex | Out-Null
+    }
+    Assert-PublisherMajesticBackupCopy -Path $sourceItem.FullName `
+        -BackupIndex $backupIndex | Out-Null
+
+    try {
+        New-PublisherMajesticBackupJunction -Path $junctionStage -Target $active
+        $target = Get-PublisherMajesticLinkTarget -Path $junctionStage
+        if (-not $target.Equals(
+            (ConvertTo-EgsCanonicalPath $active), [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Majestic Launcher Publisher backup junction verification failed"
+        }
+        Get-PublisherMajesticBackupMetadata -Path $active | Out-Null
+        $sourceWasPrevious = $sourceItem.FullName.Equals(
+            (ConvertTo-EgsCanonicalPath $previous), [StringComparison]::OrdinalIgnoreCase
+        )
+        if (-not $sourceWasPrevious) {
+            [IO.Directory]::Move($sourceItem.FullName, $previous)
+        }
+        [IO.Directory]::Move($junctionStage, $source)
+        $target = Get-PublisherMajesticLinkTarget -Path $source
+        if (-not $target.Equals(
+            (ConvertTo-EgsCanonicalPath $active), [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "Majestic Launcher Publisher backup junction verification failed"
+        }
+        $metadata = Get-PublisherMajesticBackupMetadata -Path $active
+        Remove-PublisherMajesticOwnedDirectory -Path $previous
+        return $metadata
+    } catch {
+        $failed = $_
+        $link = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+        if ($null -ne $link -and
+            (([int]$link.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            [IO.Directory]::Delete($link.FullName, $false)
+        }
+        if (-not (Test-Path -LiteralPath $source) -and
+            (Test-Path -LiteralPath $previous)) {
+            [IO.Directory]::Move($previous, $source)
+        }
+        throw $failed
+    } finally {
+        Remove-PublisherMajesticOwnedDirectory -Path $staging
+        Remove-PublisherMajesticLinkStage -Path $junctionStage
+    }
 }
 
 function Remove-PublisherMajesticBundles {
     param([Parameter(Mandatory = $true)]$VolumeMappings)
     foreach ($mapping in $VolumeMappings) {
-        $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
-        if (Test-Path -LiteralPath $path) {
-            Remove-Item -LiteralPath $path -Force
+        Assert-PublisherMajesticHelperDirectory -VolumeMapping $mapping
+        foreach ($schemaVersion in @(1, 2)) {
+            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+                -SchemaVersion $schemaVersion
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Force
+            }
         }
     }
     foreach ($mapping in $VolumeMappings) {
-        if (Test-Path -LiteralPath (
-            Get-PublisherMajesticBundlePath -VolumeMapping $mapping
-        )) {
-            throw "Stale Majestic Launcher settings bundle could not be removed"
+        foreach ($schemaVersion in @(1, 2)) {
+            if (Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+                    -SchemaVersion $schemaVersion
+            )) {
+                throw "Stale Majestic Launcher settings bundle could not be removed"
+            }
         }
     }
 }
@@ -535,12 +1062,34 @@ function Export-PublisherMajesticBundles {
     )
     $expectedSha = Get-EgsSha256Hex $BundleBytes
     foreach ($mapping in $VolumeMappings) {
+        Assert-PublisherMajesticHelperDirectory -VolumeMapping $mapping -Create
+    }
+    foreach ($mapping in $VolumeMappings) {
+        $v2Path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+        Remove-Item -LiteralPath $v2Path -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($mapping in $VolumeMappings) {
+        if (Test-Path -LiteralPath (
+            Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+        )) { throw "Stale Majestic Launcher v2 marker could not be removed" }
+    }
+    foreach ($mapping in $VolumeMappings) {
         $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
         Write-PublisherEgsBytesAtomic -Path $path -Bytes $BundleBytes
         $written = [IO.File]::ReadAllBytes($path)
         if ((Get-EgsSha256Hex $written) -ne $expectedSha -or
             $written.Length -ne $BundleBytes.Length) {
             throw "Majestic Launcher settings bundle verification failed"
+        }
+    }
+    foreach ($mapping in $VolumeMappings) {
+        $legacyPath = Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+            -SchemaVersion 1
+        if (Test-Path -LiteralPath $legacyPath) {
+            Remove-Item -LiteralPath $legacyPath -Force
+        }
+        if (Test-Path -LiteralPath $legacyPath) {
+            throw "Legacy Majestic Launcher settings bundle could not be removed"
         }
     }
     Assert-MajesticLauncherStopped
@@ -559,6 +1108,20 @@ function Invoke-PublisherMajesticSync {
     }
     try {
         Stop-MajesticLauncherProcesses
+    } catch {
+        $stopFailure = $_
+        try { Remove-PublisherMajesticBundles -VolumeMappings $VolumeMappings } catch {
+            throw "Majestic Launcher stop failed and stale bundle cleanup failed"
+        }
+        Write-Warning "Majestic Launcher settings were not exported: $($stopFailure.Exception.Message)"
+        return
+    }
+    $prefs = Get-PublisherMajesticPrefsCapture -Config $Config
+    $anchor = Get-PublisherMajesticAnchorVolume -VolumeMappings $VolumeMappings `
+        -GameDisk $prefs.GameDisk
+    Ensure-PublisherMajesticBackupJunction -Config $Config `
+        -AnchorVolume $anchor | Out-Null
+    try {
         $bytes = Get-PublisherMajesticBundleBytes -Config $Config `
             -ConfigRevision ([string]$Manifest.config_revision)
         Export-PublisherMajesticBundles -VolumeMappings $VolumeMappings `

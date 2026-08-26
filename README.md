@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.4.13
+# iSCSI Reset Service v0.4.14
 
 iSCSI Reset Service публикует согласованный набор снимков ZFS с игровых дисков и перед каждым
 запуском игрового ПК возвращает его отдельные записываемые клоны к чистому состоянию. Один
@@ -820,30 +820,63 @@ Reset API возвращает только portal, собственную це�
 
 ### Синхронизация настроек Majestic Launcher
 
-Режим `-MajesticLauncherSettingsSync Enabled` переносит только точные bytes файла
-`%APPDATA%\majestic-launcher\prefs.latest.json` и два строковых значения
-`HKCU\Software\MAJESTIC-LAUNCHER`: `lastVisitedServerID` и `game_disk`. Содержимое JSON и
-буква `game_disk` не преобразуются: Publisher и игровые ПК должны использовать одинаковые
-буквы игровых дисков. Размер prefs ограничен 1 MiB.
+Режим `-MajesticLauncherSettingsSync Enabled` переносит точные bytes файлов
+`%APPDATA%\majestic-launcher\prefs.latest.json`, `Multiplayer\majestic.json`,
+`hashMap_v3.json` и `hashMap_v3_RO.json`, поля `version/files` из `backupMap.json`, каталог
+`Multiplayer\backup`, а также два строковых значения `HKCU\Software\MAJESTIC-LAUNCHER`:
+`lastVisitedServerID` и
+`game_disk`. Содержимое и буквы дисков не преобразуются, включая `name` и пути из
+`majestic.json`. Единственное намеренное изменение — `backupDir` в клиентском `backupMap.json`:
+оно указывает на backup-каталог сохранённого клиентского профиля, а `version`, `files`, размеры,
+`mtimeNs` и `finalHash` сохраняются. Размер prefs, `majestic.json` и `backupMap.json` ограничен
+1 MiB каждый, каждый hash map — 16 MiB.
 
-Перед `Disconnect` Publisher корректно закрывает `Majestic Launcher.exe`, при необходимости
-завершает оставшийся процесс и записывает одинаковый проверенный
-`.iscsi-reset\majestic-launcher-settings.v1.json` на каждый master-том. Bundle содержит
-Base64/SHA-256 точного prefs и два разрешённых значения, но не содержит SID, пути профиля,
-Cookies, Session Storage или авторизацию. При отключённом режиме старые helper-generated
-Majestic bundles удаляются.
+Перед `Disconnect` Publisher закрывает `Majestic Launcher.exe` и записывает одинаковый bundle
+`.iscsi-reset\majestic-launcher-settings.v2.json` на каждый master-том. Bundle schema 2 содержит
+Base64/SHA-256 четырёх точных файлов, безопасные поля backup map и два
+разрешённых значения, но не SID, путь профиля, исходный `backupDir`, Cookies, Session Storage
+или авторизацию. Том-якорь определяется только по корневому полю
+`prefs.latest.json.gameDisk` формата `D:`–`Z:`: `gameInstall.persisted.path`, `majestic.json` и
+registry `game_disk` для выбора не используются. Значение registry при этом по-прежнему
+переносится буквально.
 
-Клиент применяет bundle после доказанной проверки и монтирования iSCSI-томов, но до
-синхронизации Epic и локального события `ready`. Startup-задача остаётся под `SYSTEM`: helper
-пишет в сохранённый SID игрового пользователя через `HKEY_USERS`, а до его входа временно
-загружает `NTUSER.DAT`. Файл заменяется атомарно только после записи и проверки реестра. Успех
-даёт `majestic_settings_sync_ready`; отсутствующий, различающийся или повреждённый bundle,
-ошибка профиля либо невозможность остановить Launcher дают `majestic_settings_sync_warning`,
-но не отключают проверенную iSCSI-session и не блокируют `ready`. Следующий запуск повторяет
-операцию идемпотентно.
+При первом `Disconnect` обычный Publisher-каталог `Multiplayer\backup` один раз копируется в
+`<gameDisk>\.iscsi-reset\majestic-launcher-backup` с проверкой длины, SHA-256 и NTFS timestamps,
+после чего исходный путь атомарно заменяется постоянным Windows directory junction на этот
+каталог. Junction — единственный marker завершённой миграции; published backup versions нет.
+Повторные публикации выполняют только быструю проверку цели junction, обычных файлов верхнего
+уровня, размеров и `backupMap.json`, не копируют и не хешируют 2.5–3 GiB. Разрешено не более 64
+файлов, 4 GiB на файл и 8 GiB суммарно; подкаталоги и reparse points запрещены. Временные
+`.staging`/`.previous` очищаются при успешной миграции или retry. Неоднозначная миграция,
+неверный/dangling Publisher junction либо неподтверждённая очистка staging блокируют
+`Disconnect` до offline.
 
-Этот режим не переносит авторизацию или состояние проверки игры. Их нельзя добавлять в bundle
-без отдельного анализа формата и привязки защищённых данных к пользователю или машине.
+После успешной записи v2 на все тома удаляется legacy v1. Disabled и обычная ошибка
+capture/write очищают только v1/v2 bundles: постоянный backup payload и Publisher junction
+сохраняются.
+
+Клиент применяет состояние после проверки и монтирования iSCSI-томов, но до Epic и `ready`.
+Startup-задача остаётся под `SYSTEM`: helper пишет в сохранённый SID через `HKEY_USERS`, а до
+входа пользователя временно загружает `NTUSER.DAT`. Чтобы не копировать несколько GiB после
+каждой перезагрузки, `%APPDATA%\majestic-launcher\Multiplayer\backup` становится Windows
+directory junction на `<prefs.gameDisk>\.iscsi-reset\majestic-launcher-backup`. Клиент требует,
+чтобы ровно один смонтированный iSCSI-том соответствовал этой букве, и быстро сверяет цель,
+лимиты, имена и размеры из backup map без полного SHA-256. Правильный существующий junction не
+переставляется; отсутствующий, неверный или старый обычный локальный backup-каталог заменяется
+один раз. Отсутствие `gameDisk`-тома даёт warning и не блокирует `ready`.
+
+Пять малых файлов сначала проходят staging. Оба прежних hash map удаляются из активного пути,
+затем применяются реестр, prefs, `majestic.json`, junction и переписанный `backupMap.json`;
+`hashMap_v3.json`, а затем `hashMap_v3_RO.json` становятся на место последними как markers
+завершённой проверки. При частичной ошибке оба marker удаляются, а следующий reset повторяет
+согласование. Успех даёт `majestic_settings_sync_ready`; ошибка даёт
+`majestic_settings_sync_warning`, но не отключает проверенную iSCSI-session и не блокирует
+`ready`.
+
+Перенос обоих hash map, `backupMap.json` и backup payload остаётся экспериментальным до
+физической проверки с текущей версией Launcher. Другие имена/регионы hash map автоматически не
+обнаруживаются. Режим не переносит `mods.bin`, авторизацию, Chromium Cache, Local Storage или
+Session Storage.
 
 ### Синхронизация Epic Games Launcher
 

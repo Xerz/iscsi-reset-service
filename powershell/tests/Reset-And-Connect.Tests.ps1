@@ -775,10 +775,21 @@ Describe "Majestic Launcher client settings sync" {
         if ($null -eq (Get-Command reg.exe -ErrorAction SilentlyContinue)) {
             function global:reg.exe { }
         }
+        function New-TestMajesticFilePayload {
+            param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+            return [ordered]@{
+                length = $Bytes.Length
+                sha256 = Get-EgsSha256Hex $Bytes
+                base64 = [Convert]::ToBase64String($Bytes)
+            }
+        }
     }
 
     BeforeEach {
         $script:MajesticClientProfile = Join-Path $TestDrive "client-profile"
+        if (Test-Path -LiteralPath $script:MajesticClientProfile) {
+            Remove-Item -LiteralPath $script:MajesticClientProfile -Recurse -Force
+        }
         New-Item -ItemType Directory -Path $script:MajesticClientProfile -Force | Out-Null
         Set-Content -LiteralPath (Join-Path $script:MajesticClientProfile "NTUSER.DAT") `
             -Value "hive"
@@ -789,19 +800,58 @@ Describe "Majestic Launcher client settings sync" {
             ProfilePath = $script:MajesticClientProfile
         }
         $script:MajesticClientPrefs = [Text.Encoding]::UTF8.GetBytes(
-            '{"volume":0.25,"fullscreen":true,"gameDisk":"E:"}'
+            '{"windowState":{"v2":{"main":{"maximized":true}}},"selectedProject":"ro","gameInstall":{"persisted":{"source":"custom","path":"E:\\SteamLibrary\\steamapps\\common\\Grand Theft Auto V"}},"gameDisk":"E:","settings":{"lastVisitedServerIdRo":"ro3"}}'
         )
+        $script:MajesticClientConfigBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"gtapath":"E:\\SteamLibrary\\GTA V","name":"xrzvs"}'
+        )
+        $script:MajesticClientHashMap = [Text.Encoding]::UTF8.GetBytes(
+            '{"GTA5.exe":"verification-hash","update.rpf":"other-hash"}'
+        )
+        $script:MajesticClientGeneralHashMap = [Text.Encoding]::UTF8.GetBytes(
+            '{"GTA5.exe":"general-hash","PlayGTAV.exe":"other-general-hash"}'
+        )
+        $script:MajesticClientBackupFiles = [ordered]@{
+            "GTA5.exe" = [byte[]](1, 2, 3, 4, 5)
+            "680a1b3170ad45a89f750f4ad48c0b21.bin" = [byte[]](6, 7, 8)
+            "extra.bin" = [byte[]](9, 10, 11, 12)
+        }
+        $backupMap = [ordered]@{
+            version = 1
+            backupDir = "C:\Users\publisher\AppData\Roaming\majestic-launcher\Multiplayer\backup"
+            files = [ordered]@{
+                "GTA5.exe" = [ordered]@{
+                    size = 5; mtimeNs = "1787644592547527100"
+                    finalHash = "60694b13a70d4081"
+                }
+                "680a1b3170ad45a89f750f4ad48c0b21.bin" = [ordered]@{
+                    size = 3; mtimeNs = "1787673066827856900"
+                    finalHash = "a032e37c13c599b9"
+                }
+            }
+        } | ConvertTo-Json -Depth 6 -Compress
+        $script:MajesticClientBackupMap = [Text.Encoding]::UTF8.GetBytes($backupMap)
         $script:MajesticClientVolumes = @(
-            [pscustomobject]@{ name = "nvme"; drive_letter = "S"; TestRoot = (Join-Path $TestDrive "nvme") }
+            [pscustomobject]@{ name = "nvme"; drive_letter = "E"; TestRoot = (Join-Path $TestDrive "nvme") }
             [pscustomobject]@{ name = "archive"; drive_letter = "H"; TestRoot = (Join-Path $TestDrive "archive") }
             [pscustomobject]@{ name = "bonus"; drive_letter = "T"; TestRoot = (Join-Path $TestDrive "bonus") }
         )
         $bundle = [ordered]@{
-            schema_version = 1
+            schema_version = 2
             config_revision = "majestic-revision"
-            prefs_latest_length = $script:MajesticClientPrefs.Length
-            prefs_latest_sha256 = Get-EgsSha256Hex $script:MajesticClientPrefs
-            prefs_latest_base64 = [Convert]::ToBase64String($script:MajesticClientPrefs)
+            files = [ordered]@{
+                prefs_latest_json = New-TestMajesticFilePayload `
+                    -Bytes $script:MajesticClientPrefs
+                multiplayer_majestic_json = New-TestMajesticFilePayload `
+                    -Bytes $script:MajesticClientConfigBytes
+                hash_map_v3_ro_json = New-TestMajesticFilePayload `
+                    -Bytes $script:MajesticClientHashMap
+                hash_map_v3_json = New-TestMajesticFilePayload `
+                    -Bytes $script:MajesticClientGeneralHashMap
+            }
+            backup_map = ([Text.Encoding]::UTF8.GetString(
+                $script:MajesticClientBackupMap
+            ) | ConvertFrom-Json | Select-Object version, files)
             registry = [ordered]@{
                 lastVisitedServerID = "ro3"
                 game_disk = "E:"
@@ -812,8 +862,16 @@ Describe "Majestic Launcher client settings sync" {
             $directory = Join-Path $volume.TestRoot ".iscsi-reset"
             New-Item -ItemType Directory -Path $directory -Force | Out-Null
             [IO.File]::WriteAllBytes(
-                (Join-Path $directory "majestic-launcher-settings.v1.json"),
+                (Join-Path $directory "majestic-launcher-settings.v2.json"),
                 $script:MajesticClientBundleBytes
+            )
+        }
+        $payloadDirectory = Join-Path $script:MajesticClientVolumes[0].TestRoot `
+            ".iscsi-reset/majestic-launcher-backup"
+        New-Item -ItemType Directory -Path $payloadDirectory -Force | Out-Null
+        foreach ($entry in $script:MajesticClientBackupFiles.GetEnumerator()) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $payloadDirectory $entry.Key), $entry.Value
             )
         }
         Mock Get-MajesticVolumeRoot { return $ExpectedVolume.TestRoot }
@@ -827,13 +885,22 @@ Describe "Majestic Launcher client settings sync" {
 
         (Get-EgsSha256Hex $result.PrefsBytes) |
             Should -Be (Get-EgsSha256Hex $script:MajesticClientPrefs)
+        (Get-EgsSha256Hex $result.MajesticBytes) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientConfigBytes)
+        (Get-EgsSha256Hex $result.HashMapBytes) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientHashMap)
+        (Get-EgsSha256Hex $result.HashMapGeneralBytes) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientGeneralHashMap)
+        $result.BackupFileCount | Should -Be 3
+        $result.BackupTotalBytes | Should -Be 12
+        $result.GameDisk | Should -Be "E:"
         $result.Registry.lastVisitedServerID | Should -Be "ro3"
         $result.Registry.game_disk | Should -Be "E:"
     }
 
     It "rejects a missing, mismatched, or wrong-revision bundle" {
         $firstPath = Join-Path $script:MajesticClientVolumes[0].TestRoot `
-            ".iscsi-reset/majestic-launcher-settings.v1.json"
+            ".iscsi-reset/majestic-launcher-settings.v2.json"
         Remove-Item -LiteralPath $firstPath -Force
         {
             Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
@@ -853,11 +920,30 @@ Describe "Majestic Launcher client settings sync" {
                 -ConfigRevision "other-revision"
         } | Should -Throw "*metadata*"
 
+        $badHashBundle = [Text.Encoding]::UTF8.GetString(
+            $script:MajesticClientBundleBytes
+        ) | ConvertFrom-Json
+        $badHashBundle.files.hash_map_v3_ro_json.sha256 = (("0" * 64) -join "")
+        $badHashBytes = [Text.Encoding]::UTF8.GetBytes(
+            ($badHashBundle | ConvertTo-Json -Depth 8 -Compress)
+        )
+        foreach ($volume in $script:MajesticClientVolumes) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $volume.TestRoot `
+                    ".iscsi-reset/majestic-launcher-settings.v2.json"),
+                $badHashBytes
+            )
+        }
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*verification hash map payload verification failed*"
+
         $corrupt = [Text.Encoding]::UTF8.GetBytes('{not-json')
         foreach ($volume in $script:MajesticClientVolumes) {
             [IO.File]::WriteAllBytes(
                 (Join-Path $volume.TestRoot `
-                    ".iscsi-reset/majestic-launcher-settings.v1.json"),
+                    ".iscsi-reset/majestic-launcher-settings.v2.json"),
                 $corrupt
             )
         }
@@ -867,21 +953,162 @@ Describe "Majestic Launcher client settings sync" {
         } | Should -Throw "*not valid UTF-8 JSON*"
     }
 
-    It "stages prefs, writes the exact registry values, and atomically replaces the file" {
+    It "rejects a legacy v1 bundle instead of treating it as verification state" {
+        foreach ($volume in $script:MajesticClientVolumes) {
+            $directory = Join-Path $volume.TestRoot ".iscsi-reset"
+            Remove-Item -LiteralPath (
+                Join-Path $directory "majestic-launcher-settings.v2.json"
+            ) -Force
+            [IO.File]::WriteAllBytes(
+                (Join-Path $directory "majestic-launcher-settings.v1.json"),
+                [Text.Encoding]::UTF8.GetBytes('{"schema_version":1}')
+            )
+        }
+
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*missing*"
+    }
+
+    It "requires a safe payload only on the prefs gameDisk volume" {
+        $missingPath = Join-Path $script:MajesticClientVolumes[0].TestRoot `
+            ".iscsi-reset/majestic-launcher-backup/GTA5.exe"
+        Remove-Item -LiteralPath $missingPath -Force
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*does not match backup map*"
+
+        $isolated = Join-Path $TestDrive "majestic-payload-reparse"
+        New-Item -ItemType Directory -Path $isolated -Force | Out-Null
+        $outside = Join-Path $TestDrive "outside-backup.bin"
+        [IO.File]::WriteAllBytes($outside, [byte[]](1, 2, 3))
+        try {
+            New-Item -ItemType SymbolicLink -Path (Join-Path $isolated "linked.bin") `
+                -Target $outside -ErrorAction Stop | Out-Null
+        } catch {
+            Set-ItResult -Skipped -Because "Symbolic links are unavailable"
+            return
+        }
+        {
+            Assert-ClientMajesticBackupPayload -Path $isolated
+        } | Should -Throw "*verification failed*"
+    }
+
+    It "rejects a missing or ambiguous prefs gameDisk client volume" {
+        $withoutE = @($script:MajesticClientVolumes | Where-Object drive_letter -ne "E")
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $withoutE `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*exactly one mounted client volume*"
+
+        $duplicate = @($script:MajesticClientVolumes) + [pscustomobject]@{
+            name = "duplicate"; drive_letter = "E"; TestRoot = (Join-Path $TestDrive "dup-e")
+        }
+        New-Item -ItemType Directory -Path (
+            Join-Path $duplicate[-1].TestRoot ".iscsi-reset"
+        ) -Force | Out-Null
+        [IO.File]::WriteAllBytes(
+            (Join-Path $duplicate[-1].TestRoot `
+                ".iscsi-reset/majestic-launcher-settings.v2.json"),
+            $script:MajesticClientBundleBytes
+        )
+        {
+            Get-ClientMajesticBundle -ExpectedVolumes $duplicate `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*exactly one mounted client volume*"
+    }
+
+    It "enforces payload size limits and rejects target reparse points" {
+        $oversizedBytes = [byte[]](1..17)
+        $oversizedPayload = New-TestMajesticFilePayload -Bytes $oversizedBytes
+        {
+            ConvertFrom-MajesticFilePayload -Payload $oversizedPayload `
+                -Description "test payload" -MaximumBytes 16
+        } | Should -Throw "*payload verification failed*"
+
+        $launcherDirectory = Join-Path $script:MajesticClientProfile `
+            "AppData/Roaming/majestic-launcher"
+        New-Item -ItemType Directory -Path $launcherDirectory -Force | Out-Null
+        $outsideDirectory = Join-Path $TestDrive "outside-multiplayer"
+        New-Item -ItemType Directory -Path $outsideDirectory -Force | Out-Null
+        try {
+            New-Item -ItemType SymbolicLink `
+                -Path (Join-Path $launcherDirectory "Multiplayer") `
+                -Target $outsideDirectory -ErrorAction Stop | Out-Null
+        } catch {
+            Set-ItResult -Skipped -Because "Symbolic links are unavailable"
+            return
+        }
+        {
+            Get-MajesticProfileTargets -ProfilePath $script:MajesticClientProfile
+        } | Should -Throw "*target directory is unsafe*"
+    }
+
+    It "replaces files, rewrites backupDir, and commits both verification maps last" {
         Mock Set-MajesticRegistryValues { }
         $targetDirectory = Join-Path $script:MajesticClientProfile `
             "AppData/Roaming/majestic-launcher"
-        New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
-        $target = Join-Path $targetDirectory "prefs.latest.json"
-        [IO.File]::WriteAllBytes($target, [Text.Encoding]::UTF8.GetBytes('{"stale":true}'))
+        $multiplayerDirectory = Join-Path $targetDirectory "Multiplayer"
+        New-Item -ItemType Directory -Path $multiplayerDirectory -Force | Out-Null
+        $prefsTarget = Join-Path $targetDirectory "prefs.latest.json"
+        $majesticTarget = Join-Path $multiplayerDirectory "majestic.json"
+        $hashMapTarget = Join-Path $targetDirectory "hashMap_v3_RO.json"
+        $generalHashMapTarget = Join-Path $targetDirectory "hashMap_v3.json"
+        $backupMapTarget = Join-Path $targetDirectory "backupMap.json"
+        $backupDirectoryTarget = Join-Path $multiplayerDirectory "backup"
+        foreach ($target in @(
+            $prefsTarget, $majesticTarget, $hashMapTarget,
+            $generalHashMapTarget, $backupMapTarget
+        )) {
+            [IO.File]::WriteAllBytes(
+                $target,
+                [Text.Encoding]::UTF8.GetBytes('{"stale":true}')
+            )
+        }
+        $script:MajesticCommitOrder = @()
+        Mock Commit-MajesticFile {
+            $script:MajesticCommitOrder += Split-Path $TargetPath -Leaf
+            if (Test-Path -LiteralPath $TargetPath) {
+                Remove-Item -LiteralPath $TargetPath -Force
+            }
+            [IO.File]::Move($StagePath, $TargetPath)
+        }
 
         $result = Invoke-ClientMajesticSettingsSync `
             -Config $script:MajesticClientConfig `
             -ExpectedVolumes $script:MajesticClientVolumes `
             -ConfigRevision "majestic-revision"
 
-        (Get-EgsFileSha256Hex $target) |
+        (Get-EgsFileSha256Hex $prefsTarget) |
             Should -Be (Get-EgsSha256Hex $script:MajesticClientPrefs)
+        (Get-EgsFileSha256Hex $majesticTarget) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientConfigBytes)
+        (Get-EgsFileSha256Hex $hashMapTarget) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientHashMap)
+        (Get-EgsFileSha256Hex $generalHashMapTarget) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientGeneralHashMap)
+        $writtenBackupMap = Get-Content -LiteralPath $backupMapTarget -Raw |
+            ConvertFrom-Json
+        $writtenBackupMap.backupDir | Should -Be $backupDirectoryTarget
+        $writtenBackupMap.files."GTA5.exe".finalHash | Should -Be "60694b13a70d4081"
+        ((Get-Item -LiteralPath $backupDirectoryTarget -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+        $selectedPayload = Join-Path $script:MajesticClientVolumes[0].TestRoot `
+            ".iscsi-reset/majestic-launcher-backup/GTA5.exe"
+        $changedSourceBytes = [byte[]](21, 22, 23, 24, 25)
+        [IO.File]::WriteAllBytes($selectedPayload, $changedSourceBytes)
+        (Get-EgsFileSha256Hex (Join-Path $backupDirectoryTarget "GTA5.exe")) |
+            Should -Be (Get-EgsSha256Hex $changedSourceBytes)
+        $script:MajesticCommitOrder | Should -Be @(
+            "prefs.latest.json", "majestic.json", "backupMap.json",
+            "hashMap_v3.json", "hashMap_v3_RO.json"
+        )
+        $result.FileCount | Should -Be 5
+        $result.BackupFileCount | Should -Be 3
+        $result.BackupTotalBytes | Should -Be 12
+        $result.HashMapLength | Should -Be $script:MajesticClientHashMap.Length
         $result.RegistryValueCount | Should -Be 2
         Should -Invoke Set-MajesticRegistryValues -Times 1 -Exactly `
             -ParameterFilter {
@@ -890,10 +1117,99 @@ Describe "Majestic Launcher client settings sync" {
             }
     }
 
+    It "keeps an already-correct client junction without replacing it" {
+        $targetDirectory = Join-Path $script:MajesticClientProfile `
+            "AppData/Roaming/majestic-launcher/Multiplayer"
+        New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+        $junction = Join-Path $targetDirectory "backup"
+        $bundle = Get-ClientMajesticBundle `
+            -ExpectedVolumes $script:MajesticClientVolumes `
+            -ConfigRevision "majestic-revision"
+        Set-MajesticBackupJunction -Path $junction `
+            -SourcePath $bundle.BackupSourcePath -BackupMap $bundle.BackupMap
+        Mock New-MajesticBackupJunction { throw "junction must not be replaced" }
+
+        Set-MajesticBackupJunction -Path $junction `
+            -SourcePath $bundle.BackupSourcePath -BackupMap $bundle.BackupMap
+
+        Should -Invoke New-MajesticBackupJunction -Times 0 -Exactly
+        Assert-MajesticBackupJunction -Path $junction `
+            -SourcePath $bundle.BackupSourcePath -BackupMap $bundle.BackupMap
+    }
+
+    It "keeps the verification marker inactive after a <Phase> failure and retries" -ForEach @(
+        @{ Phase = "registry" }
+        @{ Phase = "prefs" }
+        @{ Phase = "majestic" }
+        @{ Phase = "backup_map" }
+        @{ Phase = "general_hash_map" }
+    ) {
+        $targetDirectory = Join-Path $script:MajesticClientProfile `
+            "AppData/Roaming/majestic-launcher"
+        $multiplayerDirectory = Join-Path $targetDirectory "Multiplayer"
+        New-Item -ItemType Directory -Path $multiplayerDirectory -Force | Out-Null
+        $hashMapTarget = Join-Path $targetDirectory "hashMap_v3_RO.json"
+        $generalHashMapTarget = Join-Path $targetDirectory "hashMap_v3.json"
+        [IO.File]::WriteAllBytes(
+            $hashMapTarget,
+            [Text.Encoding]::UTF8.GetBytes('{"old":"verification-state"}')
+        )
+        [IO.File]::WriteAllBytes(
+            $generalHashMapTarget,
+            [Text.Encoding]::UTF8.GetBytes('{"old":"general-state"}')
+        )
+        $script:MajesticFailurePhase = $Phase
+        Mock Set-MajesticRegistryValues {
+            if ($script:MajesticFailurePhase -eq "registry") {
+                throw "injected registry failure"
+            }
+        }
+        Mock Commit-MajesticFile {
+            if (Test-Path -LiteralPath $TargetPath) {
+                Remove-Item -LiteralPath $TargetPath -Force
+            }
+            [IO.File]::Move($StagePath, $TargetPath)
+            $leaf = Split-Path $TargetPath -Leaf
+            if (($script:MajesticFailurePhase -eq "prefs" -and
+                $leaf -eq "prefs.latest.json") -or
+                ($script:MajesticFailurePhase -eq "majestic" -and
+                $leaf -eq "majestic.json") -or
+                ($script:MajesticFailurePhase -eq "backup_map" -and
+                $leaf -eq "backupMap.json") -or
+                ($script:MajesticFailurePhase -eq "general_hash_map" -and
+                $leaf -eq "hashMap_v3.json")) {
+                throw "injected $($script:MajesticFailurePhase) failure"
+            }
+        }
+
+        {
+            Invoke-ClientMajesticSettingsSync `
+                -Config $script:MajesticClientConfig `
+                -ExpectedVolumes $script:MajesticClientVolumes `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*injected*failure*"
+        Test-Path -LiteralPath $hashMapTarget | Should -BeFalse
+        Test-Path -LiteralPath $generalHashMapTarget | Should -BeFalse
+
+        $script:MajesticFailurePhase = "none"
+        $result = Invoke-ClientMajesticSettingsSync `
+            -Config $script:MajesticClientConfig `
+            -ExpectedVolumes $script:MajesticClientVolumes `
+            -ConfigRevision "majestic-revision"
+
+        $result.FileCount | Should -Be 5
+        (Get-EgsFileSha256Hex $hashMapTarget) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientHashMap)
+        (Get-EgsFileSha256Hex $generalHashMapTarget) |
+            Should -Be (Get-EgsSha256Hex $script:MajesticClientGeneralHashMap)
+    }
+
     It "does not mutate the profile when Majestic Launcher cannot be stopped" {
         Mock Get-ClientMajesticBundle {
             return [pscustomobject]@{
                 PrefsBytes = $script:MajesticClientPrefs
+                MajesticBytes = $script:MajesticClientConfigBytes
+                HashMapBytes = $script:MajesticClientHashMap
                 Registry = [pscustomobject]@{
                     lastVisitedServerID = "ro3"
                     game_disk = "E:"
@@ -902,7 +1218,7 @@ Describe "Majestic Launcher client settings sync" {
             }
         }
         Mock Stop-MajesticLauncherProcesses { throw "launcher remained running" }
-        Mock Get-MajesticPrefsTargetPath { throw "profile mutation must not start" }
+        Mock Get-MajesticProfileTargets { throw "profile mutation must not start" }
         Mock Set-MajesticRegistryValues { throw "registry mutation must not start" }
 
         {
@@ -912,7 +1228,7 @@ Describe "Majestic Launcher client settings sync" {
                 -ConfigRevision "majestic-revision"
         } | Should -Throw "*remained running*"
 
-        Should -Invoke Get-MajesticPrefsTargetPath -Times 0 -Exactly
+        Should -Invoke Get-MajesticProfileTargets -Times 0 -Exactly
         Should -Invoke Set-MajesticRegistryValues -Times 0 -Exactly
     }
 
@@ -1432,6 +1748,11 @@ Describe "Startup flow failure handling" {
         Mock Invoke-ClientMajesticSettingsSync {
             return [pscustomobject]@{
                 PrefsLength = 555
+                HashMapLength = 101259
+                HashMapGeneralLength = 202518
+                BackupFileCount = 4
+                BackupTotalBytes = 2684354560
+                FileCount = 5
                 RegistryValueCount = 2
             }
         }
@@ -1463,9 +1784,14 @@ Describe "Startup flow failure handling" {
             Should -BeLessThan ([Array]::IndexOf($events, "ready"))
         $majestic = $records | Where-Object event -eq "majestic_settings_sync_ready"
         $majestic.prefs_bytes | Should -Be 555
+        $majestic.verification_hash_map_bytes | Should -Be 101259
+        $majestic.general_hash_map_bytes | Should -Be 202518
+        $majestic.backup_file_count | Should -Be 4
+        $majestic.backup_total_bytes | Should -Be 2684354560
+        $majestic.file_count | Should -Be 5
         $majestic.registry_value_count | Should -Be 2
         (Get-Content -LiteralPath $logPath -Raw) | Should -Not -Match `
-            'prefs_latest_base64|lastVisitedServerID|game_disk|ro3|E:'
+            'prefs_latest_base64|lastVisitedServerID|game_disk|ro3|E:|xrzvs|SteamLibrary'
     }
 
     It "keeps the session and ready when enabled Majestic sync warns" {
@@ -1499,6 +1825,61 @@ Describe "Startup flow failure handling" {
         }
         Mock Invoke-ClientMajesticSettingsSync {
             throw "bundle verification failed"
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath `
+            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        @((Read-SimulationState).sessions).Count | Should -Be 1
+        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
+            ForEach-Object { ($_ | ConvertFrom-Json).event })
+        $events | Should -Contain "majestic_settings_sync_warning"
+        $events | Should -Contain "ready"
+        $events | Should -Not -Contain "target_disconnected_after_error"
+        (Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") -Raw) |
+            Should -Not -Match "bundle verification failed|publisher-profile|SteamLibrary"
+    }
+
+    It "warns but still reaches ready when only legacy Majestic v1 bundles exist" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $majesticConfig = Join-Path $TestDrive "majestic-enabled-v1.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Get-MajesticVolumeRoot {
+            return Join-Path $TestDrive ("legacy-" + [string]$ExpectedVolume.name)
+        }
+        foreach ($name in @("ssd", "hdd")) {
+            $directory = Join-Path (Join-Path $TestDrive "legacy-$name") ".iscsi-reset"
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            Set-Content -LiteralPath (
+                Join-Path $directory "majestic-launcher-settings.v1.json"
+            ) -Value '{"schema_version":1}'
         }
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" `

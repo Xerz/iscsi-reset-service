@@ -1149,6 +1149,133 @@ function Get-MajesticVolumeRoot {
     return "${letter}:\"
 }
 
+function Get-ClientMajesticBackupPayloadPath {
+    param([Parameter(Mandatory = $true)]$ExpectedVolume)
+    return Join-Path (Get-MajesticVolumeRoot -ExpectedVolume $ExpectedVolume) `
+        ".iscsi-reset\majestic-launcher-backup"
+}
+
+function Test-ClientMajesticBackupLeafName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ([string]::IsNullOrWhiteSpace($Name) -or $Name.Length -gt 255 -or
+        $Name -in @(".", "..") -or $Name -match '[\\/:]' -or
+        [IO.Path]::GetFileName($Name) -cne $Name) {
+        return $false
+    }
+    return $true
+}
+
+function Assert-ClientMajesticBackupPayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        $BackupMap,
+        [int]$MaximumFileCount = 64,
+        [Int64]$MaximumTotalBytes = 8GB,
+        [Int64]$MaximumFileBytes = 4GB
+    )
+    $root = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or
+        (([int]$root.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher backup payload directory is unsafe"
+    }
+    $children = @(Get-ChildItem -LiteralPath $root.FullName -Force)
+    if ($children.Count -lt 1 -or $children.Count -gt $MaximumFileCount) {
+        throw "Majestic Launcher backup payload file set is invalid"
+    }
+    $files = @{}
+    $total = [Int64]0
+    foreach ($item in $children) {
+        $name = [string]$item.Name
+        $length = [Int64]$item.Length
+        if ($item.PSIsContainer -or -not (Test-ClientMajesticBackupLeafName $name) -or
+            $files.ContainsKey($name) -or
+            (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            $length -lt 0 -or $length -gt $MaximumFileBytes) {
+            throw "Majestic Launcher backup payload file verification failed"
+        }
+        $files[$name] = $length
+        $total += $length
+        if ($total -gt $MaximumTotalBytes) {
+            throw "Majestic Launcher backup payload exceeds its size limit"
+        }
+    }
+    if ($null -ne $BackupMap) {
+        foreach ($property in @($BackupMap.files.PSObject.Properties)) {
+            $name = [string]$property.Name
+            if (-not $files.ContainsKey($name) -or
+                [Int64]$property.Value.size -ne [Int64]$files[$name]) {
+                throw "Majestic Launcher backup payload does not match backup map"
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Path = $root.FullName
+        Files = $files
+        FileCount = [int]$children.Count
+        TotalBytes = $total
+    }
+}
+
+function ConvertFrom-ClientMajesticBackupMap {
+    param([Parameter(Mandatory = $true)]$Map)
+    $mapProperties = @($Map.PSObject.Properties.Name)
+    if ([int]$Map.version -ne 1 -or $null -eq $Map.files -or
+        $mapProperties.Count -ne 2 -or $mapProperties -notcontains "version" -or
+        $mapProperties -notcontains "files") {
+        throw "Majestic Launcher backup map metadata is invalid"
+    }
+    $properties = @($Map.files.PSObject.Properties)
+    if ($properties.Count -lt 1 -or $properties.Count -gt 64) {
+        throw "Majestic Launcher backup map file set is invalid"
+    }
+    foreach ($property in $properties) {
+        $metadata = $property.Value
+        $metadataProperties = @($metadata.PSObject.Properties.Name)
+        $mtime = [Int64]0
+        if (-not (Test-ClientMajesticBackupLeafName ([string]$property.Name)) -or
+            $metadataProperties.Count -ne 3 -or
+            $metadataProperties -notcontains "size" -or
+            $metadataProperties -notcontains "mtimeNs" -or
+            $metadataProperties -notcontains "finalHash" -or
+            [Int64]$metadata.size -lt 0 -or [Int64]$metadata.size -gt 4GB -or
+            -not [Int64]::TryParse([string]$metadata.mtimeNs, [ref]$mtime) -or
+            [string]$metadata.finalHash -notmatch '^[0-9A-Fa-f]{16}$') {
+            throw "Majestic Launcher backup map contains invalid file metadata"
+        }
+    }
+    return $Map
+}
+
+function Get-ClientMajesticGameDisk {
+    param([Parameter(Mandatory = $true)][byte[]]$PrefsBytes)
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $prefs = $strictUtf8.GetString($PrefsBytes) | ConvertFrom-Json
+    } catch {
+        throw "Majestic Launcher prefs payload is not valid UTF-8 JSON"
+    }
+    $gameDisk = ([string]$prefs.gameDisk).Trim().ToUpperInvariant()
+    if ($gameDisk -notmatch '^[D-Z]:$') {
+        throw "Majestic Launcher prefs gameDisk is missing or invalid"
+    }
+    return $gameDisk
+}
+
+function Get-ClientMajesticAnchorVolume {
+    param(
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)][string]$GameDisk
+    )
+    $letter = $GameDisk.Substring(0, 1)
+    $matches = @($ExpectedVolumes | Where-Object {
+        ([string]$_.drive_letter).Trim().ToUpperInvariant() -ceq $letter
+    })
+    if ($matches.Count -ne 1) {
+        throw "Majestic Launcher gameDisk must match exactly one mounted client volume"
+    }
+    return $matches[0]
+}
+
 function Get-ClientMajesticBundle {
     param(
         [Parameter(Mandatory = $true)]$ExpectedVolumes,
@@ -1161,9 +1288,14 @@ function Get-ClientMajesticBundle {
     $commonSha = ""
     foreach ($volume in $ExpectedVolumes) {
         $root = Get-MajesticVolumeRoot -ExpectedVolume $volume
-        $path = Join-Path $root ".iscsi-reset\majestic-launcher-settings.v1.json"
+        $path = Join-Path $root ".iscsi-reset\majestic-launcher-settings.v2.json"
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "Majestic Launcher settings bundle is missing"
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ((([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [Int64]$item.Length -lt 1 -or [Int64]$item.Length -gt 48MB) {
+            throw "Majestic Launcher settings bundle file is unsafe"
         }
         $bytes = [IO.File]::ReadAllBytes($path)
         $sha = Get-EgsSha256Hex $bytes
@@ -1180,27 +1312,32 @@ function Get-ClientMajesticBundle {
     } catch {
         throw "Majestic Launcher settings bundle is not valid UTF-8 JSON"
     }
-    if ([int]$bundle.schema_version -ne 1 -or
+    if ([int]$bundle.schema_version -ne 2 -or
         [string]$bundle.config_revision -cne $ConfigRevision -or
-        $null -eq $bundle.registry) {
+        $null -eq $bundle.files -or $null -eq $bundle.registry -or
+        $null -eq $bundle.backup_map -or
+        $bundle.PSObject.Properties.Name -contains "backup_directory") {
         throw "Majestic Launcher settings bundle metadata is invalid"
     }
-    try {
-        $prefsBytes = [Convert]::FromBase64String([string]$bundle.prefs_latest_base64)
-    } catch {
-        throw "Majestic Launcher prefs payload is not valid Base64"
-    }
-    if ($prefsBytes.Length -lt 1 -or $prefsBytes.Length -gt 1MB -or
-        [Int64]$bundle.prefs_latest_length -ne [Int64]$prefsBytes.Length -or
-        [string]$bundle.prefs_latest_sha256 -notmatch '^[0-9a-f]{64}$' -or
-        (Get-EgsSha256Hex $prefsBytes) -ne [string]$bundle.prefs_latest_sha256) {
-        throw "Majestic Launcher prefs payload verification failed"
-    }
-    try {
-        $strictUtf8.GetString($prefsBytes) | ConvertFrom-Json | Out-Null
-    } catch {
-        throw "Majestic Launcher prefs payload is not valid UTF-8 JSON"
-    }
+    $prefsBytes = ConvertFrom-MajesticFilePayload `
+        -Payload $bundle.files.prefs_latest_json -Description "prefs" `
+        -MaximumBytes 1MB -RequireJson
+    $majesticBytes = ConvertFrom-MajesticFilePayload `
+        -Payload $bundle.files.multiplayer_majestic_json -Description "majestic config" `
+        -MaximumBytes 1MB -RequireJson
+    $hashMapBytes = ConvertFrom-MajesticFilePayload `
+        -Payload $bundle.files.hash_map_v3_ro_json -Description "verification hash map" `
+        -MaximumBytes 16MB -RequireJson
+    $hashMapGeneralBytes = ConvertFrom-MajesticFilePayload `
+        -Payload $bundle.files.hash_map_v3_json -Description "general verification hash map" `
+        -MaximumBytes 16MB -RequireJson
+    $backupMap = ConvertFrom-ClientMajesticBackupMap -Map $bundle.backup_map
+    $prefsGameDisk = Get-ClientMajesticGameDisk -PrefsBytes $prefsBytes
+    $anchor = Get-ClientMajesticAnchorVolume -ExpectedVolumes $ExpectedVolumes `
+        -GameDisk $prefsGameDisk
+    $backupSourcePath = Get-ClientMajesticBackupPayloadPath -ExpectedVolume $anchor
+    $backupMetadata = Assert-ClientMajesticBackupPayload `
+        -Path $backupSourcePath -BackupMap $backupMap
     $lastServer = [string]$bundle.registry.lastVisitedServerID
     $gameDisk = [string]$bundle.registry.game_disk
     if ([string]::IsNullOrWhiteSpace($lastServer) -or $lastServer.Length -gt 1024 -or
@@ -1209,6 +1346,14 @@ function Get-ClientMajesticBundle {
     }
     return [pscustomobject]@{
         PrefsBytes = $prefsBytes
+        MajesticBytes = $majesticBytes
+        HashMapBytes = $hashMapBytes
+        HashMapGeneralBytes = $hashMapGeneralBytes
+        BackupMap = $backupMap
+        BackupSourcePath = $backupMetadata.Path
+        BackupFileCount = [int]$backupMetadata.FileCount
+        BackupTotalBytes = [Int64]$backupMetadata.TotalBytes
+        GameDisk = $prefsGameDisk
         Registry = [pscustomobject]@{
             lastVisitedServerID = $lastServer
             game_disk = $gameDisk
@@ -1217,7 +1362,39 @@ function Get-ClientMajesticBundle {
     }
 }
 
-function Get-MajesticPrefsTargetPath {
+function ConvertFrom-MajesticFilePayload {
+    param(
+        [Parameter(Mandatory = $true)]$Payload,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][Int64]$MaximumBytes,
+        [switch]$RequireJson
+    )
+    if ($null -eq $Payload) {
+        throw "Majestic Launcher $Description payload is missing"
+    }
+    try {
+        $bytes = [Convert]::FromBase64String([string]$Payload.base64)
+    } catch {
+        throw "Majestic Launcher $Description payload is not valid Base64"
+    }
+    if ($bytes.Length -lt 1 -or $bytes.Length -gt $MaximumBytes -or
+        [Int64]$Payload.length -ne [Int64]$bytes.Length -or
+        [string]$Payload.sha256 -notmatch '^[0-9a-f]{64}$' -or
+        (Get-EgsSha256Hex $bytes) -ne [string]$Payload.sha256) {
+        throw "Majestic Launcher $Description payload verification failed"
+    }
+    if ($RequireJson) {
+        try {
+            $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+            $strictUtf8.GetString($bytes) | ConvertFrom-Json | Out-Null
+        } catch {
+            throw "Majestic Launcher $Description payload is not valid UTF-8 JSON"
+        }
+    }
+    return $bytes
+}
+
+function Get-MajesticProfileTargets {
     param([Parameter(Mandatory = $true)][string]$ProfilePath)
     $profile = Get-Item -LiteralPath $ProfilePath -Force -ErrorAction Stop
     if (-not $profile.PSIsContainer -or
@@ -1238,29 +1415,206 @@ function Get-MajesticPrefsTargetPath {
             throw "Majestic Launcher target directory is unsafe"
         }
     }
-    $target = Join-Path $directory "prefs.latest.json"
-    if (Test-Path -LiteralPath $target) {
-        $item = Get-Item -LiteralPath $target -Force
-        if ($item.PSIsContainer -or
-            (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
-            throw "Majestic Launcher prefs target is unsafe"
+    $launcherDirectory = $directory
+    $multiplayerDirectory = Join-Path $launcherDirectory "Multiplayer"
+    if (Test-Path -LiteralPath $multiplayerDirectory) {
+        $item = Get-Item -LiteralPath $multiplayerDirectory -Force
+    } else {
+        New-Item -ItemType Directory -Path $multiplayerDirectory | Out-Null
+        $item = Get-Item -LiteralPath $multiplayerDirectory -Force
+    }
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Majestic Launcher Multiplayer target directory is unsafe"
+    }
+    $targets = [ordered]@{
+        Prefs = Join-Path $launcherDirectory "prefs.latest.json"
+        Majestic = Join-Path $multiplayerDirectory "majestic.json"
+        HashMap = Join-Path $launcherDirectory "hashMap_v3_RO.json"
+        HashMapGeneral = Join-Path $launcherDirectory "hashMap_v3.json"
+        BackupMap = Join-Path $launcherDirectory "backupMap.json"
+        BackupDirectory = Join-Path $multiplayerDirectory "backup"
+    }
+    foreach ($target in @(
+        $targets.Prefs, $targets.Majestic, $targets.HashMap,
+        $targets.HashMapGeneral, $targets.BackupMap
+    )) {
+        if (Test-Path -LiteralPath $target) {
+            $item = Get-Item -LiteralPath $target -Force
+            if ($item.PSIsContainer -or
+                (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                throw "Majestic Launcher target file is unsafe"
+            }
         }
     }
-    return $target
+    if (Test-Path -LiteralPath $targets.BackupDirectory) {
+        $backupItem = Get-Item -LiteralPath $targets.BackupDirectory -Force
+        if (-not $backupItem.PSIsContainer) {
+            throw "Majestic Launcher target backup path is unsafe"
+        }
+    }
+    return [pscustomobject]$targets
 }
 
-function Commit-MajesticPrefsFile {
+function Commit-MajesticFile {
     param(
         [Parameter(Mandatory = $true)][string]$StagePath,
         [Parameter(Mandatory = $true)][string]$TargetPath
     )
-    $backup = Join-Path (Split-Path $TargetPath -Parent) `
-        (".majestic-prefs-" + [Guid]::NewGuid().ToString("N") + ".bak")
-    if (Test-Path -LiteralPath $TargetPath) {
-        [IO.File]::Replace($StagePath, $TargetPath, $backup)
+    $backup = Join-Path (Split-Path $TargetPath -Parent) (
+        ".majestic-file-" + [Guid]::NewGuid().ToString("N") + ".bak"
+    )
+    try {
+        if (Test-Path -LiteralPath $TargetPath) {
+            [IO.File]::Replace($StagePath, $TargetPath, $backup)
+        } else {
+            [IO.File]::Move($StagePath, $TargetPath)
+        }
+    } finally {
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-MajesticStageFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    [IO.File]::WriteAllBytes($Path, $Bytes)
+    if ((Get-EgsFileSha256Hex $Path) -ne (Get-EgsSha256Hex $Bytes)) {
+        throw "Majestic Launcher $Description staging verification failed"
+    }
+}
+
+function ConvertTo-ClientMajesticBackupMapBytes {
+    param(
+        [Parameter(Mandatory = $true)]$BackupMap,
+        [Parameter(Mandatory = $true)][string]$BackupDirectory
+    )
+    $rewritten = [ordered]@{
+        version = [int]$BackupMap.version
+        backupDir = $BackupDirectory
+        files = $BackupMap.files
+    }
+    $json = $rewritten | ConvertTo-Json -Depth 8 -Compress
+    return (New-Object Text.UTF8Encoding($false)).GetBytes($json)
+}
+
+function Remove-MajesticBackupDirectoryEntry {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return }
+    if (-not $item.PSIsContainer) {
+        throw "Majestic Launcher backup target is not a directory"
+    }
+    if ((([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        [IO.Directory]::Delete($item.FullName, $false)
     } else {
-        [IO.File]::Move($StagePath, $TargetPath)
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($item.FullName)
+        while ($pending.Count -gt 0) {
+            $directory = $pending.Pop()
+            foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+                if ((([int]$child.Attributes -band
+                    [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                    throw "Majestic Launcher backup directory contains a reparse point"
+                }
+                if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+            }
+        }
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force
+    }
+}
+
+function New-MajesticBackupJunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Target
+    )
+    $itemType = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        "Junction"
+    } else {
+        # The non-Windows branch exists only for the portable Pester suite.
+        "SymbolicLink"
+    }
+    New-Item -ItemType $itemType -Path $Path -Target $Target -ErrorAction Stop | Out-Null
+}
+
+function Get-MajesticBackupJunctionTarget {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or
+        (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -eq 0)) {
+        throw "Majestic Launcher backup junction is not active"
+    }
+    $target = [string](@($item.Target)[0])
+    if ([string]::IsNullOrWhiteSpace($target)) {
+        throw "Majestic Launcher backup junction target cannot be read"
+    }
+    if (-not [IO.Path]::IsPathRooted($target)) {
+        $target = Join-Path (Split-Path $item.FullName -Parent) $target
+    }
+    return ConvertTo-EgsCanonicalPath $target
+}
+
+function Assert-MajesticBackupJunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)]$BackupMap
+    )
+    $actualTarget = Get-MajesticBackupJunctionTarget -Path $Path
+    $expectedTarget = ConvertTo-EgsCanonicalPath $SourcePath
+    if (-not $actualTarget.Equals(
+        $expectedTarget, [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Majestic Launcher backup junction points to another directory"
+    }
+    Assert-ClientMajesticBackupPayload -Path $SourcePath `
+        -BackupMap $BackupMap | Out-Null
+}
+
+function Set-MajesticBackupJunction {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)]$BackupMap
+    )
+    $current = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -ne $current -and
+        (([int]$current.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        try {
+            Assert-MajesticBackupJunction -Path $Path -SourcePath $SourcePath `
+                -BackupMap $BackupMap
+            return
+        } catch {
+            [IO.Directory]::Delete($current.FullName, $false)
+        }
+    }
+    $parent = Split-Path $Path -Parent
+    $stage = Join-Path $parent (".majestic-backup-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    $previous = Join-Path $parent ".iscsi-reset-majestic-backup.previous"
+    try {
+        Remove-MajesticBackupDirectoryEntry -Path $stage
+        Remove-MajesticBackupDirectoryEntry -Path $previous
+        New-MajesticBackupJunction -Path $stage -Target $SourcePath
+        Assert-MajesticBackupJunction -Path $stage -SourcePath $SourcePath `
+            -BackupMap $BackupMap
+        $current = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        if ($null -ne $current) {
+            if ((([int]$current.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                [IO.Directory]::Delete($current.FullName, $false)
+            } else {
+                [IO.Directory]::Move($current.FullName, $previous)
+            }
+        }
+        [IO.Directory]::Move($stage, $Path)
+        Assert-MajesticBackupJunction -Path $Path -SourcePath $SourcePath `
+            -BackupMap $BackupMap
+        Remove-MajesticBackupDirectoryEntry -Path $previous
+    } finally {
+        Remove-MajesticBackupDirectoryEntry -Path $stage
     }
 }
 
@@ -1274,30 +1628,95 @@ function Invoke-ClientMajesticSettingsSync {
         -ConfigRevision $ConfigRevision
     Stop-MajesticLauncherProcesses
     Assert-MajesticLauncherStopped
-    $targetPath = Get-MajesticPrefsTargetPath -ProfilePath $Config.ProfilePath
-    $directory = Split-Path $targetPath -Parent
-    $stagePath = Join-Path $directory `
-        (".majestic-prefs-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    $targets = Get-MajesticProfileTargets -ProfilePath $Config.ProfilePath
+    $rewrittenBackupMapBytes = ConvertTo-ClientMajesticBackupMapBytes `
+        -BackupMap $bundle.BackupMap -BackupDirectory $targets.BackupDirectory
+    $stages = [ordered]@{
+        Prefs = Join-Path (Split-Path $targets.Prefs -Parent) `
+            (".majestic-prefs-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        Majestic = Join-Path (Split-Path $targets.Majestic -Parent) `
+            (".majestic-config-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        HashMap = Join-Path (Split-Path $targets.HashMap -Parent) `
+            (".majestic-hashmap-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        HashMapGeneral = Join-Path (Split-Path $targets.HashMapGeneral -Parent) `
+            (".majestic-hashmap-general-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        BackupMap = Join-Path (Split-Path $targets.BackupMap -Parent) `
+            (".majestic-backup-map-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+    }
+    $markerInvalidated = $false
+    $completed = $false
     try {
-        [IO.File]::WriteAllBytes($stagePath, $bundle.PrefsBytes)
-        if ((Get-EgsFileSha256Hex $stagePath) -ne
-            (Get-EgsSha256Hex $bundle.PrefsBytes)) {
-            throw "Majestic Launcher prefs staging verification failed"
+        Write-MajesticStageFile -Path $stages.Prefs -Bytes $bundle.PrefsBytes `
+            -Description "prefs"
+        Write-MajesticStageFile -Path $stages.Majestic -Bytes $bundle.MajesticBytes `
+            -Description "majestic config"
+        Write-MajesticStageFile -Path $stages.HashMap -Bytes $bundle.HashMapBytes `
+            -Description "verification hash map"
+        Write-MajesticStageFile -Path $stages.HashMapGeneral `
+            -Bytes $bundle.HashMapGeneralBytes -Description "general verification hash map"
+        Write-MajesticStageFile -Path $stages.BackupMap `
+            -Bytes $rewrittenBackupMapBytes -Description "backup map"
+        Remove-Item -LiteralPath $targets.HashMap -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $targets.HashMapGeneral -Force -ErrorAction SilentlyContinue
+        $markerInvalidated = $true
+        if ((Test-Path -LiteralPath $targets.HashMap) -or
+            (Test-Path -LiteralPath $targets.HashMapGeneral)) {
+            throw "Majestic Launcher verification hash maps could not be invalidated"
         }
         Set-MajesticRegistryValues -Config $Config -RegistryValues $bundle.Registry
         Assert-MajesticLauncherStopped
-        Commit-MajesticPrefsFile -StagePath $stagePath -TargetPath $targetPath
-        if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf) -or
-            (Get-EgsFileSha256Hex $targetPath) -ne
-            (Get-EgsSha256Hex $bundle.PrefsBytes)) {
-            throw "Majestic Launcher prefs target verification failed"
+        Commit-MajesticFile -StagePath $stages.Prefs -TargetPath $targets.Prefs
+        Commit-MajesticFile -StagePath $stages.Majestic -TargetPath $targets.Majestic
+        Set-MajesticBackupJunction -Path $targets.BackupDirectory `
+            -SourcePath $bundle.BackupSourcePath -BackupMap $bundle.BackupMap
+        Commit-MajesticFile -StagePath $stages.BackupMap -TargetPath $targets.BackupMap
+        Assert-MajesticLauncherStopped
+        Commit-MajesticFile -StagePath $stages.HashMapGeneral `
+            -TargetPath $targets.HashMapGeneral
+        Commit-MajesticFile -StagePath $stages.HashMap -TargetPath $targets.HashMap
+        foreach ($check in @(
+            [pscustomobject]@{ Path = $targets.Prefs; Bytes = $bundle.PrefsBytes },
+            [pscustomobject]@{ Path = $targets.Majestic; Bytes = $bundle.MajesticBytes },
+            [pscustomobject]@{
+                Path = $targets.BackupMap; Bytes = $rewrittenBackupMapBytes
+            },
+            [pscustomobject]@{
+                Path = $targets.HashMapGeneral; Bytes = $bundle.HashMapGeneralBytes
+            },
+            [pscustomobject]@{ Path = $targets.HashMap; Bytes = $bundle.HashMapBytes }
+        )) {
+            if (-not (Test-Path -LiteralPath $check.Path -PathType Leaf) -or
+                (Get-EgsFileSha256Hex $check.Path) -ne
+                (Get-EgsSha256Hex $check.Bytes)) {
+                throw "Majestic Launcher target file verification failed"
+            }
         }
+        Assert-MajesticBackupJunction -Path $targets.BackupDirectory `
+            -SourcePath $bundle.BackupSourcePath -BackupMap $bundle.BackupMap
+        Assert-MajesticLauncherStopped
+        $completed = $true
     } finally {
-        Remove-Item -LiteralPath $stagePath -Force -ErrorAction SilentlyContinue
+        foreach ($stagePath in @($stages.Values)) {
+            Remove-Item -LiteralPath $stagePath -Force -ErrorAction SilentlyContinue
+        }
+        if ($markerInvalidated -and -not $completed) {
+            Remove-Item -LiteralPath $targets.HashMap -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $targets.HashMapGeneral -Force `
+                -ErrorAction SilentlyContinue
+            if ((Test-Path -LiteralPath $targets.HashMap) -or
+                (Test-Path -LiteralPath $targets.HashMapGeneral)) {
+                throw "Majestic Launcher verification hash maps remained active after failure"
+            }
+        }
     }
     return [pscustomobject]@{
         BundleSha256 = $bundle.BundleSha256
         PrefsLength = [Int64]$bundle.PrefsBytes.Length
+        HashMapLength = [Int64]$bundle.HashMapBytes.Length
+        HashMapGeneralLength = [Int64]$bundle.HashMapGeneralBytes.Length
+        BackupFileCount = [int]$bundle.BackupFileCount
+        BackupTotalBytes = [Int64]$bundle.BackupTotalBytes
+        FileCount = 5
         RegistryValueCount = 2
     }
 }
@@ -3603,13 +4022,18 @@ function Invoke-ResetMain {
                     -Message "Majestic Launcher settings match the mounted release" `
                     -Details @{
                         prefs_bytes = [Int64]$majesticResult.PrefsLength
+                        verification_hash_map_bytes = [Int64]$majesticResult.HashMapLength
+                        general_hash_map_bytes = [Int64]$majesticResult.HashMapGeneralLength
+                        backup_file_count = [int]$majesticResult.BackupFileCount
+                        backup_total_bytes = [Int64]$majesticResult.BackupTotalBytes
+                        file_count = [int]$majesticResult.FileCount
                         registry_value_count = [int]$majesticResult.RegistryValueCount
                     }
             }
         } catch {
             Write-ResetLog -Level "WARN" -Event "majestic_settings_sync_warning" `
                 -RequestId $requestId `
-                -Message "Majestic Launcher settings were not applied: $($_.Exception.Message)" `
+                -Message "Majestic Launcher settings were not applied" `
                 -Details @{ stage = "majestic_settings_sync" }
         }
         if ($egsSyncMode -ne "Disabled") {

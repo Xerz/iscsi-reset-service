@@ -254,29 +254,51 @@
    helper с `-MajesticLauncherSettingsSync Enabled` под соответствующим игровым пользователем.
    Проверить schema 1 `majestic-sync.json`, точные SID/profile и ACL только для SYSTEM и
    Administrators. Повторить с `Disabled` и убедиться, что startup-задача остаётся SYSTEM.
-2. На Publisher задать `prefs.latest.json`, `lastVisitedServerID=ro3` и `game_disk=E:`, открыть
-   `Majestic Launcher.exe` и выполнить `Disconnect` с тремя произвольно названными master-томами.
+2. На Publisher полностью проверить игру, задать `prefs.latest.json`,
+   `Multiplayer\majestic.json` с тестовым `name`, оба `hashMap_v3.json` и
+   `hashMap_v3_RO.json`, `backupMap.json` и реальный `Multiplayer\backup`,
+   `lastVisitedServerID=ro3` и `game_disk=E:`, открыть `Majestic Launcher.exe` и выполнить
+   `Disconnect` с тремя произвольно названными master-томами.
    Helper должен запросить graceful close, ограниченно завершить остаток процесса и записать
-   одинаковый `.iscsi-reset\majestic-launcher-settings.v1.json` на каждый том.
-3. Декодировать bundle и сверить точные bytes/размер/SHA-256 prefs и оба `REG_SZ`. SID, путь
-   профиля, Cookies, Session Storage, account и authorization state должны отсутствовать.
+   одинаковый `.iscsi-reset\majestic-launcher-settings.v2.json` на каждый том. Только том с
+   буквой из корневого `prefs.latest.json.gameDisk` должен получить постоянный каталог
+   `.iscsi-reset\majestic-launcher-backup`; исходный Publisher `Multiplayer\backup` должен стать
+   junction на него. Registry `game_disk` временно задать другой буквой и подтвердить, что он
+   не влияет на выбор якоря. Затем удалить legacy v1 bundle.
+3. Декодировать bundle и сверить точные bytes/размер/SHA-256 четырёх файлов, безопасные
+   `version/files` backup map и оба `REG_SZ`. Поля backup index/directory в bundle быть не
+   должно. Сверить точные bytes, timestamps и SHA-256 одноразово перенесённого payload только
+   на `gameDisk`-томе. SID, исходный `backupDir`,
+   путь профиля, Cookies, Session Storage, account и authorization state должны отсутствовать.
 4. Выполнить полный Publisher → stage → activate → client reset до входа игрового пользователя.
    SYSTEM должен временно загрузить его `NTUSER.DAT`, записать оба значения через `HKEY_USERS`,
-   атомарно заменить prefs и выгрузить hive. После входа Launcher должен показать сервер и
-   настройки Publisher без преобразования `E:`.
+   атомарно заменить малые файлы, создать directory junction на backup payload, последними
+   активировать оба hash map и выгрузить hive.
+   После входа Launcher должен показать сервер, имя и настройки Publisher без преобразования
+   `E:`, а запуск игры не должен повторно читать все 40 GiB для полной проверки.
 5. Повторить reset при уже загруженном hive пользователя. `reg load/unload` не вызываются,
-   точные файл и значения сохраняются, а журнал содержит `majestic_settings_sync_ready` перед
-   Epic-событиями и `ready` без содержимого prefs.
-6. Поочерёдно удалить bundle одного тома, изменить его bytes, config revision, Base64 и prefs
-   hash, а также заблокировать профиль или перезапустить Launcher во время sync. Каждый случай
-   должен дать `majestic_settings_sync_warning`, оставить проверенную session подключённой и
-   завершиться `ready` без частичного копирования файла.
-7. Имитировать отказ после записи `lastVisitedServerID`. Текущий запуск может оставить
-   повторяемое частичное пользовательское состояние, но следующий reset обязан согласовать оба
-   значения и точные prefs без ручной очистки.
-8. Переключить Publisher в `Disabled`: следующий Disconnect должен удалить только
-   helper-generated Majestic bundles со всех master-томов. Client в `Disabled` не должен
-   закрывать Launcher, читать bundles или менять профиль.
+   точные файлы и значения сохраняются, а журнал содержит `majestic_settings_sync_ready` перед
+   Epic-событиями и `ready` без содержимого файлов, `name` или путей.
+6. Поочерёдно удалить bundle одного тома, оставить только v1, изменить его bytes, config
+   revision, Base64 и hash каждого payload, а также заблокировать профиль или перезапустить
+   Launcher во время sync. Каждый случай должен дать `majestic_settings_sync_warning`, оставить
+   проверенную session подключённой и завершиться `ready`.
+7. Повторить Publisher `Disconnect` и client reset. Publisher не должен вызывать backup copy
+   или `Get-FileHash`, а правильные Publisher/client junction не должны переставляться.
+   `backupMap.json` должен сохранить `version/files`, но получить `backupDir` клиентского
+   профиля.
+8. Имитировать отказ после registry, prefs, `majestic.json`, junction и `backupMap.json`. Во всех
+   случаях оба hash map должны отсутствовать, а следующий reset обязан согласовать состояние
+   без ручной очистки, активировав `hashMap_v3.json` и `hashMap_v3_RO.json` последними.
+9. Переключить Publisher в `Disabled`: следующий Disconnect должен удалить только
+   helper-generated Majestic v1/v2 bundles, сохранив постоянный backup payload и Publisher
+   junction. Client в `Disabled` не должен закрывать Launcher, читать bundles или менять
+   профиль.
+10. Имитировать остановку первой миграции после staging, фиксации постоянного каталога,
+    переименования исходного backup и создания junction. Retry обязан либо восстановить
+    исходный обычный каталог, либо завершить правильный junction и удалить `.staging`/`.previous`.
+    Неверный/dangling Publisher junction и staging reparse point должны блокировать Disconnect
+    до disk offline.
 
 ## 9. Один dual-role Publisher/client ПК
 
@@ -316,7 +338,7 @@
 | Restart revisions | После restart startup = saved |  | ☐ |
 | Publisher Disconnect | Exact session/NAA, pending до mutations |  | ☐ |
 | Epic Games sync | Exact bundles, managed `.item`, rollback/retry |  | ☐ |
-| Majestic settings sync | Exact prefs/REG_SZ, user hive, warning/retry |  | ☐ |
+| Majestic settings sync | 5 small files/REG_SZ, backup junction, both hash maps last |  | ☐ |
 | Stage | Fail-closed, immutable полный mapping |  | ☐ |
 | Incomplete retry | Исходный request ID, без удаления snapshots |  | ☐ |
 | Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |

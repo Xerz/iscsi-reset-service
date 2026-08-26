@@ -1,5 +1,67 @@
 # Verification record
 
+## Majestic Launcher verification state v0.4.14 — 2026-08-26
+
+### Реализация
+
+- Существующий opt-in `-MajesticLauncherSettingsSync Enabled` расширен без изменения installer
+  config schema, YAML, SQLite и Reset API. Publisher теперь захватывает точные bytes prefs,
+  `Multiplayer\majestic.json`, `hashMap_v3.json`, `hashMap_v3_RO.json`, два разрешённых `REG_SZ`
+  и проверенную безопасную часть `version/files` из `backupMap.json`.
+- Publisher выбирает ровно один anchor только по корневому `prefs.latest.json.gameDisk`, не по
+  registry или путям из других файлов. При первой публикации он копирует обычные файлы верхнего
+  уровня `Multiplayer\backup` в постоянный
+  `<gameDisk>\.iscsi-reset\majestic-launcher-backup`, проверяет длину, SHA-256 и timestamps и
+  атомарно заменяет исходный каталог directory junction. Лимиты: 64 файла, 4 GiB на файл,
+  8 GiB всего; reparse points и подкаталоги запрещены.
+- Правильный Publisher junction становится единственным marker миграции. Повторный Disconnect
+  выполняет только быструю проверку цели/размеров и не копирует или хеширует backup. Bundle
+  schema 2 одинаков на всех master-томах и больше не содержит backup index/directory; исходный
+  `backupDir`, дополнительные поля backup metadata, SID и путь профиля также не попадают.
+- Client требует одинаковый валидный v2 на всех своих томах, выбирает anchor только по
+  переданному prefs `gameDisk` и создаёт постоянный `Multiplayer\backup` junction на
+  `<gameDisk>\.iscsi-reset\majestic-launcher-backup`. Правильный junction не переставляется;
+  `backupMap.json` получает клиентский `backupDir` при сохранении безопасных `version/files`.
+- Перед mutations удаляются оба verification hash map. Registry, prefs, `majestic.json`,
+  junction и `backupMap.json` применяются до `hashMap_v3.json`; `hashMap_v3_RO.json` фиксируется
+  последним. Частичный сбой удаляет оба marker и остаётся warning-only, следующий reset
+  повторяет согласование. Disabled/обычная capture failure очищает только v1/v2 bundles и
+  сохраняет постоянный payload/junction. Неоднозначное состояние миграции, неверный junction
+  или неподтверждённая очистка staging блокируют Publisher до offline/disconnect.
+
+### Автоматически проверено
+
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  1.70 секунды.
+- `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- Parser всех production/test `.ps1` и полный Pester 5.7.1 в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`
+  (`sha256:4be726730a1f69796dfc86d2531ddbdf662bebbaa4edc47c4111c2463fe32b9a`) —
+  **156 passed, 0 failed, 1 skipped** из 157 за 17.53 секунды. Linux/amd64 PowerShell
+  выполнялся через эмуляцию на arm64 Docker host; пропущена существующая Windows-only ACL
+  проверка. Majestic-тесты используют малые fixtures и покрывают реальную структуру prefs,
+  `gameDisk` независимо от registry, три произвольных тома, exact bytes/timestamps,
+  одноразовую миграцию, no-copy/no-hash retry, recovery после commit/rename/junction failure,
+  unsafe staging, постоянные Publisher/client junction, marker-last, Disabled и warning/ready.
+- `docker compose config --quiet` — успешно.
+- `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed**; после проверки выполнен `docker compose down --volumes`.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Полный Pester на настоящем Windows PowerShell 5.1 и отдельная проверка создания/замены
+  directory junction под Publisher helper и startup-задачей `SYSTEM`, включая одноразовый
+  переход со старого обычного backup-каталога размером около 2.5–3 GiB и отсутствие повторного
+  копирования/хеширования.
+- Физический Publisher → `Disconnect` → stage → activate → client reset с реальными NTFS,
+  iSCSI, ZFS/TrueNAS и backup payload. Нужно подтвердить точные bytes четырёх файлов, оба
+  `REG_SZ`, сгенерированный `backupMap.json`, доступность backup через junction и восстановление
+  clone после следующего reset.
+- Первый запуск игры должен подтвердить, что Majestic Launcher принимает оба hash map,
+  `backupMap.json` и linked backup payload как состояние завершённой проверки и больше не читает
+  все 40 GiB. Mock/Pester/Compose этого поведения Launcher не доказывают.
+
 ## Majestic Launcher settings sync v0.4.13 — 2026-08-25
 
 ### Реализация

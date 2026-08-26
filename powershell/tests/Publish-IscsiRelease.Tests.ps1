@@ -161,6 +161,19 @@ Describe "Publisher target discovery" {
 
 Describe "Publisher Majestic Launcher settings bundles" {
     BeforeEach {
+        foreach ($leaf in @("publisher-profile", "nvme", "archive", "bonus", "dup")) {
+            $candidate = Join-Path $TestDrive $leaf
+            $existing = Get-Item -LiteralPath $candidate -Force `
+                -ErrorAction SilentlyContinue
+            if ($null -ne $existing) {
+                if ((([int]$existing.Attributes -band
+                    [int][IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                    [IO.Directory]::Delete($existing.FullName, $false)
+                } else {
+                    Remove-Item -LiteralPath $existing.FullName -Recurse -Force
+                }
+            }
+        }
         $script:MajesticProfile = Join-Path $TestDrive "publisher-profile"
         $prefsDirectory = Join-Path $script:MajesticProfile `
             "AppData/Roaming/majestic-launcher"
@@ -168,11 +181,72 @@ Describe "Publisher Majestic Launcher settings bundles" {
         Set-Content -LiteralPath (Join-Path $script:MajesticProfile "NTUSER.DAT") `
             -Value "hive"
         $script:MajesticPrefsBytes = [Text.Encoding]::UTF8.GetBytes(
-            '{"volume":0.25,"fullscreen":true,"gameDisk":"E:"}'
+            '{"windowState":{"v2":{"main":{"maximized":true}}},"selectedProject":"ro","gameInstall":{"persisted":{"source":"custom","path":"E:\\SteamLibrary\\steamapps\\common\\Grand Theft Auto V"}},"gameDisk":"E:","settings":{"lastVisitedServerIdRo":"ro3"}}'
         )
         [IO.File]::WriteAllBytes(
             (Join-Path $prefsDirectory "prefs.latest.json"),
             $script:MajesticPrefsBytes
+        )
+        $multiplayerDirectory = Join-Path $prefsDirectory "Multiplayer"
+        New-Item -ItemType Directory -Path $multiplayerDirectory -Force | Out-Null
+        $script:MajesticConfigBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"gtapath":"E:\\SteamLibrary\\GTA V","name":"xrzvs"}'
+        )
+        $script:MajesticHashMapBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"GTA5.exe":"verification-hash","update.rpf":"other-hash"}'
+        )
+        $script:MajesticGeneralHashMapBytes = [Text.Encoding]::UTF8.GetBytes(
+            '{"GTA5.exe":"general-hash","PlayGTAV.exe":"other-general-hash"}'
+        )
+        [IO.File]::WriteAllBytes(
+            (Join-Path $multiplayerDirectory "majestic.json"),
+            $script:MajesticConfigBytes
+        )
+        [IO.File]::WriteAllBytes(
+            (Join-Path $prefsDirectory "hashMap_v3_RO.json"),
+            $script:MajesticHashMapBytes
+        )
+        [IO.File]::WriteAllBytes(
+            (Join-Path $prefsDirectory "hashMap_v3.json"),
+            $script:MajesticGeneralHashMapBytes
+        )
+        $script:MajesticBackupDirectory = Join-Path $multiplayerDirectory "backup"
+        New-Item -ItemType Directory -Path $script:MajesticBackupDirectory -Force |
+            Out-Null
+        $script:MajesticBackupFiles = [ordered]@{
+            "GTA5.exe" = [byte[]](1, 2, 3, 4, 5)
+            "680a1b3170ad45a89f750f4ad48c0b21.bin" = [byte[]](6, 7, 8)
+            "extra.bin" = [byte[]](9, 10, 11, 12)
+        }
+        foreach ($entry in $script:MajesticBackupFiles.GetEnumerator()) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $script:MajesticBackupDirectory $entry.Key),
+                $entry.Value
+            )
+            [IO.File]::SetLastWriteTimeUtc(
+                (Join-Path $script:MajesticBackupDirectory $entry.Key),
+                [DateTime]::SpecifyKind([DateTime]"2026-08-20T12:34:56", "Utc")
+            )
+        }
+        $backupMap = [ordered]@{
+            version = 1
+            backupDir = $script:MajesticBackupDirectory
+            files = [ordered]@{
+                "GTA5.exe" = [ordered]@{
+                    size = 5; mtimeNs = "1787644592547527100"
+                    finalHash = "60694b13a70d4081"
+                    publisherOnlyPath = $script:MajesticBackupDirectory
+                }
+                "680a1b3170ad45a89f750f4ad48c0b21.bin" = [ordered]@{
+                    size = 3; mtimeNs = "1787673066827856900"
+                    finalHash = "a032e37c13c599b9"
+                }
+            }
+        } | ConvertTo-Json -Depth 6 -Compress
+        $script:MajesticBackupMapBytes = [Text.Encoding]::UTF8.GetBytes($backupMap)
+        [IO.File]::WriteAllBytes(
+            (Join-Path $prefsDirectory "backupMap.json"),
+            $script:MajesticBackupMapBytes
         )
         $script:MajesticConfig = [pscustomobject]@{
             Present = $true
@@ -184,9 +258,9 @@ Describe "Publisher Majestic Launcher settings bundles" {
             config_revision = "majestic-revision"
         }
         $script:MajesticMappings = @(
-            [pscustomobject]@{ Name = "nvme"; RootPath = (Join-Path $TestDrive "nvme") }
-            [pscustomobject]@{ Name = "archive"; RootPath = (Join-Path $TestDrive "archive") }
-            [pscustomobject]@{ Name = "bonus"; RootPath = (Join-Path $TestDrive "bonus") }
+            [pscustomobject]@{ Name = "nvme"; DriveLetter = "E"; RootPath = (Join-Path $TestDrive "nvme") }
+            [pscustomobject]@{ Name = "archive"; DriveLetter = "H"; RootPath = (Join-Path $TestDrive "archive") }
+            [pscustomobject]@{ Name = "bonus"; DriveLetter = "T"; RootPath = (Join-Path $TestDrive "bonus") }
         )
         foreach ($mapping in $script:MajesticMappings) {
             New-Item -ItemType Directory -Path $mapping.RootPath -Force | Out-Null
@@ -194,7 +268,7 @@ Describe "Publisher Majestic Launcher settings bundles" {
         Mock Get-MajesticRegistryValues {
             return [pscustomobject]@{
                 lastVisitedServerID = "ro3"
-                game_disk = "E:"
+                game_disk = "H:"
             }
         }
         Mock Get-Process { return @() } -ParameterFilter { $Name -eq "Majestic Launcher" }
@@ -218,18 +292,16 @@ Describe "Publisher Majestic Launcher settings bundles" {
         $enabled.UserSid | Should -Be $script:MajesticConfig.UserSid
     }
 
-    It "writes identical exact-byte bundles to three arbitrary volumes" {
-        $bytes = Get-PublisherMajesticBundleBytes -Config $script:MajesticConfig `
-            -ConfigRevision $script:MajesticManifest.config_revision
-
-        foreach ($mapping in $script:MajesticMappings) {
-            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
-            New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
-                -Force | Out-Null
-            Set-Content -LiteralPath $path -Value "stale"
+    It "migrates backup only to prefs gameDisk and writes identical exact-byte bundles" {
+        $originalTimes = @{}
+        foreach ($entry in $script:MajesticBackupFiles.GetEnumerator()) {
+            $originalTimes[$entry.Key] = (Get-Item -LiteralPath (
+                Join-Path $script:MajesticBackupDirectory $entry.Key
+            )).LastWriteTimeUtc.Ticks
         }
-        Export-PublisherMajesticBundles -VolumeMappings $script:MajesticMappings `
-            -BundleBytes $bytes
+
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
 
         $hashes = @()
         foreach ($mapping in $script:MajesticMappings) {
@@ -237,23 +309,249 @@ Describe "Publisher Majestic Launcher settings bundles" {
             $written = [IO.File]::ReadAllBytes($path)
             $hashes += Get-EgsSha256Hex $written
             $bundle = [Text.Encoding]::UTF8.GetString($written) | ConvertFrom-Json
+            $bundle.schema_version | Should -Be 2
             (Get-EgsSha256Hex ([Convert]::FromBase64String(
-                [string]$bundle.prefs_latest_base64
+                [string]$bundle.files.prefs_latest_json.base64
             ))) | Should -Be (Get-EgsSha256Hex $script:MajesticPrefsBytes)
+            (Get-EgsSha256Hex ([Convert]::FromBase64String(
+                [string]$bundle.files.multiplayer_majestic_json.base64
+            ))) | Should -Be (Get-EgsSha256Hex $script:MajesticConfigBytes)
+            (Get-EgsSha256Hex ([Convert]::FromBase64String(
+                [string]$bundle.files.hash_map_v3_ro_json.base64
+            ))) | Should -Be (Get-EgsSha256Hex $script:MajesticHashMapBytes)
+            (Get-EgsSha256Hex ([Convert]::FromBase64String(
+                [string]$bundle.files.hash_map_v3_json.base64
+            ))) | Should -Be (Get-EgsSha256Hex $script:MajesticGeneralHashMapBytes)
+            $bundle.backup_map.version | Should -Be 1
+            $bundle.backup_map.files."GTA5.exe".finalHash |
+                Should -Be "60694b13a70d4081"
+            $bundle.backup_map.PSObject.Properties.Name |
+                Should -Not -Contain "backupDir"
+            $bundle.PSObject.Properties.Name | Should -Not -Contain "backup_directory"
             $bundle.registry.lastVisitedServerID | Should -Be "ro3"
-            $bundle.registry.game_disk | Should -Be "E:"
+            $bundle.registry.game_disk | Should -Be "H:"
             $bundle.PSObject.Properties.Name | Should -Not -Contain "profile_path"
             $bundle.PSObject.Properties.Name | Should -Not -Contain "user_sid"
+            [Text.Encoding]::UTF8.GetString($written) |
+                Should -Not -Match "publisher-profile|backupDir"
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+                    -SchemaVersion 1
+            ) | Should -BeFalse
         }
         @($hashes | Select-Object -Unique).Count | Should -Be 1
+        $payloadPath = Get-PublisherMajesticBackupPayloadPath `
+            -VolumeMapping $script:MajesticMappings[0]
+        foreach ($entry in $script:MajesticBackupFiles.GetEnumerator()) {
+            $copied = Join-Path $payloadPath $entry.Key
+            (Get-EgsFileSha256Hex $copied) | Should -Be (Get-EgsSha256Hex $entry.Value)
+            (Get-Item -LiteralPath $copied).LastWriteTimeUtc.Ticks |
+                Should -Be $originalTimes[$entry.Key]
+        }
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+        foreach ($mapping in @($script:MajesticMappings[1], $script:MajesticMappings[2])) {
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBackupPayloadPath -VolumeMapping $mapping
+            ) | Should -BeFalse
+        }
     }
 
-    It "removes all helper-owned bundles when sync is disabled" {
+    It "does not copy or hash backup files after the Publisher junction exists" {
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+        Mock Get-PublisherMajesticBackupIndex {
+            throw "backup index must not be rebuilt"
+        }
+        Mock Get-EgsFileSha256Hex { throw "backup files must not be hashed" }
+
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+
+        Should -Invoke Get-PublisherMajesticBackupIndex -Times 0 -Exactly
+        Should -Invoke Get-EgsFileSha256Hex -Times 0 -Exactly
         foreach ($mapping in $script:MajesticMappings) {
-            $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping
-            New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
-                -Force | Out-Null
-            Set-Content -LiteralPath $path -Value "stale"
+            Test-Path -LiteralPath (
+                Get-PublisherMajesticBundlePath -VolumeMapping $mapping
+            ) | Should -BeTrue
+        }
+    }
+
+    It "reconciles an interruption after payload commit and source rename" {
+        $anchor = Get-PublisherMajesticAnchorVolume `
+            -VolumeMappings $script:MajesticMappings -GameDisk "E:"
+        Assert-PublisherMajesticHelperDirectory -VolumeMapping $anchor -Create
+        $active = Get-PublisherMajesticBackupPayloadPath -VolumeMapping $anchor
+        $previous = Get-PublisherMajesticBackupPreviousPath `
+            -BackupPath $script:MajesticBackupDirectory
+        $index = Get-PublisherMajesticBackupIndex `
+            -Path $script:MajesticBackupDirectory
+        Copy-PublisherMajesticBackupOnce -BackupIndex $index -Destination $active
+        [IO.Directory]::Move($script:MajesticBackupDirectory, $previous)
+
+        Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+            -AnchorVolume $anchor | Out-Null
+
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+        Test-Path -LiteralPath $previous | Should -BeFalse
+        Test-Path -LiteralPath (
+            Get-PublisherMajesticBackupPayloadPath -VolumeMapping $anchor -Kind staging
+        ) | Should -BeFalse
+    }
+
+    It "restores the source and retries after junction creation fails" {
+        $anchor = Get-PublisherMajesticAnchorVolume `
+            -VolumeMappings $script:MajesticMappings -GameDisk "E:"
+        $script:FailMajesticJunctionCreation = $true
+        Mock New-PublisherMajesticBackupJunction {
+            if ($script:FailMajesticJunctionCreation) {
+                throw "injected junction creation failure"
+            }
+            $itemType = if (
+                [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+            ) { "Junction" } else { "SymbolicLink" }
+            New-Item -ItemType $itemType -Path $Path -Target $Target |
+                Out-Null
+        }
+
+        {
+            Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+                -AnchorVolume $anchor
+        } | Should -Throw "*injected junction creation failure*"
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Be 0
+        Test-Path -LiteralPath (
+            Get-PublisherMajesticBackupPreviousPath `
+                -BackupPath $script:MajesticBackupDirectory
+        ) | Should -BeFalse
+
+        $script:FailMajesticJunctionCreation = $false
+        Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+            -AnchorVolume $anchor | Out-Null
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
+    }
+
+    It "blocks when migration staging cleanup cannot be proven" {
+        $anchor = Get-PublisherMajesticAnchorVolume `
+            -VolumeMappings $script:MajesticMappings -GameDisk "E:"
+        Assert-PublisherMajesticHelperDirectory -VolumeMapping $anchor -Create
+        $staging = Get-PublisherMajesticBackupPayloadPath `
+            -VolumeMapping $anchor -Kind staging
+        $outside = Join-Path $TestDrive "outside-staging"
+        New-Item -ItemType Directory -Path $outside -Force | Out-Null
+        try {
+            New-Item -ItemType SymbolicLink -Path $staging -Target $outside `
+                -ErrorAction Stop | Out-Null
+        } catch {
+            Set-ItResult -Skipped -Because "Symbolic links are unavailable"
+            return
+        }
+
+        {
+            Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+                -AnchorVolume $anchor
+        } | Should -Throw "*helper-owned backup path is unsafe*"
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Be 0
+    }
+
+    It "rejects missing, invalid, or ambiguous prefs gameDisk before migration" {
+        $prefsPath = Join-Path $script:MajesticProfile `
+            "AppData/Roaming/majestic-launcher/prefs.latest.json"
+        foreach ($prefs in @('{"selectedProject":"ro"}', '{"gameDisk":"C:"}')) {
+            [IO.File]::WriteAllBytes($prefsPath, [Text.Encoding]::UTF8.GetBytes($prefs))
+            {
+                Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+                    -Manifest $script:MajesticManifest `
+                    -VolumeMappings $script:MajesticMappings
+            } | Should -Throw "*gameDisk*"
+        }
+        [IO.File]::WriteAllBytes($prefsPath, $script:MajesticPrefsBytes)
+        $ambiguous = @($script:MajesticMappings) + [pscustomobject]@{
+            Name = "duplicate"; DriveLetter = "E"; RootPath = (Join-Path $TestDrive "dup")
+        }
+        New-Item -ItemType Directory -Path $ambiguous[-1].RootPath -Force | Out-Null
+        {
+            Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+                -Manifest $script:MajesticManifest -VolumeMappings $ambiguous
+        } | Should -Throw "*exactly one Publisher volume*"
+    }
+
+    It "rejects an oversized or reparse-point source file" {
+        $smallLimitPath = Join-Path $TestDrive "oversized-majestic.json"
+        [IO.File]::WriteAllBytes($smallLimitPath, [byte[]](1..32))
+        {
+            Get-PublisherMajesticFileBytes -Path $smallLimitPath `
+                -Description "test file" -MaximumBytes 16
+        } | Should -Throw "*size limit*"
+
+        $linkPath = Join-Path $TestDrive "majestic-link.json"
+        try {
+            New-Item -ItemType SymbolicLink -Path $linkPath -Target $smallLimitPath `
+                -ErrorAction Stop | Out-Null
+        } catch {
+            Set-ItResult -Skipped -Because "Symbolic links are unavailable"
+            return
+        }
+        {
+            Get-PublisherMajesticFileBytes -Path $linkPath `
+                -Description "test file" -MaximumBytes 1MB
+        } | Should -Throw "*unsafe*"
+    }
+
+    It "rejects backup subdirectories, limits, and a backupMap pointing elsewhere" {
+        $isolated = Join-Path $TestDrive "unsafe-backup"
+        New-Item -ItemType Directory -Path (Join-Path $isolated "nested") -Force |
+            Out-Null
+        {
+            Get-PublisherMajesticBackupIndex -Path $isolated
+        } | Should -Throw "*unsafe entry*"
+
+        $limited = Join-Path $TestDrive "limited-backup"
+        New-Item -ItemType Directory -Path $limited -Force | Out-Null
+        [IO.File]::WriteAllBytes((Join-Path $limited "large.bin"), [byte[]](1..8))
+        {
+            Get-PublisherMajesticBackupIndex -Path $limited -MaximumTotalBytes 4
+        } | Should -Throw "*size limit*"
+
+        $backupMapPath = Join-Path $script:MajesticProfile `
+            "AppData/Roaming/majestic-launcher/backupMap.json"
+        $badMap = [ordered]@{
+            version = 1
+            backupDir = (Join-Path $TestDrive "somewhere-else")
+            files = [ordered]@{
+                "GTA5.exe" = [ordered]@{
+                    size = 5; mtimeNs = "1787644592547527100"
+                    finalHash = "60694b13a70d4081"
+                }
+            }
+        } | ConvertTo-Json -Depth 6 -Compress
+        [IO.File]::WriteAllBytes($backupMapPath, [Text.Encoding]::UTF8.GetBytes($badMap))
+        $anchor = Get-PublisherMajesticAnchorVolume `
+            -VolumeMappings $script:MajesticMappings -GameDisk "E:"
+        Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+            -AnchorVolume $anchor | Out-Null
+        {
+            Get-PublisherMajesticBundleBytes -Config $script:MajesticConfig `
+                -ConfigRevision "majestic-revision"
+        } | Should -Throw "*another backup directory*"
+    }
+
+    It "disabled removes only bundles and preserves backup payload and junction" {
+        Invoke-PublisherMajesticSync -Config $script:MajesticConfig `
+            -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
+        $payloadPath = Get-PublisherMajesticBackupPayloadPath `
+            -VolumeMapping $script:MajesticMappings[0]
+        foreach ($mapping in $script:MajesticMappings) {
+            foreach ($schemaVersion in @(1, 2)) {
+                $path = Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+                    -SchemaVersion $schemaVersion
+                New-Item -ItemType Directory -Path (Split-Path $path -Parent) `
+                    -Force | Out-Null
+                Set-Content -LiteralPath $path -Value "stale"
+            }
         }
         $disabled = [pscustomobject]@{
             Present = $true
@@ -264,15 +562,21 @@ Describe "Publisher Majestic Launcher settings bundles" {
             -Manifest $script:MajesticManifest -VolumeMappings $script:MajesticMappings
 
         foreach ($mapping in $script:MajesticMappings) {
-            Test-Path -LiteralPath (
-                Get-PublisherMajesticBundlePath -VolumeMapping $mapping
-            ) | Should -BeFalse
+            foreach ($schemaVersion in @(1, 2)) {
+                Test-Path -LiteralPath (
+                    Get-PublisherMajesticBundlePath -VolumeMapping $mapping `
+                        -SchemaVersion $schemaVersion
+                ) | Should -BeFalse
+            }
         }
+        Test-Path -LiteralPath $payloadPath | Should -BeTrue
+        ((Get-Item -LiteralPath $script:MajesticBackupDirectory -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) | Should -Not -Be 0
     }
 
     It "cleans a partial bundle write and a retry can reconcile every volume" {
         Mock Get-PublisherMajesticBundleBytes {
-            return [Text.Encoding]::UTF8.GetBytes('{"schema_version":1}')
+            return [Text.Encoding]::UTF8.GetBytes('{"schema_version":2}')
         }
         $script:MajesticExportCalls = 0
         Mock Export-PublisherMajesticBundles {
@@ -311,6 +615,10 @@ Describe "Publisher Majestic Launcher settings bundles" {
     }
 
     It "fails before disconnect when stale bundle cleanup cannot be confirmed" {
+        $anchor = Get-PublisherMajesticAnchorVolume `
+            -VolumeMappings $script:MajesticMappings -GameDisk "E:"
+        Ensure-PublisherMajesticBackupJunction -Config $script:MajesticConfig `
+            -AnchorVolume $anchor | Out-Null
         Mock Get-PublisherMajesticBundleBytes { throw "capture failed" }
         Mock Remove-PublisherMajesticBundles { throw "cleanup failed" }
 
