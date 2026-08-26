@@ -45,6 +45,11 @@
 - `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
   **Interaction suite passed** с версией `0.5.0`; после проверки выполнен
   `docker compose down --volumes`.
+- Первый запуск publish workflow для tag `v0.5.0` (`33003589865`) остановился в новом validate
+  step до reusable verification, сборки образа и создания GitHub Release. Удалённый ref
+  отдельно подтверждён как annotated tag, указывающий на release commit с версией `0.5.0` и
+  непустыми highlights. Для повторного запуска checkout получил явный `fetch-tags`, а validate
+  проверяет `GITHUB_REF_TYPE`, tag object по `GITHUB_REF` и непустой body без shell pipeline.
 
 ## Majestic Launcher verification state v0.4.14 — 2026-08-26
 
