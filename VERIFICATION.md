@@ -1,5 +1,32 @@
 # Verification record
 
+## Windows PowerShell 5.1 GTA5RP TxR test hotfix v0.5.1 — 2026-08-28
+
+### Причина и исправление
+
+- GitHub Actions run `33186462220` для commit `38331e9` прошёл Python и interaction jobs, но
+  Windows PowerShell 5.1 завершил Pester с **171 passed, 1 failed** из 172. Windows-only
+  GTA5RP TxR-тест получил scalar из одноэлементной ветки `$valueDefinitions`, поэтому строгий
+  доступ к `.Count` вызвал `PropertyNotFoundException` на строке 2419.
+- Тест нормализует значение через `@($valueDefinitions).Count`. Production PowerShell и
+  поведение registry transaction не изменялись.
+
+### Автоматические проверки
+
+- Parser всех production/test `.ps1` в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — успешно.
+- Полный Pester 5.7.1 в том же Linux/amd64 образе — **170 passed, 0 failed, 2 skipped** из 172
+  за 19.46 секунды. Пропущены Windows-only ACL и реальная Transactional Registry проверка;
+  это не Windows PowerShell 5.1.
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  1.91 секунды. `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose config --quiet` — успешно.
+
+### Ожидает удалённой проверки
+
+- Повторный полный Pester на GitHub Actions Windows PowerShell 5.1 после hotfix commit.
+
 ## Epic Games client sync warning-only v0.5.1 — 2026-08-28
 
 ### Реализация

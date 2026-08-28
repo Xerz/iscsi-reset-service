@@ -2416,7 +2416,7 @@ Describe "GTA5RP Launcher client registry sync" {
                         $nativeTree.Keys.Add($emptyKey)
                     }
                 }
-                $nativeTree.ValueCount = $valueDefinitions.Count
+                $nativeTree.ValueCount = @($valueDefinitions).Count
                 $nativeTree.TotalDataBytes = [int64](
                     ($valueDefinitions | ForEach-Object { $_.Data.Length } |
                         Measure-Object -Sum).Sum
