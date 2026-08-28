@@ -1554,7 +1554,7 @@ Describe "Startup flow failure handling" {
         $events | Should -Not -Contain "target_disconnected_after_error"
     }
 
-    It "disconnects the newly-created session when enabled EGS sync fails" {
+    It "warns and keeps the session when enabled EGS sync fails" {
         $state = Read-SimulationState
         ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id = "0x6589cfc000000001"
         Save-SimulationState $state
@@ -1577,17 +1577,82 @@ Describe "Startup flow failure handling" {
                 )
             }
         }
-        Mock Invoke-ClientEgsManifestSync { throw "injected EGS metadata failure" }
+        Mock Invoke-ClientEgsManifestSync {
+            throw "injected EGS metadata failure BaseURLs publisher.invalid"
+        }
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:tokenPath `
             -SyncConfigPath $syncConfig -TimeoutSeconds 2
 
-        $code | Should -Be 40
-        @((Read-SimulationState).sessions).Count | Should -Be 0
-        $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
-            ForEach-Object { ($_ | ConvertFrom-Json).event })
-        $events | Should -Contain "CLIENT_ERROR"
-        $events | Should -Not -Contain "ready"
+        $code | Should -Be 0
+        @((Read-SimulationState).sessions).Count | Should -Be 1
+        $logPath = Join-Path $TestDrive "client.log.jsonl"
+        $raw = Get-Content -LiteralPath $logPath -Raw
+        $records = @(Get-Content -LiteralPath $logPath |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $events = @($records.event)
+        $events | Should -Contain "egs_manifest_sync_warning"
+        $events | Should -Contain "ready"
+        $events | Should -Not -Contain "CLIENT_ERROR"
+        $events | Should -Not -Contain "target_disconnected_after_error"
+        $events | Should -Not -Contain "egs_manifest_sync_ready"
+        [Array]::IndexOf($events, "egs_manifest_sync_warning") |
+            Should -BeLessThan ([Array]::IndexOf($events, "ready"))
+        $warning = $records | Where-Object event -eq "egs_manifest_sync_warning"
+        $warning.level | Should -Be "WARN"
+        $warning.stage | Should -Be "egs_manifest_sync"
+        $raw | Should -Not -Match "BaseURLs|publisher.invalid|injected EGS metadata failure"
+    }
+
+    It "warns and keeps the session when aggressive EGS rollback is incomplete" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
+            "0x6589cfc000000001"
+        Save-SimulationState $state
+        $syncConfig = Join-Path $TestDrive "egs-sync-aggressive.json"
+        @{ schema_version = 2; mode = "aggressive" } | ConvertTo-Json |
+            Set-Content -LiteralPath $syncConfig
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
+        Mock Invoke-ResetRequest {
+            if ($Uri.EndsWith("/v1/client")) {
+                return [pscustomobject]@{
+                    target_iqn = "iqn.2026-08.lab.games:chimera"
+                    portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                }
+            }
+            return [pscustomobject]@{
+                target_iqn = "iqn.2026-08.lab.games:chimera"
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = @(
+                    [pscustomobject]@{ name = "ssd"; disk_unique_id = "6589cfc000000001"; drive_letter = "S"; label = "GAMES_SSD" },
+                    [pscustomobject]@{ name = "hdd"; disk_unique_id = "6589cfc000000002"; drive_letter = "H"; label = "GAMES_HDD" }
+                )
+            }
+        }
+        Mock Invoke-ClientEgsAggressiveSync {
+            throw "Epic Games aggressive sync failed and rollback did not complete: secret"
+        }
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:tokenPath -SyncConfigPath $syncConfig -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        @((Read-SimulationState).sessions).Count | Should -Be 1
+        $logPath = Join-Path $TestDrive "client.log.jsonl"
+        $raw = Get-Content -LiteralPath $logPath -Raw
+        $records = @(Get-Content -LiteralPath $logPath |
+            ForEach-Object { $_ | ConvertFrom-Json })
+        $events = @($records.event)
+        $events | Should -Contain "egs_manifest_sync_warning"
+        $events | Should -Contain "ready"
+        $events | Should -Not -Contain "CLIENT_ERROR"
+        $events | Should -Not -Contain "target_disconnected_after_error"
+        $events | Should -Not -Contain "egs_eos_install_db_sync_ready"
+        $events | Should -Not -Contain "egs_programdata_sync_ready"
+        $events | Should -Not -Contain "egs_manifest_sync_ready"
+        [Array]::IndexOf($events, "egs_manifest_sync_warning") |
+            Should -BeLessThan ([Array]::IndexOf($events, "ready"))
+        $raw | Should -Not -Match "rollback did not complete|secret"
     }
 
     It "logs registration takeover before manifest sync readiness" {
@@ -1713,7 +1778,7 @@ Describe "Startup flow failure handling" {
         Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
     }
 
-    It "logs Majestic readiness before Epic events and final ready" {
+    It "logs Majestic then GTA5RP readiness before Epic events and final ready" {
         $state = Read-SimulationState
         ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
             "0x6589cfc000000001"
@@ -1728,6 +1793,13 @@ Describe "Startup flow failure handling" {
             user_sid = "S-1-5-21-100-200-300-1001"
             profile_path = $TestDrive
         } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        $gta5RpConfig = Join-Path $TestDrive "gta5rp-enabled.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $gta5RpConfig
         Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
         Mock Invoke-ResetRequest {
             if ($Uri.EndsWith("/v1/client")) {
@@ -1756,6 +1828,14 @@ Describe "Startup flow failure handling" {
                 RegistryValueCount = 2
             }
         }
+        Mock Invoke-ClientGta5RpSettingsSync {
+            return [pscustomobject]@{
+                TreeCount = 2
+                KeyCount = 4
+                ValueCount = 7
+                TotalDataBytes = 16936
+            }
+        }
         Mock Invoke-ClientEgsManifestSync {
             return [pscustomobject]@{
                 ManifestCount = 2
@@ -1770,7 +1850,8 @@ Describe "Startup flow failure handling" {
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" `
             -ClientTokenPath $script:tokenPath -SyncConfigPath $egsConfig `
-            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+            -MajesticSettingsConfigPath $majesticConfig `
+            -Gta5RpSettingsConfigPath $gta5RpConfig -TimeoutSeconds 2
 
         $code | Should -Be 0
         $logPath = Join-Path $TestDrive "client.log.jsonl"
@@ -1779,6 +1860,8 @@ Describe "Startup flow failure handling" {
         })
         $events = @($records.event)
         [Array]::IndexOf($events, "majestic_settings_sync_ready") |
+            Should -BeLessThan ([Array]::IndexOf($events, "gta5rp_settings_sync_ready"))
+        [Array]::IndexOf($events, "gta5rp_settings_sync_ready") |
             Should -BeLessThan ([Array]::IndexOf($events, "egs_manifest_sync_ready"))
         [Array]::IndexOf($events, "egs_manifest_sync_ready") |
             Should -BeLessThan ([Array]::IndexOf($events, "ready"))
@@ -1790,11 +1873,16 @@ Describe "Startup flow failure handling" {
         $majestic.backup_total_bytes | Should -Be 2684354560
         $majestic.file_count | Should -Be 5
         $majestic.registry_value_count | Should -Be 2
+        $gta5Rp = $records | Where-Object event -eq "gta5rp_settings_sync_ready"
+        $gta5Rp.registry_tree_count | Should -Be 2
+        $gta5Rp.registry_key_count | Should -Be 4
+        $gta5Rp.registry_value_count | Should -Be 7
+        $gta5Rp.registry_data_bytes | Should -Be 16936
         (Get-Content -LiteralPath $logPath -Raw) | Should -Not -Match `
-            'prefs_latest_base64|lastVisitedServerID|game_disk|ro3|E:|xrzvs|SteamLibrary'
+            'prefs_latest_base64|lastVisitedServerID|game_disk|ro3|E:|xrzvs|SteamLibrary|serversMeta|LicenseVersionAccept|gamePath'
     }
 
-    It "keeps the session and ready when enabled Majestic sync warns" {
+    It "keeps the session and ready when enabled Majestic and GTA5RP sync warn" {
         $state = Read-SimulationState
         ($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id =
             "0x6589cfc000000001"
@@ -1806,6 +1894,13 @@ Describe "Startup flow failure handling" {
             user_sid = "S-1-5-21-100-200-300-1001"
             profile_path = $TestDrive
         } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        $gta5RpConfig = Join-Path $TestDrive "gta5rp-enabled-warning.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $gta5RpConfig
         Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "rev-1" } }
         Mock Invoke-ResetRequest {
             if ($Uri.EndsWith("/v1/client")) {
@@ -1826,20 +1921,26 @@ Describe "Startup flow failure handling" {
         Mock Invoke-ClientMajesticSettingsSync {
             throw "bundle verification failed"
         }
+        Mock Invoke-ClientGta5RpSettingsSync {
+            throw "LicenseVersionAccept publisher-profile gamePath"
+        }
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" `
             -ClientTokenPath $script:tokenPath `
-            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+            -MajesticSettingsConfigPath $majesticConfig `
+            -Gta5RpSettingsConfigPath $gta5RpConfig -TimeoutSeconds 2
 
         $code | Should -Be 0
         @((Read-SimulationState).sessions).Count | Should -Be 1
         $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
             ForEach-Object { ($_ | ConvertFrom-Json).event })
         $events | Should -Contain "majestic_settings_sync_warning"
+        $events | Should -Contain "gta5rp_settings_sync_warning"
         $events | Should -Contain "ready"
         $events | Should -Not -Contain "target_disconnected_after_error"
         (Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") -Raw) |
-            Should -Not -Match "bundle verification failed|publisher-profile|SteamLibrary"
+            Should -Not -Match `
+                "bundle verification failed|LicenseVersionAccept|gamePath|publisher-profile|SteamLibrary"
     }
 
     It "warns but still reaches ready when only legacy Majestic v1 bundles exist" {
@@ -1907,6 +2008,13 @@ Describe "Startup flow failure handling" {
             user_sid = "S-1-5-21-100-200-300-1001"
             profile_path = $TestDrive
         } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfig
+        $gta5RpConfig = Join-Path $TestDrive "gta5rp-disabled.json"
+        @{
+            schema_version = 1
+            mode = "disabled"
+            user_sid = "S-1-5-21-100-200-300-1001"
+            profile_path = $TestDrive
+        } | ConvertTo-Json | Set-Content -LiteralPath $gta5RpConfig
         Mock Invoke-ResetRequest {
             if ($Uri.EndsWith("/v1/client")) {
                 return [pscustomobject]@{
@@ -1926,18 +2034,444 @@ Describe "Startup flow failure handling" {
         Mock Invoke-ClientMajesticSettingsSync {
             throw "disabled synchronization must not run"
         }
+        Mock Invoke-ClientGta5RpSettingsSync {
+            throw "disabled GTA5RP synchronization must not run"
+        }
 
         $code = Invoke-ResetMain -BaseUrl "http://mock" `
             -ClientTokenPath $script:tokenPath `
-            -MajesticSettingsConfigPath $majesticConfig -TimeoutSeconds 2
+            -MajesticSettingsConfigPath $majesticConfig `
+            -Gta5RpSettingsConfigPath $gta5RpConfig -TimeoutSeconds 2
 
         $code | Should -Be 0
         Should -Invoke Invoke-ClientMajesticSettingsSync -Times 0 -Exactly
+        Should -Invoke Invoke-ClientGta5RpSettingsSync -Times 0 -Exactly
         $events = @(Get-Content -LiteralPath (Join-Path $TestDrive "client.log.jsonl") |
             ForEach-Object { ($_ | ConvertFrom-Json).event })
         $events | Should -Contain "ready"
         $events | Should -Not -Contain "majestic_settings_sync_ready"
         $events | Should -Not -Contain "majestic_settings_sync_warning"
+        $events | Should -Not -Contain "gta5rp_settings_sync_ready"
+        $events | Should -Not -Contain "gta5rp_settings_sync_warning"
+    }
+}
+
+Describe "GTA5RP Launcher client registry sync" {
+    BeforeEach {
+        Initialize-Gta5RpRegistryNative
+        $script:Gta5RpClientProfile = Join-Path $TestDrive "gta5rp-client-profile"
+        New-Item -ItemType Directory -Path $script:Gta5RpClientProfile -Force |
+            Out-Null
+        Set-Content -LiteralPath (
+            Join-Path $script:Gta5RpClientProfile "NTUSER.DAT"
+        ) -Value "hive"
+        $script:Gta5RpClientConfig = [pscustomobject]@{
+            Present = $true
+            Enabled = $true
+            UserSid = "S-1-5-21-100-200-300-1001"
+            ProfilePath = $script:Gta5RpClientProfile
+        }
+        $script:Gta5RpClientVolumes = @(
+            [pscustomobject]@{ name = "fast"; drive_letter = "E" }
+            [pscustomobject]@{ name = "bulk"; drive_letter = "H" }
+            [pscustomobject]@{ name = "extra"; drive_letter = "T" }
+        )
+        $script:Gta5RpClientRoots = @{}
+        foreach ($volume in $script:Gta5RpClientVolumes) {
+            $root = Join-Path $TestDrive ("gta5rp-volume-" + $volume.name)
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            $script:Gta5RpClientRoots[[string]$volume.name] = $root
+        }
+        Mock Get-Gta5RpVolumeRoot {
+            return $script:Gta5RpClientRoots[[string]$ExpectedVolume.name]
+        }
+        $trees = @()
+        foreach ($definition in @(
+            [pscustomobject]@{
+                Root = "GTA5RPLauncher"
+                Keys = @(
+                    [pscustomobject]@{
+                        Path = ""
+                        Values = @(
+                            [pscustomobject]@{
+                                Name = ""; Type = 1; Data = [byte[]](65, 0, 0, 0)
+                            }
+                            [pscustomobject]@{
+                                Name = "LicenseVersionAccept"; Type = 4
+                                Data = [byte[]](1, 0, 0, 0)
+                            }
+                        )
+                    }
+                    [pscustomobject]@{
+                        Path = "Cache"
+                        Values = @(
+                            [pscustomobject]@{
+                                Name = "serversMeta"; Type = 3
+                                Data = [byte[]](9, 8, 7, 6)
+                            }
+                        )
+                    }
+                )
+            }
+            [pscustomobject]@{
+                Root = "RAGE-MP"
+                Keys = @(
+                    [pscustomobject]@{
+                        Path = ""
+                        Values = @(
+                            [pscustomobject]@{
+                                Name = "gamePath"; Type = 2
+                                Data = [byte[]](69, 0, 58, 0, 0, 0)
+                            }
+                        )
+                    }
+                    [pscustomobject]@{ Path = "config"; Values = @() }
+                )
+            }
+        )) {
+            $nativeTree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+            $nativeTree.RootName = $definition.Root
+            $treeBytes = [int64]0
+            $treeValues = 0
+            foreach ($definitionKey in $definition.Keys) {
+                $nativeKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+                $nativeKey.RelativePath = $definitionKey.Path
+                foreach ($definitionValue in $definitionKey.Values) {
+                    $nativeValue = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+                    $nativeValue.Name = $definitionValue.Name
+                    $nativeValue.Type = [uint32]$definitionValue.Type
+                    $nativeValue.Data = [byte[]]$definitionValue.Data
+                    $nativeKey.Values.Add($nativeValue)
+                    $treeValues++
+                    $treeBytes += [int64]$definitionValue.Data.Length
+                }
+                $nativeTree.Keys.Add($nativeKey)
+            }
+            $nativeTree.ValueCount = $treeValues
+            $nativeTree.TotalDataBytes = $treeBytes
+            $trees += (ConvertTo-Gta5RpRegistryTreePayload -Tree $nativeTree).Payload
+        }
+        $script:Gta5RpClientBundle = [ordered]@{
+            schema_version = 1
+            config_revision = "gta5rp-revision"
+            registry_trees = $trees
+        }
+        $script:Gta5RpClientBundleBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+            ($script:Gta5RpClientBundle | ConvertTo-Json -Depth 9 -Compress)
+        )
+        foreach ($volume in $script:Gta5RpClientVolumes) {
+            $directory = Join-Path $script:Gta5RpClientRoots[[string]$volume.name] `
+                ".iscsi-reset"
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            [IO.File]::WriteAllBytes(
+                (Join-Path $directory "gta5rp-launcher-settings.v1.json"),
+                $script:Gta5RpClientBundleBytes
+            )
+        }
+    }
+
+    It "validates exact raw bytes on every volume and applies both trees once" {
+        Mock Open-Gta5RpUserHive {
+            return [pscustomobject]@{ RootName = "loaded-user"; LoadedByHelper = $false }
+        }
+        Mock Close-Gta5RpUserHive { }
+        Mock Invoke-Gta5RpRegistryTransaction { }
+
+        $result = Invoke-ClientGta5RpSettingsSync `
+            -Config $script:Gta5RpClientConfig `
+            -ExpectedVolumes $script:Gta5RpClientVolumes `
+            -ConfigRevision "gta5rp-revision"
+
+        $result.TreeCount | Should -Be 2
+        $result.KeyCount | Should -Be 4
+        $result.ValueCount | Should -Be 4
+        $result.TotalDataBytes | Should -Be 18
+        Should -Invoke Invoke-Gta5RpRegistryTransaction -Times 1 -Exactly `
+            -ParameterFilter {
+                $RootName -eq "loaded-user" -and @($Trees).Count -eq 2 -and
+                $Trees[0].Root -eq "GTA5RPLauncher" -and
+                $Trees[1].Root -eq "RAGE-MP" -and
+                $Trees[0].NativeTree.Keys[1].RelativePath -eq "Cache" -and
+                $Trees[1].NativeTree.Keys[1].Values.Count -eq 0
+            }
+    }
+
+    It "preserves every allowed Win32 type, default values, and empty nested keys" {
+        $nativeTree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+        $nativeTree.RootName = "GTA5RPLauncher"
+        $rootKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+        $rootKey.RelativePath = ""
+        $definitions = @(
+            [pscustomobject]@{ Name = ""; Type = 0; Data = [byte[]](0, 255) }
+            [pscustomobject]@{ Name = "binary"; Type = 3; Data = [byte[]](9, 8, 7) }
+            [pscustomobject]@{ Name = "dword"; Type = 4; Data = [byte[]](1, 0, 0, 0) }
+            [pscustomobject]@{ Name = "dwordBe"; Type = 5; Data = [byte[]](0, 0, 0, 2) }
+            [pscustomobject]@{ Name = "expand"; Type = 2; Data = [byte[]](37, 0, 88, 0, 37, 0, 0, 0) }
+            [pscustomobject]@{ Name = "multi"; Type = 7; Data = [byte[]](65, 0, 0, 0, 0, 0) }
+            [pscustomobject]@{ Name = "qword"; Type = 11; Data = [byte[]](3, 0, 0, 0, 0, 0, 0, 0) }
+            [pscustomobject]@{ Name = "string"; Type = 1; Data = [byte[]](66, 0, 0, 0) }
+        )
+        foreach ($definition in $definitions) {
+            $nativeValue = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+            $nativeValue.Name = $definition.Name
+            $nativeValue.Type = [uint32]$definition.Type
+            $nativeValue.Data = [byte[]]$definition.Data
+            $rootKey.Values.Add($nativeValue)
+        }
+        $nativeTree.Keys.Add($rootKey)
+        foreach ($path in @("A", "A!", "A\z")) {
+            $emptyKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+            $emptyKey.RelativePath = $path
+            $nativeTree.Keys.Add($emptyKey)
+        }
+        $nativeTree.ValueCount = $definitions.Count
+        $nativeTree.TotalDataBytes = [int64](
+            ($definitions | ForEach-Object { $_.Data.Length } | Measure-Object -Sum).Sum
+        )
+
+        $payloadA = (ConvertTo-Gta5RpRegistryTreePayload -Tree $nativeTree).Payload
+        $payloadB = (ConvertTo-Gta5RpRegistryTreePayload -Tree $nativeTree).Payload
+        $converted = ConvertFrom-ClientGta5RpRegistryTree -Tree $payloadA `
+            -ExpectedRoot "GTA5RPLauncher"
+
+        $payloadA.sha256 | Should -Be $payloadB.sha256
+        $converted.KeyCount | Should -Be 4
+        $converted.ValueCount | Should -Be 8
+        @($converted.NativeTree.Keys[1].Values).Count | Should -Be 0
+        @($converted.NativeTree.Keys[0].Values | ForEach-Object { [int]$_.Type }) |
+            Should -Be @(0, 3, 4, 5, 2, 7, 11, 1)
+        $converted.NativeTree.Keys[0].Values[0].Name | Should -Be ""
+        $converted.NativeTree.Keys[0].Values[0].Data | Should -Be ([byte[]](0, 255))
+    }
+
+    It "enforces registry depth, key, value, and per-value data limits" {
+        $tooManyKeys = [pscustomobject]@{
+            root = "GTA5RPLauncher"
+            sha256 = ("0" * 64)
+            keys = @(0..256 | ForEach-Object {
+                [pscustomobject]@{ path = if ($_ -eq 0) { "" } else { "K$_" }; values = @() }
+            })
+        }
+        {
+            ConvertFrom-ClientGta5RpRegistryTree -Tree $tooManyKeys `
+                -ExpectedRoot "GTA5RPLauncher"
+        } | Should -Throw "*key count*"
+
+        $depthKeys = @([pscustomobject]@{ path = ""; values = @() })
+        $current = ""
+        foreach ($part in 1..17) {
+            $current = if ($current.Length -eq 0) { "K$part" } else { "$current\K$part" }
+            $depthKeys += [pscustomobject]@{ path = $current; values = @() }
+        }
+        $tooDeep = [pscustomobject]@{
+            root = "GTA5RPLauncher"; sha256 = ("0" * 64); keys = $depthKeys
+        }
+        {
+            ConvertFrom-ClientGta5RpRegistryTree -Tree $tooDeep `
+                -ExpectedRoot "GTA5RPLauncher"
+        } | Should -Throw "*depth*"
+
+        $values = @(0..1024 | ForEach-Object {
+            [pscustomobject]@{
+                name = ("v{0:D4}" -f $_); type = 3; length = 0; base64 = ""
+            }
+        })
+        $tooManyValues = [pscustomobject]@{
+            root = "GTA5RPLauncher"; sha256 = ("0" * 64)
+            keys = @([pscustomobject]@{ path = ""; values = $values })
+        }
+        {
+            ConvertFrom-ClientGta5RpRegistryTree -Tree $tooManyValues `
+                -ExpectedRoot "GTA5RPLauncher"
+        } | Should -Throw "*exceeds its limits*"
+
+        $tooLargeBytes = New-Object byte[] (4MB + 1)
+        $tooLargeValue = [pscustomobject]@{
+            root = "GTA5RPLauncher"; sha256 = ("0" * 64)
+            keys = @([pscustomobject]@{
+                path = ""
+                values = @([pscustomobject]@{
+                    name = "large"; type = 3; length = $tooLargeBytes.Length
+                    base64 = [Convert]::ToBase64String($tooLargeBytes)
+                })
+            })
+        }
+        {
+            ConvertFrom-ClientGta5RpRegistryTree -Tree $tooLargeValue `
+                -ExpectedRoot "GTA5RPLauncher"
+        } | Should -Throw "*length*"
+    }
+
+    It "rejects missing, differing, corrupt, and unsupported registry bundles" {
+        $missing = Join-Path $script:Gta5RpClientRoots["extra"] `
+            ".iscsi-reset/gta5rp-launcher-settings.v1.json"
+        Remove-Item -LiteralPath $missing -Force
+        {
+            Get-ClientGta5RpBundle -ExpectedVolumes $script:Gta5RpClientVolumes `
+                -ConfigRevision "gta5rp-revision"
+        } | Should -Throw "*missing*"
+        [IO.File]::WriteAllBytes($missing, $script:Gta5RpClientBundleBytes)
+        Add-Content -LiteralPath $missing -Value "different"
+        {
+            Get-ClientGta5RpBundle -ExpectedVolumes $script:Gta5RpClientVolumes `
+                -ConfigRevision "gta5rp-revision"
+        } | Should -Throw "*do not match*"
+        [IO.File]::WriteAllBytes($missing, $script:Gta5RpClientBundleBytes)
+        $bad = $script:Gta5RpClientBundleBytes.Clone()
+        $badBundle = [Text.Encoding]::UTF8.GetString($bad) | ConvertFrom-Json
+        $badBundle.registry_trees[0].keys[0].values[0].type = 6
+        $badBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+            ($badBundle | ConvertTo-Json -Depth 9 -Compress)
+        )
+        foreach ($volume in $script:Gta5RpClientVolumes) {
+            [IO.File]::WriteAllBytes(
+                (Join-Path $script:Gta5RpClientRoots[[string]$volume.name] `
+                    ".iscsi-reset/gta5rp-launcher-settings.v1.json"),
+                $badBytes
+            )
+        }
+        {
+            Get-ClientGta5RpBundle -ExpectedVolumes $script:Gta5RpClientVolumes `
+                -ConfigRevision "gta5rp-revision"
+        } | Should -Throw "*unsupported*"
+    }
+
+    It "uses a loaded or temporary user hive and never requires HKCU SYSTEM" {
+        Mock Get-ClientGta5RpBundle {
+            return [pscustomobject]@{
+                Trees = @([pscustomobject]@{ Root = "GTA5RPLauncher" })
+                BundleSha256 = "bundle"
+                KeyCount = 1
+                ValueCount = 1
+                TotalDataBytes = 4
+            }
+        }
+        Mock Open-Gta5RpUserHive {
+            return [pscustomobject]@{
+                RootName = "IscsiResetGta5Rp_test"
+                LoadedByHelper = $true
+            }
+        }
+        Mock Invoke-Gta5RpRegistryTransaction { }
+        Mock Close-Gta5RpUserHive { }
+
+        Invoke-ClientGta5RpSettingsSync -Config $script:Gta5RpClientConfig `
+            -ExpectedVolumes $script:Gta5RpClientVolumes `
+            -ConfigRevision "gta5rp-revision" | Out-Null
+
+        Should -Invoke Invoke-Gta5RpRegistryTransaction -Times 1 -Exactly `
+            -ParameterFilter { $RootName -eq "IscsiResetGta5Rp_test" }
+        Should -Invoke Close-Gta5RpUserHive -Times 1 -Exactly
+    }
+
+    It "atomically replaces both real registry trees and rolls back before commit" {
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+            Set-ItResult -Skipped -Because "Windows Transactional Registry is required"
+            return
+        }
+        $suffix = [Guid]::NewGuid().ToString("N")
+        $rootA = "IscsiResetGta5RpTestA_$suffix"
+        $rootB = "IscsiResetGta5RpTestB_$suffix"
+        $pathA = "HKCU:\Software\$rootA"
+        $pathB = "HKCU:\Software\$rootB"
+        try {
+            New-Item -Path (Join-Path $pathA "stale") -Force | Out-Null
+            New-ItemProperty -Path $pathA -Name "old" -Value "keep-a" -Force |
+                Out-Null
+            New-Item -Path $pathB -Force | Out-Null
+            New-ItemProperty -Path $pathB -Name "old" -Value "keep-b" -Force |
+                Out-Null
+            $trees = @()
+            foreach ($root in @($rootA, $rootB)) {
+                $nativeTree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+                $nativeTree.RootName = $root
+                $nativeKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+                $nativeKey.RelativePath = ""
+                $valueDefinitions = if ($root -eq $rootA) {
+                    @(
+                        [pscustomobject]@{ Name = ""; Type = 0; Data = [byte[]](255) }
+                        [pscustomobject]@{ Name = "binary"; Type = 3; Data = [byte[]](9, 8) }
+                        [pscustomobject]@{ Name = "dwordBe"; Type = 5; Data = [byte[]](0, 0, 0, 2) }
+                        [pscustomobject]@{ Name = "expand"; Type = 2; Data = [byte[]](37, 0, 0, 0) }
+                        [pscustomobject]@{ Name = "multi"; Type = 7; Data = [byte[]](65, 0, 0, 0, 0, 0) }
+                        [pscustomobject]@{ Name = "new"; Type = 4; Data = [byte[]](7, 0, 0, 0) }
+                        [pscustomobject]@{ Name = "qword"; Type = 11; Data = [byte[]](8, 0, 0, 0, 0, 0, 0, 0) }
+                        [pscustomobject]@{ Name = "string"; Type = 1; Data = [byte[]](66, 0, 0, 0) }
+                    )
+                } else {
+                    @([pscustomobject]@{ Name = "new"; Type = 4; Data = [byte[]](7, 0, 0, 0) })
+                }
+                foreach ($valueDefinition in $valueDefinitions) {
+                    $nativeValue = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+                    $nativeValue.Name = $valueDefinition.Name
+                    $nativeValue.Type = [uint32]$valueDefinition.Type
+                    $nativeValue.Data = [byte[]]$valueDefinition.Data
+                    $nativeKey.Values.Add($nativeValue)
+                }
+                $nativeTree.Keys.Add($nativeKey)
+                if ($root -eq $rootA) {
+                    foreach ($relativePath in @("nested", "nested\empty")) {
+                        $emptyKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+                        $emptyKey.RelativePath = $relativePath
+                        $nativeTree.Keys.Add($emptyKey)
+                    }
+                }
+                $nativeTree.ValueCount = $valueDefinitions.Count
+                $nativeTree.TotalDataBytes = [int64](
+                    ($valueDefinitions | ForEach-Object { $_.Data.Length } |
+                        Measure-Object -Sum).Sum
+                )
+                $payload = ConvertTo-Gta5RpRegistryTreePayload -Tree $nativeTree
+                $trees += [pscustomobject]@{
+                    Root = $root
+                    NativeTree = $nativeTree
+                    Sha256 = [string]$payload.Payload.sha256
+                }
+            }
+            $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            {
+                Invoke-Gta5RpRegistryTransaction -RootName $sid -Trees $trees `
+                    -BeforeCommit { throw "injected before commit" }
+            } | Should -Throw "*injected before commit*"
+            (Get-ItemProperty -LiteralPath $pathA -Name "old").old |
+                Should -Be "keep-a"
+            (Get-ItemProperty -LiteralPath $pathB -Name "old").old |
+                Should -Be "keep-b"
+
+            Invoke-Gta5RpRegistryTransaction -RootName $sid -Trees $trees
+
+            (Get-ItemProperty -LiteralPath $pathA -Name "new").new | Should -Be 7
+            (Get-ItemProperty -LiteralPath $pathB -Name "new").new | Should -Be 7
+            Test-Path -LiteralPath (Join-Path $pathA "stale") | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $pathA "nested\empty") |
+                Should -BeTrue
+            (Get-ItemProperty -LiteralPath $pathA).PSObject.Properties.Name |
+                Should -Not -Contain "old"
+            (Get-ItemProperty -LiteralPath $pathB).PSObject.Properties.Name |
+                Should -Not -Contain "old"
+            $captured = [IscsiReset.Gta5RpRegistryNative]::CaptureTree($sid, $rootA)
+            @($captured.Keys[0].Values | ForEach-Object { [int]$_.Type }) |
+                Should -Be @(0, 3, 5, 2, 7, 4, 11, 1)
+            $captured.Keys[0].Values[0].Name | Should -Be ""
+            $captured.Keys[0].Values[0].Data | Should -Be ([byte[]](255))
+        } finally {
+            Remove-Item -LiteralPath $pathA -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $pathB -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "contains no GTA5RP process stop or process check" {
+        $source = Get-Content -LiteralPath $script:ClientScriptPath -Raw
+        $block = [regex]::Match(
+            $source,
+            '(?s)function Invoke-ClientGta5RpSettingsSync.*?function Initialize-EgsZipSupport'
+        ).Value
+        $block | Should -Not -Match 'Get-Process|Stop-Process|CloseMainWindow'
+        $source | Should -Match 'REG_OPTION_OPEN_LINK'
+        $source | Should -Match 'AssertTreeHasNoLinks'
+        $source | Should -Match 'key, childName, 0, desired'
+        $source | Should -Match 'softwareKey, treeRoot, 0'
+        $source | Should -Match 'type != 5 && type != 7'
     }
 }
 

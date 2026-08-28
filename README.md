@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.5.0
+# iSCSI Reset Service v0.5.1
 
 iSCSI Reset Service публикует согласованный набор ZFS-снимков игровых дисков и перед запуском
 игрового ПК возвращает его записываемые клоны к чистому состоянию. Publisher хранит и обновляет
@@ -363,7 +363,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 ./Install-IscsiReleasePublisher.ps1 `
   -ManifestSourcePath ./publisher.json `
   -EpicGamesManifestSync Aggressive `
-  -MajesticLauncherSettingsSync Enabled
+  -MajesticLauncherSettingsSync Enabled `
+  -Gta5RpLauncherSettingsSync Enabled
 ```
 
 Установщик размещает helper и защищённую конфигурацию в
@@ -381,7 +382,8 @@ Set-ExecutionPolicy -Scope Process Bypass
   -CaCertificatePath ./reset-ca.crt `
   -ResetApiIp 10.20.40.10 `
   -EpicGamesManifestSync Aggressive `
-  -MajesticLauncherSettingsSync Enabled
+  -MajesticLauncherSettingsSync Enabled `
+  -Gta5RpLauncherSettingsSync Enabled
 ```
 
 Введите client token в скрытом приглашении. Установщик сохраняет token, сертификат,
@@ -399,8 +401,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 | `-EpicGamesManifestSync` | `Aggressive` | Полное состояние Epic для клиента с точным полным набором Publisher-томов |
 | `-MajesticLauncherSettingsSync` | `Disabled` | Синхронизация Majestic выключена |
 | `-MajesticLauncherSettingsSync` | `Enabled` | Перенос настроек и состояния проверки Majestic |
+| `-Gta5RpLauncherSettingsSync` | `Disabled` | Синхронизация GTA5RP/RAGE-MP выключена |
+| `-Gta5RpLauncherSettingsSync` | `Enabled` | Перенос полных пользовательских деревьев реестра GTA5RP/RAGE-MP |
 
-Оба параметра по умолчанию имеют значение `Disabled`. Majestic включается отдельно от Epic.
+Все параметры по умолчанию имеют значение `Disabled` и включаются независимо.
 
 ### Epic Games Launcher
 
@@ -408,6 +412,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 же буквах и полных путях. `Aggressive` дополнительно переносит общее состояние Epic и требует
 точный полный case-sensitive набор логических Publisher-томов. Для сетевых игр отключите Auto
 Update штатным переключателем Epic Games Launcher.
+
+Клиент выполняет Epic sync только после успешной проверки и подключения полного набора
+iSCSI-томов. Любая ошибка Epic записывается как `egs_manifest_sync_warning`, но не отключает
+проверенную client-сессию и не блокирует `ready`. При таком предупреждении игровые диски готовы,
+но локальное состояние Epic может быть несогласованным, в том числе после неудачного rollback.
 
 Синхронизация сохраняет локальные учётные записи, authorization, LocalAppData, webcache и
 несвязанные установки. На старом release может отображаться `Update`; при совпадающем build
@@ -433,6 +442,17 @@ Update штатным переключателем Epic Games Launcher.
 Клиенты используют ту же букву `gameDisk`; helper создаёт профильный junction на payload своего
 клона. Переносятся только перечисленные настройки и verification state. Авторизация,
 `mods.bin`, Chromium Cache, Local Storage и Session Storage остаются локальными.
+
+### GTA5RP Launcher и RAGE-MP
+
+`Enabled` переносит полные пользовательские деревья `HKCU\Software\GTA5RPLauncher` и
+`HKCU\Software\RAGE-MP`, включая вложенные и пустые ключи, default values и исходные типы и
+данные значений. Пути переносятся буквально. Файлы launcher, RAGE-MP и состояние дискового
+кэша остаются на игровых томах.
+
+Снимок реестра хранится без шифрования в `.iscsi-reset` каждого игрового тома. Он может
+содержать авторизацию, если GTA5RP Launcher или RAGE-MP записали её в эти деревья. Включайте
+режим только для доверенных игровых томов и устанавливайте оба helper под игровым пользователем.
 
 ## Ежедневная эксплуатация
 

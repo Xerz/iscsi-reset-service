@@ -1,5 +1,103 @@
 # Verification record
 
+## Epic Games client sync warning-only v0.5.1 — 2026-08-28
+
+### Реализация
+
+- После успешных prepare, iSCSI login и полной проверки дисков весь клиентский Epic Games sync
+  выполняется как необязательная post-connect операция. Любое исключение, включая неполный
+  rollback, записывает только безопасное `egs_manifest_sync_warning`, сохраняет проверенную
+  session и не блокирует итоговый `ready`.
+- При ошибке не записываются Epic success-события и исходный exception не попадает в JSONL.
+  Ошибки connect, discovery, NAA, labels, partitions и drive-letter reconciliation сохраняют
+  прежнее fail-closed поведение с отключением session текущего запуска.
+- README и TEST-PLAN явно фиксируют, что после warning диски готовы, но локальное состояние Epic
+  может быть несогласованным. YAML schema, SQLite, Reset API и bundle formats не изменялись.
+
+### Автоматические проверки
+
+- Parser всех production/test `.ps1` в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — успешно.
+- Профильный client Pester 5.7.1 в том же Linux/amd64 образе — **104 passed, 0 failed,
+  1 skipped** из 105. Новые тесты проверяют обычную ошибку Enabled и незавершённый aggressive
+  rollback: код `0`, session сохранена, есть warning/`ready`, нет disconnect, success-событий,
+  `CLIENT_ERROR` и текста исключения.
+- Полный Pester 5.7.1 в том же образе — **170 passed, 0 failed, 2 skipped** из 172 за
+  17.94 секунды. Пропущены Windows-only ACL и реальная Transactional Registry проверка; это не
+  Windows PowerShell 5.1.
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  2.23 секунды. `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose config --quiet` — успешно.
+  `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed** с версией `0.5.1`; после проверки выполнен
+  `docker compose down --volumes`.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Полный Pester на Windows PowerShell 5.1.
+- Физический dual-role Publisher/client цикл на реальных Windows/TrueNAS: вызвать несовпадение
+  Epic bundle и отдельно незавершённый rollback, подтвердить сохранённую client-session,
+  `egs_manifest_sync_warning` → `ready` и отсутствие Epic success-событий.
+- После искусственно незавершённого rollback отдельно проверить локальное состояние Epic и
+  recovery при следующем reset; warning-only политика намеренно не гарантирует его целостность.
+
+## GTA5RP/RAGE-MP Registry Sync v0.5.1 — 2026-08-28
+
+### Реализация
+
+- В установщики Publisher и клиента добавлен независимый opt-in
+  `-Gta5RpLauncherSettingsSync Enabled|Disabled`, по умолчанию `Disabled`. Защищённый
+  `gta5rp-sync.json` хранит режим, SID и путь профиля пользователя установщика; startup-задача
+  клиента остаётся под SYSTEM.
+- Publisher дважды канонически считывает обязательные деревья
+  `HKCU\Software\GTA5RPLauncher` и `HKCU\Software\RAGE-MP` из загруженного либо временно
+  загруженного пользовательского hive. Переносятся пустые/вложенные ключи, default values,
+  разрешённые Win32-типы и исходные bytes. Registry links и resource-descriptor types
+  отклоняются.
+- Одинаковый schema 1 bundle с `config_revision` атомарно записывается на каждый master-том.
+  Disabled и обычная ошибка экспорта удаляют только GTA5RP bundle; неподтверждённая очистка
+  останавливает Publisher до перевода дисков offline.
+- Клиент проверяет одинаковый bundle на всех своих томах и заменяет оба дерева в одной общей
+  KTM/TxR-транзакции. Состояние сверяется внутри транзакции перед commit и повторно после
+  commit. Ошибка остаётся warning-only, сохраняет iSCSI-session и не блокирует `ready`.
+  Событие успеха расположено после Majestic и до Epic-событий.
+- Версия повышена до `0.5.1` в package metadata, заголовках README и TEST-PLAN. YAML schema,
+  SQLite, Reset API и существующие Epic/Majestic bundle не изменялись. Commit, push, tag и
+  GitHub Release не выполнялись.
+
+### Автоматические проверки
+
+- Parser всех production/test `.ps1` в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — успешно.
+- Полный Pester 5.7.1 в том же Linux/amd64 образе через эмуляцию на arm64 Docker host —
+  **169 passed, 0 failed, 2 skipped** из 171 за 18.6 секунды. Пропущены Windows-only ACL и
+  реальная Transactional Registry проверка; это не Windows PowerShell 5.1.
+- GTA5RP Pester-покрытие проверяет независимые installer flags/config, точные raw bytes,
+  default values, пустые и вложенные ключи, все разрешённые типы, детерминированность, лимиты,
+  двойной snapshot, три произвольно названных тома, cleanup, warning/ready и порядок событий.
+  Windows-only тест подготовлен для реальной TxR-замены двух временных HKCU-деревьев,
+  rollback до commit, stale subkeys и повторное чтение всех разрешённых типов.
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  4.34 секунды. `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose config --quiet` — успешно.
+  `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed** с версией `0.5.1`; после проверки выполнен
+  `docker compose down --volumes`.
+- README содержит ровно по одному вызову установщиков Publisher/клиента; оба примера включают
+  Epic `Aggressive`, Majestic `Enabled` и GTA5RP `Enabled`. Сохранены 13 сбалансированных
+  диагностических `<details>`.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Полный Pester на Windows PowerShell 5.1, включая реальную KTM/TxR-транзакцию, rollback и
+  работу с временно загруженным `NTUSER.DAT`.
+- Publisher `Disconnect` → stage → activate → client reset на реальных Windows/TrueNAS,
+  сравнение канонических snapshots обоих деревьев и запуск GTA5RP/RAGE-MP с сетевыми путями.
+- Отдельная физическая проверка конфликта открытого Registry, Registry symbolic link и
+  rollback реальной TxR-транзакции.
+
 ## Release preparation v0.5.0 — 2026-08-27
 
 ### Физическое подтверждение оператора

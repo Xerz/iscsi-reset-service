@@ -7,7 +7,9 @@ param(
     [ValidateSet("Enabled", "Disabled", "Aggressive")]
     [string]$EpicGamesManifestSync = "Disabled",
     [ValidateSet("Enabled", "Disabled")]
-    [string]$MajesticLauncherSettingsSync = "Disabled"
+    [string]$MajesticLauncherSettingsSync = "Disabled",
+    [ValidateSet("Enabled", "Disabled")]
+    [string]$Gta5RpLauncherSettingsSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -182,6 +184,7 @@ function Invoke-IscsiResetClientInstall {
         $tokenPath = Join-Path $InstallRoot "client.token"
         $egsConfigPath = Join-Path $InstallRoot "egs-sync.json"
         $majesticConfigPath = Join-Path $InstallRoot "majestic-sync.json"
+        $gta5RpConfigPath = Join-Path $InstallRoot "gta5rp-sync.json"
         Copy-Item -LiteralPath $ClientScriptPath -Destination $installedScript -Force
         Set-Acl -LiteralPath $installedScript -AclObject (New-RestrictedFileSystemAcl)
         [System.IO.File]::WriteAllText(
@@ -203,6 +206,13 @@ function Invoke-IscsiResetClientInstall {
             profile_path = $majesticProfile.ProfilePath
         } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfigPath -Encoding UTF8
         Set-Acl -LiteralPath $majesticConfigPath -AclObject (New-RestrictedFileSystemAcl)
+        [ordered]@{
+            schema_version = 1
+            mode = $Gta5RpLauncherSettingsSync.ToLowerInvariant()
+            user_sid = $majesticProfile.Sid
+            profile_path = $majesticProfile.ProfilePath
+        } | ConvertTo-Json | Set-Content -LiteralPath $gta5RpConfigPath -Encoding UTF8
+        Set-Acl -LiteralPath $gta5RpConfigPath -AclObject (New-RestrictedFileSystemAcl)
 
         Import-Certificate -FilePath $CaCertificatePath `
             -CertStoreLocation "Cert:\LocalMachine\Root" | Out-Null
@@ -236,6 +246,7 @@ function Invoke-IscsiResetClientInstall {
         Write-Host "Installed iSCSI reset client for Reset API $($api.Ip):8443."
         Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
         Write-Host "Majestic Launcher settings sync: $MajesticLauncherSettingsSync."
+        Write-Host "GTA5RP Launcher settings sync: $Gta5RpLauncherSettingsSync."
         Write-Host "Reboot to run the first reset and non-persistent login."
     }
     finally {

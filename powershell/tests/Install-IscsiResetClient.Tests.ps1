@@ -52,6 +52,7 @@ Describe "iSCSI reset client installer inputs" {
         $parameterNames | Should -Contain "ResetApiIp"
         $parameterNames | Should -Contain "EpicGamesManifestSync"
         $parameterNames | Should -Contain "MajesticLauncherSettingsSync"
+        $parameterNames | Should -Contain "Gta5RpLauncherSettingsSync"
         $parameterNames | Should -Not -Contain "Token"
         $parameterNames | Should -Not -Contain "ApiBaseUrl"
     }
@@ -200,6 +201,8 @@ Describe "Installer secret and ACL regression" {
                 'ValidateSet\("Enabled", "Disabled", "Aggressive"\)'
             $installerSource | Should -Match `
                 'MajesticLauncherSettingsSync = "Disabled"'
+            $installerSource | Should -Match `
+                'Gta5RpLauncherSettingsSync = "Disabled"'
             $installerSource | Should -Match 'schema_version = 1'
             $installerSource | Should -Match `
                 'mode = \$MajesticLauncherSettingsSync\.ToLowerInvariant\(\)'
@@ -209,6 +212,10 @@ Describe "Installer secret and ACL regression" {
                 '\$majesticProfile = Get-MajesticSyncUserProfile'
             $installerSource | Should -Match 'user_sid = \$majesticProfile\.Sid'
             $installerSource | Should -Match 'profile_path = \$majesticProfile\.ProfilePath'
+            $installerSource | Should -Match 'gta5rp-sync\.json'
+            $installerSource | Should -Match `
+                'mode = \$Gta5RpLauncherSettingsSync\.ToLowerInvariant\(\)'
+            $installerSource | Should -Match 'user_sid = \$majesticProfile\.Sid'
         }
     }
 

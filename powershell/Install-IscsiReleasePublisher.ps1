@@ -6,7 +6,9 @@ param(
     [ValidateSet("Enabled", "Disabled", "Aggressive")]
     [string]$EpicGamesManifestSync = "Disabled",
     [ValidateSet("Enabled", "Disabled")]
-    [string]$MajesticLauncherSettingsSync = "Disabled"
+    [string]$MajesticLauncherSettingsSync = "Disabled",
+    [ValidateSet("Enabled", "Disabled")]
+    [string]$Gta5RpLauncherSettingsSync = "Disabled"
 )
 
 Set-StrictMode -Version 2.0
@@ -74,6 +76,7 @@ $configPath = Join-Path $InstallDirectory "publisher.json"
 $installedScript = Join-Path $InstallDirectory "Publish-IscsiRelease.ps1"
 $egsConfigPath = Join-Path $InstallDirectory "egs-sync.json"
 $majesticConfigPath = Join-Path $InstallDirectory "majestic-sync.json"
+$gta5RpConfigPath = Join-Path $InstallDirectory "gta5rp-sync.json"
 Copy-Item -LiteralPath $ManifestSourcePath -Destination $configPath -Force
 Copy-Item -LiteralPath $PublisherScriptPath -Destination $installedScript -Force
 [ordered]@{
@@ -87,11 +90,19 @@ $majesticProfile = Get-MajesticSyncUserProfile
     user_sid = $majesticProfile.Sid
     profile_path = $majesticProfile.ProfilePath
 } | ConvertTo-Json | Set-Content -LiteralPath $majesticConfigPath -Encoding UTF8
+[ordered]@{
+    schema_version = 1
+    mode = $Gta5RpLauncherSettingsSync.ToLowerInvariant()
+    user_sid = $majesticProfile.Sid
+    profile_path = $majesticProfile.ProfilePath
+} | ConvertTo-Json | Set-Content -LiteralPath $gta5RpConfigPath -Encoding UTF8
 
 & icacls.exe $InstallDirectory /inheritance:r | Out-Null
 & icacls.exe $InstallDirectory `
     /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-foreach ($path in @($configPath, $installedScript, $egsConfigPath, $majesticConfigPath)) {
+foreach ($path in @(
+    $configPath, $installedScript, $egsConfigPath, $majesticConfigPath, $gta5RpConfigPath
+)) {
     & icacls.exe $path /inheritance:r | Out-Null
     & icacls.exe $path /grant:r "*S-1-5-18:F" "*S-1-5-32-544:F" | Out-Null
 }
@@ -100,4 +111,5 @@ Write-Host "Publisher helper installed: $installedScript"
 Write-Host "Manifest revision: $($manifest.config_revision)"
 Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
 Write-Host "Majestic Launcher settings sync: $MajesticLauncherSettingsSync."
+Write-Host "GTA5RP Launcher settings sync: $Gta5RpLauncherSettingsSync."
 Write-Host "Use -Action Disconnect before staging and -Action Reconnect after activation."

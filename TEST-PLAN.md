@@ -1,4 +1,4 @@
-# Механический тест-план v0.5.0
+# Механический тест-план v0.5.1
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -170,8 +170,8 @@
 6. Поочерёдно подменить на копии стенда installation ID, install path, hashes `.item`,
    `.manifest` и `.mancpn`, `config_revision`, `volume_name`, обязательный `.manifest`,
    существующий `.mancpn` и executable. Publisher должен отказать до
-   pending/offline/disconnect; client — вернуть `40`, не записать `ready` и отключить только
-   созданную этим запуском session.
+   pending/offline/disconnect; client должен записать `egs_manifest_sync_warning`, сохранить
+   проверенную session, затем записать `ready` без Epic success-событий и текста исключения.
 7. Удалить EGS с клиента, установить Launcher заново, не начинать загрузки и выполнить reset.
    До запуска EGS должны существовать три точных `.item`, managed-state и минимальный
    `LauncherInstalled.dat` с GTA V, Fortnite и GTA V Enhanced. Ожидаемый порядок:
@@ -185,8 +185,8 @@
    записями `LauncherInstalled.dat`. Helper должен сохранить точные резервные копии под
    `egs-displaced-registrations`, удалить только старую регистрацию, оставить каталог и marker
    локальной игры, одну совпадающую сетевую запись и все посторонние приложения/поля.
-   Повреждённый локальный JSON и целевой GUID-файл другого AppName должны дать код `40` до
-   `ready`.
+   Повреждённый локальный JSON и целевой GUID-файл другого AppName должны дать
+   `egs_manifest_sync_warning`, сохранить session и завершиться `ready`.
 10. Удалить или повредить Publisher `LauncherInstalled.dat`, создать дубли и несовпадающие
    path/version. `Disconnect` должен продолжиться с предупреждением, bundle — получить
    `launcher_registration: null`, а клиент — ненулевой `item_only_fallback_count` без создания
@@ -199,9 +199,10 @@
    имитировать отказ после первой замены `.item` и после создания нового `LauncherInstalled.dat`:
    проверенный rollback должен восстановить все bytes, managed-state и `LauncherInstalled.dat`,
    а следующий запуск — успешно завершить транзакцию. Отдельно восстановить оставшийся journal
-   v1 от v0.4.6; при искусственно неполном rollback журнал должен сохраниться.
-13. Активировать старый release только с v1: client в режиме `Enabled` должен вернуть `40`, не записать
-   `ready` и отключить только session текущего запуска.
+   v1 от v0.4.6; при искусственно неполном rollback журнал должен сохраниться, а helper —
+   записать warning и `ready`, оставив session подключённой.
+13. Активировать старый release только с v1: client в режиме `Enabled` должен записать
+   `egs_manifest_sync_warning`, сохранить session и завершиться `ready` без Epic success-событий.
 14. Выполнить полный Publisher → stage → activate → client workflow для трёх игр. На
    актуальном release EGS должен показать `Launch`. На старом release он должен показать
    `Update`, а не `Install`; Auto Update сетевых игр должен быть отключён штатным переключателем
@@ -222,19 +223,21 @@
     UTC timestamps. Проверить точные paths, размеры и SHA-256 при локальной NTFS metadata без
     Publisher ACL/SID. Поочерёдно внедрить изменённые bytes/размер, reparse point,
     traversal, различающийся только регистром collision, более 100 000 файлов, более 1 GiB
-    суммарно и файл более 512 MiB: операция должна fail-closed завершиться до `ready`.
+    суммарно и файл более 512 MiB: Epic sync должен остановиться с warning, но проверенная
+    session должна сохраниться и helper должен записать `ready`.
 18. Подключить клиент только с подмножеством томов, добавить лишний, пустой, дублированный и
     отличающийся только регистром logical volume, а также указать anchor отсутствующего тома.
-    Каждый случай должен вернуть `40`, отключить только созданную session и не менять локальные
-    ProgramData/shared DB. Отдельно активировать v2 и v3 release при aggressive config с тем же
-    ожиданием.
+    Каждый случай должен записать `egs_manifest_sync_warning`, сохранить session и не менять
+    локальные ProgramData/shared DB. Отдельно активировать v2 и v3 release при aggressive config
+    с тем же ожиданием; все случаи завершаются `ready` без Epic success-событий.
     Полный v4-набор в любом порядке должен дать `egs_eos_install_db_sync_ready` →
     `egs_programdata_sync_ready` → `egs_manifest_sync_ready` → `ready`.
 19. Имитировать сбой Publisher после записи ZIP, index, первого v4 bundle и удаления первого
     v1–v3 helper-файла; pending/offline/disconnect запрещены, retry согласует весь набор. На
     клиенте имитировать сбои после swap shared-базы, directory swap, замены
     `LauncherInstalled.dat` и managed-state: journal v4 обязан точно восстановить старые bytes,
-    а неполный rollback — сохранить journal.
+    а неполный rollback — сохранить journal. Любая клиентская ошибка, включая неполный rollback,
+    должна дать warning и `ready` с сохранённой session; следующий запуск выполняет recovery.
 20. Проверить recovery оставшихся journals v1–v3, постоянный SHA-addressed backup старых shared
     Install DB, Data и launcher-файла и no-op повторного запуска при точном tree hash. Старое
     локальное состояние не должно удаляться из backup автоматически. Отдельная non-shared база
@@ -300,7 +303,41 @@
     Неверный/dangling Publisher junction и staging reparse point должны блокировать Disconnect
     до disk offline.
 
-## 9. Один dual-role Publisher/client ПК
+## 9. GTA5RP Launcher и RAGE-MP registry sync
+
+1. На Publisher и выделенном клиенте из повышенной Windows PowerShell 5.1 переустановить
+   helper с `-Gta5RpLauncherSettingsSync Enabled` под соответствующим игровым пользователем.
+   Проверить schema 1 `gta5rp-sync.json`, точные SID/profile, ACL только для SYSTEM и
+   Administrators и startup-задачу под SYSTEM. Повторить с `Disabled`.
+2. Создать на Publisher оба обязательных дерева `HKCU\Software\GTA5RPLauncher` и
+   `HKCU\Software\RAGE-MP`: вложенные и пустые ключи, default value, `REG_SZ`, `REG_EXPAND_SZ`,
+   `REG_BINARY`, `REG_DWORD`, `REG_DWORD_BIG_ENDIAN`, `REG_MULTI_SZ`, `REG_QWORD` и stale
+   значения, отсутствующие в эталоне клиента. Выполнить `Disconnect` с тремя произвольно
+   названными master-томами без остановки процессов GTA5RP/RAGE-MP.
+3. Сверить одинаковый `.iscsi-reset\gta5rp-launcher-settings.v1.json` на всех master-томах,
+   `config_revision`, канонические SHA-256 деревьев, типы, длины и Base64 исходных bytes.
+   Bundle не должен содержать SID или путь профиля. JSONL не должен содержать имена ключей,
+   значений, пути и данные реестра.
+4. Выполнить Publisher → stage → activate → client reset до входа игрового пользователя.
+   SYSTEM должен временно загрузить `NTUSER.DAT`, одной реальной TxR-транзакцией заменить оба
+   дерева, удалить stale subkeys и commit-ить только после внутренней сверки. После входа
+   сравнить канонические snapshots и подтвердить запуск GTA5RP/RAGE-MP с сетевыми путями.
+5. Повторить reset при загруженном hive. `reg load/unload` не вызываются, результат остаётся
+   точным и журнал содержит `gta5rp_settings_sync_ready` после Majestic и до Epic/`ready`.
+6. Имитировать сбой перед TxR commit и отдельно конфликт открытого Registry. Оба прежних дерева
+   должны сохраниться без частичных изменений; helper пишет `gta5rp_settings_sync_warning`,
+   сохраняет iSCSI-session и завершает `ready`. Следующий reset полностью согласует состояние.
+7. Поочерёдно удалить bundle одного тома, изменить bytes, config revision, Base64, hash и тип,
+   а также создать разные bundles на клиентских томах. Каждый случай должен дать warning и
+   `ready` без изменений деревьев.
+8. Изменить одно дерево между первым и вторым Publisher snapshot. Публикация должна удалить
+   GTA5RP bundle со всех томов и продолжить Disconnect; неподтверждённая очистка обязана
+   остановить операцию до disk offline. Режим `Disabled` удаляет только этот bundle.
+9. Отдельно выполнить реальный rollback TxR на Windows PowerShell 5.1 и проверить, что до
+   commit ни одно из двух старых деревьев не изменяется. Проверку не заменять mock/container
+   результатом.
+
+## 10. Один dual-role Publisher/client ПК
 
 1. Настроить один клиент с той же полной парой SAN IP/IQN, что у Publisher, но с отдельными
    client target, extent и associations. Убедиться, что обе target имеют точный IQN и тот же
@@ -316,7 +353,7 @@
 6. Проверить частичное совпадение только IP, только IQN и постороннюю target: это должна быть
    красная ошибка `identity conflict`, а не ожидаемое предупреждение о другой роли.
 
-## 10. Комплект GitHub Release
+## 11. Комплект GitHub Release
 
 1. Скачать семь assets: YAML, `image-digest.txt`, `SHA256SUMS` и четыре операторских `.ps1`.
 2. Убедиться, что `publisher.json` и тестовые PowerShell-файлы в выпуск не попали.
@@ -327,7 +364,7 @@
 5. Проверить, что workflow artifact и GitHub Release содержат одинаковый комплект файлов.
 6. На опубликованном tag дождаться Python, Compose и Windows PowerShell 5.1 CI.
 
-## 11. Чек-лист результата
+## 12. Чек-лист результата
 
 | Проверка | Ожидание | Факт | Статус |
 |---|---|---|---|
@@ -337,8 +374,9 @@
 | Config save | 409/live recheck/SQLite guards/atomic history |  | ☐ |
 | Restart revisions | После restart startup = saved |  | ☐ |
 | Publisher Disconnect | Exact session/NAA, pending до mutations |  | ☐ |
-| Epic Games sync | Exact bundles, managed `.item`, rollback/retry |  | ☐ |
+| Epic Games sync | Exact bundles; любая ошибка warning-only, session/ready сохраняются |  | ☐ |
 | Majestic settings sync | 5 small files/REG_SZ, backup junction, both hash maps last |  | ☐ |
+| GTA5RP/RAGE-MP sync | Два полных Registry tree, один TxR commit, rollback/retry |  | ☐ |
 | Stage | Fail-closed, immutable полный mapping |  | ☐ |
 | Incomplete retry | Исходный request ID, без удаления snapshots |  | ☐ |
 | Activate до reconnect | Повторная live-сверка и atomic pointer |  | ☐ |

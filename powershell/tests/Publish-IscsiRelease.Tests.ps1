@@ -650,6 +650,237 @@ Describe "Publisher Majestic Launcher settings bundles" {
     }
 }
 
+Describe "Publisher GTA5RP Launcher registry bundles" {
+    BeforeEach {
+        $script:GetPublisherGta5RpRegistryCaptureOriginal =
+            ${function:Get-PublisherGta5RpRegistryCapture}
+        $script:Gta5RpPublisherProfile = Join-Path $TestDrive "gta5rp-publisher-profile"
+        New-Item -ItemType Directory -Path $script:Gta5RpPublisherProfile -Force |
+            Out-Null
+        Set-Content -LiteralPath (
+            Join-Path $script:Gta5RpPublisherProfile "NTUSER.DAT"
+        ) -Value "hive"
+        $script:Gta5RpPublisherConfig = [pscustomobject]@{
+            Present = $true
+            Enabled = $true
+            UserSid = "S-1-5-21-100-200-300-1001"
+            ProfilePath = $script:Gta5RpPublisherProfile
+        }
+        $script:Gta5RpPublisherManifest = [pscustomobject]@{
+            config_revision = "gta5rp-revision"
+        }
+        $script:Gta5RpPublisherMappings = @(
+            [pscustomobject]@{ Name = "fast"; RootPath = (Join-Path $TestDrive "gta-fast") }
+            [pscustomobject]@{ Name = "bulk"; RootPath = (Join-Path $TestDrive "gta-bulk") }
+            [pscustomobject]@{ Name = "extra"; RootPath = (Join-Path $TestDrive "gta-extra") }
+        )
+        foreach ($mapping in $script:Gta5RpPublisherMappings) {
+            New-Item -ItemType Directory -Path $mapping.RootPath -Force | Out-Null
+        }
+        Initialize-Gta5RpRegistryNative
+        $trees = @()
+        foreach ($definition in @(
+            [pscustomobject]@{
+                Root = "GTA5RPLauncher"
+                Values = @(
+                    [pscustomobject]@{ Name = ""; Type = 1; Data = [byte[]](65, 0, 0, 0) }
+                    [pscustomobject]@{ Name = "LicenseVersionAccept"; Type = 4; Data = [byte[]](1, 0, 0, 0) }
+                )
+            }
+            [pscustomobject]@{
+                Root = "RAGE-MP"
+                Values = @(
+                    [pscustomobject]@{ Name = "gamePath"; Type = 2; Data = [byte[]](69, 0, 58, 0, 0, 0) }
+                )
+            }
+        )) {
+            $nativeTree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+            $nativeTree.RootName = $definition.Root
+            $nativeKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+            $nativeKey.RelativePath = ""
+            foreach ($definitionValue in $definition.Values) {
+                $nativeValue = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+                $nativeValue.Name = $definitionValue.Name
+                $nativeValue.Type = [uint32]$definitionValue.Type
+                $nativeValue.Data = [byte[]]$definitionValue.Data
+                $nativeKey.Values.Add($nativeValue)
+            }
+            $nativeTree.Keys.Add($nativeKey)
+            $nativeTree.ValueCount = $definition.Values.Count
+            $nativeTree.TotalDataBytes = [int64](
+                ($definition.Values | ForEach-Object { $_.Data.Length } |
+                    Measure-Object -Sum).Sum
+            )
+            $trees += ConvertTo-Gta5RpRegistryTreePayload -Tree $nativeTree
+        }
+        $script:Gta5RpPublisherCapture = [pscustomobject]@{
+            Trees = $trees
+            Sha256 = "capture"
+        }
+        Mock Get-PublisherGta5RpRegistryCapture {
+            return $script:Gta5RpPublisherCapture
+        }
+    }
+
+    It "reads an independent strict config and resolves its default path" {
+        Resolve-PublisherGta5RpSyncConfigPath -Path "" | Should -Be (
+            Join-Path (Split-Path $script:PublisherScriptPath -Parent) "gta5rp-sync.json"
+        )
+        $path = Join-Path $TestDrive "gta5rp-sync.json"
+        @{
+            schema_version = 1
+            mode = "enabled"
+            user_sid = $script:Gta5RpPublisherConfig.UserSid
+            profile_path = $script:Gta5RpPublisherProfile
+        } | ConvertTo-Json | Set-Content -LiteralPath $path
+
+        $config = Get-Gta5RpSyncConfig -Path $path
+
+        $config.Enabled | Should -BeTrue
+        $config.UserSid | Should -Be $script:Gta5RpPublisherConfig.UserSid
+        $config.ProfilePath | Should -Be $script:Gta5RpPublisherProfile
+    }
+
+    It "writes one identical raw-byte bundle to every arbitrary Publisher volume" {
+        Invoke-PublisherGta5RpSync -Config $script:Gta5RpPublisherConfig `
+            -Manifest $script:Gta5RpPublisherManifest `
+            -VolumeMappings $script:Gta5RpPublisherMappings
+
+        $hashes = @()
+        foreach ($mapping in $script:Gta5RpPublisherMappings) {
+            $path = Get-PublisherGta5RpBundlePath -VolumeMapping $mapping
+            $bytes = [IO.File]::ReadAllBytes($path)
+            $hashes += Get-EgsSha256Hex $bytes
+            $bundle = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+            $bundle.schema_version | Should -Be 1
+            $bundle.config_revision | Should -Be "gta5rp-revision"
+            @($bundle.registry_trees).Count | Should -Be 2
+            $bundle.registry_trees[0].root | Should -Be "GTA5RPLauncher"
+            $bundle.registry_trees[1].root | Should -Be "RAGE-MP"
+            [Convert]::FromBase64String(
+                [string]$bundle.registry_trees[0].keys[0].values[0].base64
+            ) | Should -Be ([byte[]](65, 0, 0, 0))
+            [Text.Encoding]::UTF8.GetString($bytes) |
+                Should -Not -Match "gta5rp-publisher-profile|S-1-5-21"
+        }
+        @($hashes | Select-Object -Unique).Count | Should -Be 1
+    }
+
+    It "requires two stable consecutive registry captures" {
+        Mock Open-Gta5RpUserHive {
+            return [pscustomobject]@{ RootName = "test"; LoadedByHelper = $false }
+        }
+        Mock Close-Gta5RpUserHive { }
+        $script:Gta5RpCaptureCall = 0
+        Mock Get-Gta5RpNativeRegistryTree {
+            $script:Gta5RpCaptureCall++
+            $tree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+            $tree.RootName = $TreeRoot
+            $key = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+            $key.RelativePath = ""
+            $value = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+            $value.Name = "state"
+            $value.Type = 4
+            $value.Data = [byte[]]($script:Gta5RpCaptureCall, 0, 0, 0)
+            $key.Values.Add($value)
+            $tree.Keys.Add($key)
+            $tree.ValueCount = 1
+            $tree.TotalDataBytes = 4
+            return $tree
+        }
+
+        {
+            & $script:GetPublisherGta5RpRegistryCaptureOriginal `
+                -Config $script:Gta5RpPublisherConfig
+        } | Should -Throw "*changed during capture*"
+
+        Should -Invoke Get-Gta5RpNativeRegistryTree -Times 4 -Exactly
+    }
+
+    It "enforces aggregate snapshot limits before publishing" {
+        Mock Open-Gta5RpUserHive {
+            return [pscustomobject]@{ RootName = "test"; LoadedByHelper = $false }
+        }
+        Mock Close-Gta5RpUserHive { }
+        Mock Get-Gta5RpNativeRegistryTree {
+            $tree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+            $tree.RootName = $TreeRoot
+            $key = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+            $key.RelativePath = ""
+            $tree.Keys.Add($key)
+            $tree.ValueCount = 0
+            $tree.TotalDataBytes = 8MB + 1
+            return $tree
+        }
+
+        {
+            & $script:GetPublisherGta5RpRegistryCaptureOriginal `
+                -Config $script:Gta5RpPublisherConfig
+        } | Should -Throw "*aggregate limits*"
+    }
+
+    It "disabled and failed export remove only GTA5RP bundles" {
+        foreach ($mapping in $script:Gta5RpPublisherMappings) {
+            $path = Get-PublisherGta5RpBundlePath -VolumeMapping $mapping
+            New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force |
+                Out-Null
+            Set-Content -LiteralPath $path -Value "stale"
+            Set-Content -LiteralPath (
+                Join-Path (Split-Path $path -Parent) "majestic-launcher-settings.v2.json"
+            ) -Value "keep"
+        }
+        $disabled = [pscustomobject]@{ Present = $true; Enabled = $false }
+
+        Invoke-PublisherGta5RpSync -Config $disabled `
+            -Manifest $script:Gta5RpPublisherManifest `
+            -VolumeMappings $script:Gta5RpPublisherMappings
+
+        foreach ($mapping in $script:Gta5RpPublisherMappings) {
+            Test-Path -LiteralPath (
+                Get-PublisherGta5RpBundlePath -VolumeMapping $mapping
+            ) | Should -BeFalse
+            Test-Path -LiteralPath (
+                Join-Path $mapping.RootPath `
+                    ".iscsi-reset/majestic-launcher-settings.v2.json"
+            ) | Should -BeTrue
+        }
+
+        Mock Get-PublisherGta5RpBundleBytes { throw "capture failed" }
+        Invoke-PublisherGta5RpSync -Config $script:Gta5RpPublisherConfig `
+            -Manifest $script:Gta5RpPublisherManifest `
+            -VolumeMappings $script:Gta5RpPublisherMappings
+        foreach ($mapping in $script:Gta5RpPublisherMappings) {
+            Test-Path -LiteralPath (
+                Get-PublisherGta5RpBundlePath -VolumeMapping $mapping
+            ) | Should -BeFalse
+        }
+    }
+
+    It "blocks disconnect when failed export cleanup cannot be confirmed" {
+        Mock Get-PublisherGta5RpBundleBytes { throw "capture failed" }
+        Mock Remove-PublisherGta5RpBundles { throw "cleanup failed" }
+
+        {
+            Invoke-PublisherGta5RpSync -Config $script:Gta5RpPublisherConfig `
+                -Manifest $script:Gta5RpPublisherManifest `
+                -VolumeMappings $script:Gta5RpPublisherMappings
+        } | Should -Throw "*stale bundle cleanup failed*"
+    }
+
+    It "contains no GTA5RP process stop or process check" {
+        $source = Get-Content -LiteralPath $script:PublisherScriptPath -Raw
+        $block = [regex]::Match(
+            $source,
+            '(?s)function Invoke-PublisherGta5RpSync.*?function Assert-PublisherEgsItem'
+        ).Value
+        $block | Should -Not -Match 'Get-Process|Stop-Process|CloseMainWindow'
+        $source | Should -Match 'REG_OPTION_OPEN_LINK'
+        $source | Should -Match 'key, childName, 0, desired'
+        $source | Should -Match 'softwareKey, treeRoot, 0'
+        $source | Should -Match 'type != 5 && type != 7'
+    }
+}
+
 Describe "Publisher local disconnect and reconnect" {
     BeforeEach {
         $script:Manifest = [pscustomobject]@{

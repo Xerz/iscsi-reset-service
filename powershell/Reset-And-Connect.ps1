@@ -4,6 +4,7 @@ param(
     [string]$TokenPath = "C:\ProgramData\IscsiReset\client.token",
     [string]$EgsSyncConfigPath = "",
     [string]$MajesticSyncConfigPath = "",
+    [string]$Gta5RpSyncConfigPath = "",
     [int]$WaitTimeoutSeconds = 120,
     [string]$SimulationStatePath = "",
     [string]$SimulationSourceIp = "",
@@ -16,6 +17,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 $script:DefaultEgsSyncConfigPath = Join-Path $PSScriptRoot "egs-sync.json"
 $script:DefaultMajesticSyncConfigPath = Join-Path $PSScriptRoot "majestic-sync.json"
+$script:DefaultGta5RpSyncConfigPath = Join-Path $PSScriptRoot "gta5rp-sync.json"
 
 function Resolve-EgsSyncConfigPath {
     param([AllowEmptyString()][string]$Path)
@@ -36,6 +38,16 @@ function Resolve-MajesticSyncConfigPath {
 }
 
 $MajesticSyncConfigPath = Resolve-MajesticSyncConfigPath -Path $MajesticSyncConfigPath
+
+function Resolve-Gta5RpSyncConfigPath {
+    param([AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $script:DefaultGta5RpSyncConfigPath
+    }
+    return $Path
+}
+
+$Gta5RpSyncConfigPath = Resolve-Gta5RpSyncConfigPath -Path $Gta5RpSyncConfigPath
 
 function Write-ResetLog {
     param(
@@ -139,6 +151,540 @@ function Get-MajesticSyncConfig {
         Enabled = $enabled
         UserSid = $sid
         ProfilePath = $profilePath
+    }
+}
+
+function Get-Gta5RpSyncConfig {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{
+            Present = $false
+            Enabled = $false
+            UserSid = ""
+            ProfilePath = ""
+        }
+    }
+    $config = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ([int]$config.schema_version -ne 1 -or
+        [string]$config.mode -notin @("disabled", "enabled")) {
+        throw "GTA5RP Launcher settings sync config is invalid"
+    }
+    $enabled = [string]$config.mode -eq "enabled"
+    $sid = [string]$config.user_sid
+    $profilePath = [string]$config.profile_path
+    if ($enabled -and
+        ($sid -notmatch '^S-1-[0-9]+(?:-[0-9]+)+$' -or
+        $sid -eq "S-1-5-18" -or
+        [string]::IsNullOrWhiteSpace($profilePath) -or
+        -not [IO.Path]::IsPathRooted($profilePath))) {
+        throw "GTA5RP Launcher settings sync user profile is invalid"
+    }
+    return [pscustomobject]@{
+        Present = $true
+        Enabled = $enabled
+        UserSid = $sid
+        ProfilePath = $profilePath
+    }
+}
+
+function Initialize-Gta5RpRegistryNative {
+    if ($null -ne ("IscsiReset.Gta5RpRegistryNative" -as [type])) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace IscsiReset {
+    public sealed class Gta5RpRegistryValueSnapshot {
+        public string Name;
+        public uint Type;
+        public byte[] Data;
+    }
+
+    public sealed class Gta5RpRegistryKeySnapshot {
+        public string RelativePath;
+        public List<Gta5RpRegistryValueSnapshot> Values =
+            new List<Gta5RpRegistryValueSnapshot>();
+    }
+
+    public sealed class Gta5RpRegistryTreeSnapshot {
+        public string RootName;
+        public List<Gta5RpRegistryKeySnapshot> Keys =
+            new List<Gta5RpRegistryKeySnapshot>();
+        public int ValueCount;
+        public long TotalDataBytes;
+    }
+
+    public static class Gta5RpRegistryNative {
+        private const int ERROR_SUCCESS = 0;
+        private const int ERROR_FILE_NOT_FOUND = 2;
+        private const int ERROR_MORE_DATA = 234;
+        private const int ERROR_NO_MORE_ITEMS = 259;
+        private const int KEY_READ = 0x20019;
+        private const int KEY_WRITE = 0x20006;
+        private const int DELETE = 0x00010000;
+        private const int KEY_WOW64_64KEY = 0x0100;
+        private const int REG_OPTION_OPEN_LINK = 0x00000008;
+        private static readonly IntPtr HKEY_USERS =
+            new IntPtr(unchecked((int)0x80000003));
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegOpenKeyExW")]
+        private static extern int RegOpenKeyEx(
+            IntPtr hKey, string subKey, int options, int desired, out IntPtr result);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "RegOpenKeyTransactedW")]
+        private static extern int RegOpenKeyTransacted(
+            IntPtr hKey, string subKey, int options, int desired, out IntPtr result,
+            IntPtr transaction, IntPtr extendedParameter);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "RegCreateKeyTransactedW")]
+        private static extern int RegCreateKeyTransacted(
+            IntPtr hKey, string subKey, int reserved, string keyClass, int options,
+            int desired, IntPtr securityAttributes, out IntPtr result,
+            out int disposition, IntPtr transaction, IntPtr extendedParameter);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegEnumKeyExW")]
+        private static extern int RegEnumKeyEx(
+            IntPtr hKey, int index, StringBuilder name, ref int nameLength,
+            IntPtr reserved, IntPtr keyClass, IntPtr classLength, out long lastWriteTime);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegEnumValueW")]
+        private static extern int RegEnumValue(
+            IntPtr hKey, int index, StringBuilder valueName, ref int valueNameLength,
+            IntPtr reserved, out uint type, byte[] data, ref int dataLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "RegQueryValueExW")]
+        private static extern int RegQueryValueEx(
+            IntPtr hKey, string valueName, IntPtr reserved, out uint type,
+            byte[] data, ref int dataLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "RegSetValueExW")]
+        private static extern int RegSetValueEx(
+            IntPtr hKey, string valueName, int reserved, uint type,
+            byte[] data, int dataLength);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, EntryPoint = "RegDeleteTreeW")]
+        private static extern int RegDeleteTree(IntPtr hKey, string subKey);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "RegDeleteKeyTransactedW")]
+        private static extern int RegDeleteKeyTransacted(
+            IntPtr hKey, string subKey, int desired, int reserved,
+            IntPtr transaction, IntPtr extendedParameter);
+
+        [DllImport("advapi32.dll")]
+        private static extern int RegCloseKey(IntPtr hKey);
+
+        [DllImport("KtmW32.dll", CharSet = CharSet.Unicode,
+            EntryPoint = "CreateTransaction", SetLastError = true)]
+        private static extern IntPtr CreateTransactionNative(
+            IntPtr attributes, IntPtr uow, int createOptions, int isolationLevel,
+            int isolationFlags, int timeout, string description);
+
+        [DllImport("KtmW32.dll", EntryPoint = "CommitTransaction", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CommitTransactionNative(IntPtr transaction);
+
+        [DllImport("KtmW32.dll", EntryPoint = "RollbackTransaction", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RollbackTransactionNative(IntPtr transaction);
+
+        [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "CloseHandle")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandleNative(IntPtr handle);
+
+        private sealed class CaptureLimits {
+            internal int Keys;
+            internal int Values;
+            internal long Bytes;
+        }
+
+        private static void Check(int status, string operation) {
+            if (status != ERROR_SUCCESS) {
+                throw new Win32Exception(status, operation);
+            }
+        }
+
+        private static void ValidateType(uint type) {
+            if (type != 0 && type != 1 && type != 2 && type != 3 && type != 4 &&
+                type != 5 && type != 7 && type != 11) {
+                throw new InvalidOperationException(
+                    "GTA5RP registry contains an unsupported value type");
+            }
+        }
+
+        private static List<string> GetSubKeyNames(IntPtr key) {
+            List<string> names = new List<string>();
+            for (int index = 0; ; index++) {
+                StringBuilder name = new StringBuilder(256);
+                int length = name.Capacity;
+                long lastWrite;
+                int status = RegEnumKeyEx(
+                    key, index, name, ref length, IntPtr.Zero, IntPtr.Zero,
+                    IntPtr.Zero, out lastWrite);
+                if (status == ERROR_NO_MORE_ITEMS) { break; }
+                Check(status, "RegEnumKeyExW");
+                names.Add(name.ToString());
+            }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+
+        private static List<string> GetValueNames(IntPtr key) {
+            List<string> names = new List<string>();
+            for (int index = 0; ; index++) {
+                StringBuilder name = new StringBuilder(16384);
+                int nameLength = name.Capacity;
+                int dataLength = 0;
+                uint type;
+                int status = RegEnumValue(
+                    key, index, name, ref nameLength, IntPtr.Zero, out type,
+                    null, ref dataLength);
+                if (status == ERROR_NO_MORE_ITEMS) { break; }
+                if (status != ERROR_SUCCESS && status != ERROR_MORE_DATA) {
+                    Check(status, "RegEnumValueW");
+                }
+                names.Add(name.ToString());
+            }
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            return names;
+        }
+
+        private static Gta5RpRegistryValueSnapshot ReadValue(IntPtr key, string name) {
+            int length = 0;
+            uint type;
+            int status = RegQueryValueEx(
+                key, name, IntPtr.Zero, out type, null, ref length);
+            Check(status, "RegQueryValueExW(size)");
+            ValidateType(type);
+            if (length < 0 || length > 4 * 1024 * 1024) {
+                throw new InvalidOperationException(
+                    "GTA5RP registry value exceeds its size limit");
+            }
+            byte[] data = new byte[length];
+            int actual = length;
+            status = RegQueryValueEx(
+                key, name, IntPtr.Zero, out type, data, ref actual);
+            Check(status, "RegQueryValueExW(data)");
+            ValidateType(type);
+            if (actual != data.Length) {
+                Array.Resize(ref data, actual);
+            }
+            Gta5RpRegistryValueSnapshot value = new Gta5RpRegistryValueSnapshot();
+            value.Name = name;
+            value.Type = type;
+            value.Data = data;
+            return value;
+        }
+
+        private static void CaptureKey(
+            IntPtr key, string relativePath, int depth, IntPtr transaction,
+            bool transacted, Gta5RpRegistryTreeSnapshot tree, CaptureLimits limits) {
+            if (depth > 16 || ++limits.Keys > 256) {
+                throw new InvalidOperationException(
+                    "GTA5RP registry tree exceeds its key limits");
+            }
+            Gta5RpRegistryKeySnapshot snapshot = new Gta5RpRegistryKeySnapshot();
+            snapshot.RelativePath = relativePath;
+            foreach (string valueName in GetValueNames(key)) {
+                Gta5RpRegistryValueSnapshot value = ReadValue(key, valueName);
+                if (++limits.Values > 1024) {
+                    throw new InvalidOperationException(
+                        "GTA5RP registry tree exceeds its value-count limit");
+                }
+                limits.Bytes += value.Data.LongLength;
+                if (limits.Bytes > 16L * 1024L * 1024L) {
+                    throw new InvalidOperationException(
+                        "GTA5RP registry tree exceeds its total-data limit");
+                }
+                snapshot.Values.Add(value);
+            }
+            tree.Keys.Add(snapshot);
+            foreach (string childName in GetSubKeyNames(key)) {
+                IntPtr child;
+                int status;
+                int desired = KEY_READ | KEY_WOW64_64KEY;
+                if (transacted) {
+                    status = RegOpenKeyTransacted(
+                        key, childName, 0, desired, out child, transaction,
+                        IntPtr.Zero);
+                } else {
+                    status = RegOpenKeyEx(
+                        key, childName, REG_OPTION_OPEN_LINK, desired, out child);
+                }
+                Check(status, "open GTA5RP registry subkey");
+                try {
+                    string childPath = relativePath.Length == 0
+                        ? childName : relativePath + "\\" + childName;
+                    CaptureKey(
+                        child, childPath, depth + 1, transaction, transacted,
+                        tree, limits);
+                } finally {
+                    RegCloseKey(child);
+                }
+            }
+        }
+
+        private static Gta5RpRegistryTreeSnapshot CaptureOpenedTree(
+            IntPtr key, string treeRoot, IntPtr transaction, bool transacted) {
+            Gta5RpRegistryTreeSnapshot tree = new Gta5RpRegistryTreeSnapshot();
+            tree.RootName = treeRoot;
+            CaptureLimits limits = new CaptureLimits();
+            CaptureKey(key, "", 0, transaction, transacted, tree, limits);
+            tree.Keys.Sort(delegate(
+                Gta5RpRegistryKeySnapshot left,
+                Gta5RpRegistryKeySnapshot right) {
+                    return StringComparer.OrdinalIgnoreCase.Compare(
+                        left.RelativePath, right.RelativePath);
+                });
+            tree.ValueCount = limits.Values;
+            tree.TotalDataBytes = limits.Bytes;
+            return tree;
+        }
+
+        public static Gta5RpRegistryTreeSnapshot CaptureTree(
+            string hiveRootName, string treeRoot) {
+            IntPtr key;
+            int status = RegOpenKeyEx(
+                HKEY_USERS, hiveRootName + "\\Software\\" + treeRoot,
+                REG_OPTION_OPEN_LINK,
+                KEY_READ | KEY_WOW64_64KEY, out key);
+            Check(status, "open GTA5RP registry tree");
+            try {
+                return CaptureOpenedTree(key, treeRoot, IntPtr.Zero, false);
+            } finally {
+                RegCloseKey(key);
+            }
+        }
+
+        public static Gta5RpRegistryTreeSnapshot CaptureTreeTransacted(
+            IntPtr softwareKey, string treeRoot, IntPtr transaction) {
+            IntPtr key;
+            int status = RegOpenKeyTransacted(
+                softwareKey, treeRoot, 0, KEY_READ | KEY_WOW64_64KEY,
+                out key, transaction, IntPtr.Zero);
+            Check(status, "open transacted GTA5RP registry tree");
+            try {
+                return CaptureOpenedTree(key, treeRoot, transaction, true);
+            } finally {
+                RegCloseKey(key);
+            }
+        }
+
+        public static IntPtr BeginTransaction() {
+            IntPtr transaction = CreateTransactionNative(
+                IntPtr.Zero, IntPtr.Zero, 0, 0, 0, 0,
+                "iSCSI Reset GTA5RP registry sync");
+            if (transaction == new IntPtr(-1)) {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(), "CreateTransaction");
+            }
+            return transaction;
+        }
+
+        public static IntPtr OpenUserSoftwareTransacted(
+            string hiveRootName, IntPtr transaction) {
+            IntPtr key;
+            int status = RegOpenKeyTransacted(
+                HKEY_USERS, hiveRootName + "\\Software", 0,
+                KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY,
+                out key, transaction, IntPtr.Zero);
+            Check(status, "open transacted user Software key");
+            return key;
+        }
+
+        private static void AssertKeyHasNoLinks(IntPtr key) {
+            int length = 0;
+            uint type;
+            int status = RegQueryValueEx(
+                key, "SymbolicLinkValue", IntPtr.Zero, out type, null, ref length);
+            if (status == ERROR_SUCCESS && type == 6) {
+                throw new InvalidOperationException(
+                    "GTA5RP registry symbolic links are not supported");
+            }
+            if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) {
+                Check(status, "inspect GTA5RP registry key for links");
+            }
+            foreach (string childName in GetSubKeyNames(key)) {
+                IntPtr child;
+                status = RegOpenKeyEx(
+                    key, childName, REG_OPTION_OPEN_LINK,
+                    KEY_READ | KEY_WOW64_64KEY, out child);
+                Check(status, "open GTA5RP registry key for link inspection");
+                try {
+                    AssertKeyHasNoLinks(child);
+                } finally {
+                    RegCloseKey(child);
+                }
+            }
+        }
+
+        public static void AssertTreeHasNoLinks(
+            string hiveRootName, string treeRoot) {
+            IntPtr key;
+            int status = RegOpenKeyEx(
+                HKEY_USERS, hiveRootName + "\\Software\\" + treeRoot,
+                REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY, out key);
+            if (status == ERROR_FILE_NOT_FOUND) { return; }
+            Check(status, "open GTA5RP registry tree for link inspection");
+            try {
+                AssertKeyHasNoLinks(key);
+            } finally {
+                RegCloseKey(key);
+            }
+        }
+
+        public static void DeleteTreeTransacted(
+            IntPtr softwareKey, string treeRoot, IntPtr transaction) {
+            IntPtr key;
+            int status = RegOpenKeyTransacted(
+                softwareKey, treeRoot, 0,
+                KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY,
+                out key, transaction, IntPtr.Zero);
+            if (status == ERROR_FILE_NOT_FOUND) { return; }
+            Check(status, "open GTA5RP registry tree for deletion");
+            try {
+                Check(RegDeleteTree(key, null), "RegDeleteTreeW");
+            } finally {
+                RegCloseKey(key);
+            }
+            Check(RegDeleteKeyTransacted(
+                softwareKey, treeRoot, KEY_WOW64_64KEY, 0,
+                transaction, IntPtr.Zero), "RegDeleteKeyTransactedW");
+        }
+
+        public static void WriteTreeTransacted(
+            IntPtr softwareKey, Gta5RpRegistryTreeSnapshot tree,
+            IntPtr transaction) {
+            foreach (Gta5RpRegistryKeySnapshot keySnapshot in tree.Keys) {
+                string path = tree.RootName;
+                if (keySnapshot.RelativePath.Length != 0) {
+                    path += "\\" + keySnapshot.RelativePath;
+                }
+                IntPtr key;
+                int disposition;
+                int status = RegCreateKeyTransacted(
+                    softwareKey, path, 0, null, 0,
+                    KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY,
+                    IntPtr.Zero, out key, out disposition,
+                    transaction, IntPtr.Zero);
+                Check(status, "RegCreateKeyTransactedW");
+                try {
+                    foreach (Gta5RpRegistryValueSnapshot value in keySnapshot.Values) {
+                        Check(RegSetValueEx(
+                            key, value.Name, 0, value.Type,
+                            value.Data, value.Data.Length), "RegSetValueExW");
+                    }
+                } finally {
+                    RegCloseKey(key);
+                }
+            }
+        }
+
+        public static void CommitTransaction(IntPtr transaction) {
+            if (!CommitTransactionNative(transaction)) {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(), "CommitTransaction");
+            }
+        }
+
+        public static void RollbackTransaction(IntPtr transaction) {
+            if (transaction != IntPtr.Zero) {
+                RollbackTransactionNative(transaction);
+            }
+        }
+
+        public static void CloseTransaction(IntPtr transaction) {
+            if (transaction != IntPtr.Zero) { CloseHandleNative(transaction); }
+        }
+
+        public static void CloseRegistryKey(IntPtr key) {
+            if (key != IntPtr.Zero) { RegCloseKey(key); }
+        }
+    }
+}
+"@
+}
+
+function Open-Gta5RpUserHive {
+    param(
+        [Parameter(Mandatory = $true)][string]$UserSid,
+        [Parameter(Mandatory = $true)][string]$ProfilePath
+    )
+    if (Test-Path -LiteralPath "Registry::HKEY_USERS\$UserSid") {
+        return [pscustomobject]@{ RootName = $UserSid; LoadedByHelper = $false }
+    }
+    $hivePath = Join-Path $ProfilePath "NTUSER.DAT"
+    if (-not (Test-Path -LiteralPath $hivePath -PathType Leaf)) {
+        throw "GTA5RP Launcher user NTUSER.DAT does not exist"
+    }
+    $hiveFile = Get-Item -LiteralPath $hivePath -Force
+    if (([int]$hiveFile.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "GTA5RP Launcher user NTUSER.DAT must not be a reparse point"
+    }
+    $rootName = "IscsiResetGta5Rp_" + [Guid]::NewGuid().ToString("N")
+    & reg.exe load "HKU\$rootName" $hivePath | Out-Null
+    if ($LASTEXITCODE -ne 0 -or
+        -not (Test-Path -LiteralPath "Registry::HKEY_USERS\$rootName")) {
+        throw "GTA5RP Launcher user registry hive could not be loaded"
+    }
+    return [pscustomobject]@{ RootName = $rootName; LoadedByHelper = $true }
+}
+
+function Close-Gta5RpUserHive {
+    param([Parameter(Mandatory = $true)]$Hive)
+    if (-not [bool]$Hive.LoadedByHelper) { return }
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    & reg.exe unload "HKU\$($Hive.RootName)" | Out-Null
+    if ($LASTEXITCODE -ne 0 -or
+        (Test-Path -LiteralPath "Registry::HKEY_USERS\$($Hive.RootName)")) {
+        throw "GTA5RP Launcher user registry hive could not be unloaded"
+    }
+}
+
+function ConvertTo-Gta5RpRegistryTreePayload {
+    param([Parameter(Mandatory = $true)]$Tree)
+    $keys = @()
+    foreach ($key in @($Tree.Keys)) {
+        $values = @()
+        foreach ($value in @($key.Values)) {
+            $bytes = [byte[]]$value.Data
+            $values += [ordered]@{
+                name = [string]$value.Name
+                type = [int64]$value.Type
+                length = [int64]$bytes.Length
+                base64 = [Convert]::ToBase64String($bytes)
+            }
+        }
+        $keys += [ordered]@{
+            path = [string]$key.RelativePath
+            values = $values
+        }
+    }
+    $canonical = [ordered]@{
+        root = [string]$Tree.RootName
+        keys = $keys
+    }
+    $canonicalBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+        ($canonical | ConvertTo-Json -Depth 8 -Compress)
+    )
+    return [pscustomobject]@{
+        Payload = [ordered]@{
+            root = [string]$Tree.RootName
+            sha256 = Get-EgsSha256Hex $canonicalBytes
+            keys = $keys
+        }
+        CanonicalBytes = $canonicalBytes
+        KeyCount = [int]@($keys).Count
+        ValueCount = [int]$Tree.ValueCount
+        TotalDataBytes = [int64]$Tree.TotalDataBytes
     }
 }
 
@@ -1718,6 +2264,319 @@ function Invoke-ClientMajesticSettingsSync {
         BackupTotalBytes = [Int64]$bundle.BackupTotalBytes
         FileCount = 5
         RegistryValueCount = 2
+    }
+}
+
+function Get-Gta5RpVolumeRoot {
+    param([Parameter(Mandatory = $true)]$ExpectedVolume)
+    return Get-MajesticVolumeRoot -ExpectedVolume $ExpectedVolume
+}
+
+function ConvertFrom-ClientGta5RpRegistryTree {
+    param(
+        [Parameter(Mandatory = $true)]$Tree,
+        [Parameter(Mandatory = $true)][string]$ExpectedRoot
+    )
+    if ([string]$Tree.root -cne $ExpectedRoot -or
+        [string]$Tree.sha256 -notmatch '^[0-9a-f]{64}$') {
+        throw "GTA5RP Launcher registry tree metadata is invalid"
+    }
+    $keys = @($Tree.keys)
+    if ($keys.Count -lt 1 -or $keys.Count -gt 256) {
+        throw "GTA5RP Launcher registry tree key count is invalid"
+    }
+    $nativeTree = New-Object IscsiReset.Gta5RpRegistryTreeSnapshot
+    $nativeTree.RootName = $ExpectedRoot
+    $canonicalKeys = @()
+    $seenPaths = @{}
+    $previousPath = $null
+    $valueCount = 0
+    $totalBytes = [int64]0
+    foreach ($key in $keys) {
+        $path = [string]$key.path
+        if ($path.IndexOf([char]0) -ge 0 -or $path.Length -gt 4096 -or
+            $seenPaths.ContainsKey($path)) {
+            throw "GTA5RP Launcher registry key path is invalid"
+        }
+        if ($null -eq $previousPath) {
+            if ($path -cne "") {
+                throw "GTA5RP Launcher registry root key is missing"
+            }
+        } elseif ([StringComparer]::OrdinalIgnoreCase.Compare(
+            [string]$previousPath, $path
+        ) -ge 0) {
+            throw "GTA5RP Launcher registry keys are not canonical"
+        }
+        $segments = @()
+        if ($path -cne "") {
+            $segments = @($path -split '\\')
+            if ($segments.Count -gt 16 -or @($segments | Where-Object {
+                [string]::IsNullOrEmpty([string]$_) -or
+                ([string]$_).IndexOf([char]0) -ge 0
+            }).Count -ne 0) {
+                throw "GTA5RP Launcher registry key depth is invalid"
+            }
+            $parent = if ($segments.Count -eq 1) {
+                ""
+            } else {
+                [string]::Join("\", $segments[0..($segments.Count - 2)])
+            }
+            if (-not $seenPaths.ContainsKey($parent)) {
+                throw "GTA5RP Launcher registry key parent is missing"
+            }
+        }
+        $seenPaths[$path] = $true
+        $previousPath = $path
+        $nativeKey = New-Object IscsiReset.Gta5RpRegistryKeySnapshot
+        $nativeKey.RelativePath = $path
+        $canonicalValues = @()
+        $seenNames = @{}
+        $previousName = $null
+        foreach ($value in @($key.values)) {
+            $name = [string]$value.name
+            if ($name.IndexOf([char]0) -ge 0 -or $name.Length -gt 16383 -or
+                $seenNames.ContainsKey($name)) {
+                throw "GTA5RP Launcher registry value name is invalid"
+            }
+            if ($null -ne $previousName -and
+                [StringComparer]::OrdinalIgnoreCase.Compare(
+                    [string]$previousName, $name
+                ) -ge 0) {
+                throw "GTA5RP Launcher registry values are not canonical"
+            }
+            $type = [int64]$value.type
+            if ($type -notin @(0, 1, 2, 3, 4, 5, 7, 11)) {
+                throw "GTA5RP Launcher registry value type is unsupported"
+            }
+            try {
+                $data = [Convert]::FromBase64String([string]$value.base64)
+            } catch {
+                throw "GTA5RP Launcher registry value data is not valid Base64"
+            }
+            if ([Convert]::ToBase64String($data) -cne [string]$value.base64) {
+                throw "GTA5RP Launcher registry value data is not canonical Base64"
+            }
+            if ($data.Length -gt 4MB -or
+                [int64]$value.length -ne [int64]$data.Length) {
+                throw "GTA5RP Launcher registry value length is invalid"
+            }
+            $valueCount++
+            $totalBytes += [int64]$data.Length
+            if ($valueCount -gt 1024 -or $totalBytes -gt 16MB) {
+                throw "GTA5RP Launcher registry tree exceeds its limits"
+            }
+            $nativeValue = New-Object IscsiReset.Gta5RpRegistryValueSnapshot
+            $nativeValue.Name = $name
+            $nativeValue.Type = [uint32]$type
+            $nativeValue.Data = [byte[]]$data
+            $nativeKey.Values.Add($nativeValue)
+            $canonicalValues += [ordered]@{
+                name = $name
+                type = $type
+                length = [int64]$data.Length
+                base64 = [Convert]::ToBase64String($data)
+            }
+            $seenNames[$name] = $true
+            $previousName = $name
+        }
+        $nativeTree.Keys.Add($nativeKey)
+        $canonicalKeys += [ordered]@{
+            path = $path
+            values = $canonicalValues
+        }
+    }
+    $nativeTree.ValueCount = $valueCount
+    $nativeTree.TotalDataBytes = $totalBytes
+    $canonical = [ordered]@{
+        root = $ExpectedRoot
+        keys = $canonicalKeys
+    }
+    $canonicalBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+        ($canonical | ConvertTo-Json -Depth 8 -Compress)
+    )
+    $sha = Get-EgsSha256Hex $canonicalBytes
+    if ($sha -cne [string]$Tree.sha256) {
+        throw "GTA5RP Launcher registry tree hash verification failed"
+    }
+    return [pscustomobject]@{
+        Root = $ExpectedRoot
+        NativeTree = $nativeTree
+        Sha256 = $sha
+        KeyCount = $keys.Count
+        ValueCount = $valueCount
+        TotalDataBytes = $totalBytes
+    }
+}
+
+function Get-ClientGta5RpBundle {
+    param(
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)][string]$ConfigRevision
+    )
+    if (@($ExpectedVolumes).Count -eq 0) {
+        throw "GTA5RP Launcher settings require at least one mounted volume"
+    }
+    $commonBytes = $null
+    $commonSha = ""
+    foreach ($volume in $ExpectedVolumes) {
+        $root = Get-Gta5RpVolumeRoot -ExpectedVolume $volume
+        $path = Join-Path $root ".iscsi-reset\gta5rp-launcher-settings.v1.json"
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "GTA5RP Launcher settings bundle is missing"
+        }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        if ((([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            [int64]$item.Length -lt 1 -or [int64]$item.Length -gt 32MB) {
+            throw "GTA5RP Launcher settings bundle file is unsafe"
+        }
+        $bytes = [IO.File]::ReadAllBytes($path)
+        $sha = Get-EgsSha256Hex $bytes
+        if ($null -eq $commonBytes) {
+            $commonBytes = $bytes
+            $commonSha = $sha
+        } elseif ($bytes.Length -ne $commonBytes.Length -or $sha -cne $commonSha) {
+            throw "GTA5RP Launcher settings bundles do not match"
+        }
+    }
+    try {
+        $strictUtf8 = New-Object Text.UTF8Encoding($false, $true)
+        $bundle = $strictUtf8.GetString($commonBytes) | ConvertFrom-Json
+    } catch {
+        throw "GTA5RP Launcher settings bundle is not valid UTF-8 JSON"
+    }
+    if ([int]$bundle.schema_version -ne 1 -or
+        [string]$bundle.config_revision -cne $ConfigRevision) {
+        throw "GTA5RP Launcher settings bundle metadata is invalid"
+    }
+    Initialize-Gta5RpRegistryNative
+    $sourceTrees = @($bundle.registry_trees)
+    if ($sourceTrees.Count -ne 2) {
+        throw "GTA5RP Launcher settings bundle tree set is invalid"
+    }
+    $trees = @(
+        ConvertFrom-ClientGta5RpRegistryTree -Tree $sourceTrees[0] `
+            -ExpectedRoot "GTA5RPLauncher"
+        ConvertFrom-ClientGta5RpRegistryTree -Tree $sourceTrees[1] `
+            -ExpectedRoot "RAGE-MP"
+    )
+    $keyCount = [int](($trees | Measure-Object -Property KeyCount -Sum).Sum)
+    $valueCount = [int](($trees | Measure-Object -Property ValueCount -Sum).Sum)
+    $totalBytes = [int64](($trees | Measure-Object -Property TotalDataBytes -Sum).Sum)
+    if ($keyCount -gt 256 -or $valueCount -gt 1024 -or $totalBytes -gt 16MB) {
+        throw "GTA5RP Launcher registry snapshot exceeds its aggregate limits"
+    }
+    return [pscustomobject]@{
+        Trees = $trees
+        BundleSha256 = $commonSha
+        KeyCount = $keyCount
+        ValueCount = $valueCount
+        TotalDataBytes = $totalBytes
+    }
+}
+
+function Invoke-Gta5RpRegistryTransaction {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootName,
+        [Parameter(Mandatory = $true)]$Trees,
+        [scriptblock]$BeforeCommit = $null
+    )
+    Initialize-Gta5RpRegistryNative
+    $transaction = [IntPtr]::Zero
+    $softwareKey = [IntPtr]::Zero
+    $committed = $false
+    try {
+        foreach ($tree in $Trees) {
+            [IscsiReset.Gta5RpRegistryNative]::AssertTreeHasNoLinks(
+                $RootName,
+                [string]$tree.Root
+            )
+        }
+        $transaction = [IscsiReset.Gta5RpRegistryNative]::BeginTransaction()
+        $softwareKey = [IscsiReset.Gta5RpRegistryNative]::OpenUserSoftwareTransacted(
+            $RootName,
+            $transaction
+        )
+        foreach ($tree in $Trees) {
+            [IscsiReset.Gta5RpRegistryNative]::DeleteTreeTransacted(
+                $softwareKey,
+                [string]$tree.Root,
+                $transaction
+            )
+        }
+        foreach ($tree in $Trees) {
+            [IscsiReset.Gta5RpRegistryNative]::WriteTreeTransacted(
+                $softwareKey,
+                $tree.NativeTree,
+                $transaction
+            )
+        }
+        foreach ($tree in $Trees) {
+            $actual = [IscsiReset.Gta5RpRegistryNative]::CaptureTreeTransacted(
+                $softwareKey,
+                [string]$tree.Root,
+                $transaction
+            )
+            $actualPayload = ConvertTo-Gta5RpRegistryTreePayload -Tree $actual
+            if ([string]$actualPayload.Payload.sha256 -cne [string]$tree.Sha256) {
+                throw "GTA5RP Launcher transacted registry verification failed"
+            }
+        }
+        if ($null -ne $BeforeCommit) { & $BeforeCommit }
+        [IscsiReset.Gta5RpRegistryNative]::CloseRegistryKey($softwareKey)
+        $softwareKey = [IntPtr]::Zero
+        [IscsiReset.Gta5RpRegistryNative]::CommitTransaction($transaction)
+        $committed = $true
+        foreach ($tree in $Trees) {
+            $actual = [IscsiReset.Gta5RpRegistryNative]::CaptureTree(
+                $RootName,
+                [string]$tree.Root
+            )
+            $actualPayload = ConvertTo-Gta5RpRegistryTreePayload -Tree $actual
+            if ([string]$actualPayload.Payload.sha256 -cne [string]$tree.Sha256) {
+                throw "GTA5RP Launcher committed registry verification failed"
+            }
+        }
+    } finally {
+        if ($softwareKey -ne [IntPtr]::Zero) {
+            [IscsiReset.Gta5RpRegistryNative]::CloseRegistryKey($softwareKey)
+        }
+        if (-not $committed -and $transaction -ne [IntPtr]::Zero) {
+            [IscsiReset.Gta5RpRegistryNative]::RollbackTransaction($transaction)
+        }
+        if ($transaction -ne [IntPtr]::Zero) {
+            [IscsiReset.Gta5RpRegistryNative]::CloseTransaction($transaction)
+        }
+    }
+}
+
+function Invoke-ClientGta5RpSettingsSync {
+    param(
+        [Parameter(Mandatory = $true)]$Config,
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)][string]$ConfigRevision
+    )
+    $bundle = Get-ClientGta5RpBundle -ExpectedVolumes $ExpectedVolumes `
+        -ConfigRevision $ConfigRevision
+    $hive = Open-Gta5RpUserHive -UserSid $Config.UserSid `
+        -ProfilePath $Config.ProfilePath
+    $failure = $null
+    try {
+        Invoke-Gta5RpRegistryTransaction -RootName $hive.RootName `
+            -Trees $bundle.Trees
+    } catch {
+        $failure = $_
+        throw
+    } finally {
+        try { Close-Gta5RpUserHive -Hive $hive } catch {
+            if ($null -eq $failure) { throw }
+        }
+    }
+    return [pscustomobject]@{
+        BundleSha256 = $bundle.BundleSha256
+        TreeCount = 2
+        KeyCount = [int]$bundle.KeyCount
+        ValueCount = [int]$bundle.ValueCount
+        TotalDataBytes = [int64]$bundle.TotalDataBytes
     }
 }
 
@@ -3954,11 +4813,14 @@ function Invoke-ResetMain {
         [string]$ClientTokenPath,
         [string]$SyncConfigPath = "",
         [string]$MajesticSettingsConfigPath = "",
+        [string]$Gta5RpSettingsConfigPath = "",
         [int]$TimeoutSeconds
     )
     $SyncConfigPath = Resolve-EgsSyncConfigPath -Path $SyncConfigPath
     $MajesticSettingsConfigPath = Resolve-MajesticSyncConfigPath `
         -Path $MajesticSettingsConfigPath
+    $Gta5RpSettingsConfigPath = Resolve-Gta5RpSyncConfigPath `
+        -Path $Gta5RpSettingsConfigPath
     $requestId = [Guid]::NewGuid().ToString("D")
     $connectedTarget = ""
     $stage = "startup"
@@ -4036,60 +4898,90 @@ function Invoke-ResetMain {
                 -Message "Majestic Launcher settings were not applied" `
                 -Details @{ stage = "majestic_settings_sync" }
         }
+        try {
+            $gta5RpConfig = Get-Gta5RpSyncConfig -Path $Gta5RpSettingsConfigPath
+            if ($gta5RpConfig.Enabled) {
+                $gta5RpResult = Invoke-ClientGta5RpSettingsSync `
+                    -Config $gta5RpConfig -ExpectedVolumes @($prepared.volumes) `
+                    -ConfigRevision ([string]$health.config_revision)
+                Write-ResetProgress -RequestId $requestId `
+                    -Event "gta5rp_settings_sync_ready" `
+                    -Message "GTA5RP Launcher settings match the mounted release" `
+                    -Details @{
+                        registry_tree_count = [int]$gta5RpResult.TreeCount
+                        registry_key_count = [int]$gta5RpResult.KeyCount
+                        registry_value_count = [int]$gta5RpResult.ValueCount
+                        registry_data_bytes = [int64]$gta5RpResult.TotalDataBytes
+                    }
+            }
+        } catch {
+            Write-ResetLog -Level "WARN" -Event "gta5rp_settings_sync_warning" `
+                -RequestId $requestId `
+                -Message "GTA5RP Launcher settings were not applied" `
+                -Details @{ stage = "gta5rp_settings_sync" }
+        }
         if ($egsSyncMode -ne "Disabled") {
             $stage = "egs_manifest_sync"
-            if ($egsSyncMode -eq "Aggressive") {
-                $syncResult = Invoke-ClientEgsAggressiveSync `
-                    -ExpectedVolumes @($prepared.volumes) `
-                    -ConfigRevision ([string]$health.config_revision) `
-                    -SyncConfigPath $SyncConfigPath
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "egs_eos_install_db_sync_ready" `
-                    -Message "Epic Games EOS shared installation database matches the mounted release" `
-                    -Details @{
-                        file_count = [int]$syncResult.SharedInstallDbFileCount
-                        total_bytes = [Int64]$syncResult.SharedInstallDbTotalBytes
-                    }
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "egs_programdata_sync_ready" `
-                    -Message "Epic Games shared ProgramData matches the mounted release" `
-                    -Details @{
-                        file_count = [int]$syncResult.FileCount
-                        game_count = [int]$syncResult.ManifestCount
-                        total_bytes = [Int64]$syncResult.TotalBytes
-                    }
-            } else {
-                $syncResult = Invoke-ClientEgsManifestSync `
-                    -ExpectedVolumes @($prepared.volumes) `
-                    -ConfigRevision ([string]$health.config_revision) `
-                    -SyncConfigPath $SyncConfigPath
-            }
-            if ($egsSyncMode -eq "Enabled" -and
-                ($syncResult.AdoptedAppCount -gt 0 -or
-                $syncResult.DisplacedManifestCount -gt 0 -or
-                $syncResult.LauncherEntryRemovalCount -gt 0)) {
-                Write-ResetProgress -RequestId $requestId -Event "egs_registration_takeover" `
-                    -Message "Epic Games registrations were switched to the mounted release" `
-                    -Details @{
-                        adopted_app_count = [int]$syncResult.AdoptedAppCount
-                        displaced_manifest_count = [int]$syncResult.DisplacedManifestCount
-                        launcher_entry_removal_count = [int]$syncResult.LauncherEntryRemovalCount
-                    }
-            }
-            if ($egsSyncMode -eq "Enabled") {
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "egs_launcher_registration_sync" `
-                    -Message "Epic Games launcher registrations match the mounted release" `
-                    -Details @{
-                        imported_registration_count = [int]$syncResult.LauncherEntryImportCount
-                        item_only_fallback_count = [int]$syncResult.LauncherFallbackAppCount
-                        incomplete_warning_count = [int]$syncResult.IncompleteWarningCount
-                    }
-            }
-            Write-ResetProgress -RequestId $requestId -Event "egs_manifest_sync_ready" `
-                -Message "Epic Games manifests match the mounted release" -Details @{
-                    manifest_count = [int]$syncResult.ManifestCount
+            try {
+                if ($egsSyncMode -eq "Aggressive") {
+                    $syncResult = Invoke-ClientEgsAggressiveSync `
+                        -ExpectedVolumes @($prepared.volumes) `
+                        -ConfigRevision ([string]$health.config_revision) `
+                        -SyncConfigPath $SyncConfigPath
+                    Write-ResetProgress -RequestId $requestId `
+                        -Event "egs_eos_install_db_sync_ready" `
+                        -Message "Epic Games EOS shared installation database matches the mounted release" `
+                        -Details @{
+                            file_count = [int]$syncResult.SharedInstallDbFileCount
+                            total_bytes = [Int64]$syncResult.SharedInstallDbTotalBytes
+                        }
+                    Write-ResetProgress -RequestId $requestId `
+                        -Event "egs_programdata_sync_ready" `
+                        -Message "Epic Games shared ProgramData matches the mounted release" `
+                        -Details @{
+                            file_count = [int]$syncResult.FileCount
+                            game_count = [int]$syncResult.ManifestCount
+                            total_bytes = [Int64]$syncResult.TotalBytes
+                        }
+                } else {
+                    $syncResult = Invoke-ClientEgsManifestSync `
+                        -ExpectedVolumes @($prepared.volumes) `
+                        -ConfigRevision ([string]$health.config_revision) `
+                        -SyncConfigPath $SyncConfigPath
                 }
+                if ($egsSyncMode -eq "Enabled" -and
+                    ($syncResult.AdoptedAppCount -gt 0 -or
+                    $syncResult.DisplacedManifestCount -gt 0 -or
+                    $syncResult.LauncherEntryRemovalCount -gt 0)) {
+                    Write-ResetProgress -RequestId $requestId `
+                        -Event "egs_registration_takeover" `
+                        -Message "Epic Games registrations were switched to the mounted release" `
+                        -Details @{
+                            adopted_app_count = [int]$syncResult.AdoptedAppCount
+                            displaced_manifest_count = [int]$syncResult.DisplacedManifestCount
+                            launcher_entry_removal_count = [int]$syncResult.LauncherEntryRemovalCount
+                        }
+                }
+                if ($egsSyncMode -eq "Enabled") {
+                    Write-ResetProgress -RequestId $requestId `
+                        -Event "egs_launcher_registration_sync" `
+                        -Message "Epic Games launcher registrations match the mounted release" `
+                        -Details @{
+                            imported_registration_count = [int]$syncResult.LauncherEntryImportCount
+                            item_only_fallback_count = [int]$syncResult.LauncherFallbackAppCount
+                            incomplete_warning_count = [int]$syncResult.IncompleteWarningCount
+                        }
+                }
+                Write-ResetProgress -RequestId $requestId -Event "egs_manifest_sync_ready" `
+                    -Message "Epic Games manifests match the mounted release" -Details @{
+                        manifest_count = [int]$syncResult.ManifestCount
+                    }
+            } catch {
+                Write-ResetLog -Level "WARN" -Event "egs_manifest_sync_warning" `
+                    -RequestId $requestId `
+                    -Message "Epic Games state was not synchronized" `
+                    -Details @{ stage = "egs_manifest_sync" }
+            }
         }
         Write-ResetLog -Level "INFO" -Event "ready" -RequestId $requestId `
             -Message "Target connected and verified" -Details @{
@@ -4135,6 +5027,7 @@ if (-not $NoMain) {
     $exitCode = Invoke-ResetMain -BaseUrl $ApiBaseUrl -ClientTokenPath $TokenPath `
         -SyncConfigPath $EgsSyncConfigPath `
         -MajesticSettingsConfigPath $MajesticSyncConfigPath `
+        -Gta5RpSettingsConfigPath $Gta5RpSyncConfigPath `
         -TimeoutSeconds $WaitTimeoutSeconds
     if ($PassThruExitCode) {
         Write-Output $exitCode
