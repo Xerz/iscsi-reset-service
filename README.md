@@ -1,4 +1,4 @@
-# iSCSI Reset Service v0.5.1
+# iSCSI Reset Service v0.5.2
 
 iSCSI Reset Service публикует согласованный набор ZFS-снимков игровых дисков и перед запуском
 игрового ПК возвращает его записываемые клоны к чистому состоянию. Publisher хранит и обновляет
@@ -383,12 +383,33 @@ Set-ExecutionPolicy -Scope Process Bypass
   -ResetApiIp 10.20.40.10 `
   -EpicGamesManifestSync Aggressive `
   -MajesticLauncherSettingsSync Enabled `
-  -Gta5RpLauncherSettingsSync Enabled
+  -Gta5RpLauncherSettingsSync Enabled `
+  -StartAfterResetTask "\Drova\Streaming Service"
 ```
 
 Введите client token в скрытом приглашении. Установщик сохраняет token, сертификат,
 конфигурацию, SID и профиль игрового пользователя в `C:\ProgramData\IscsiReset`, закрывает ACL
 для SYSTEM и Administrators и создаёт startup-задачу под `SYSTEM`.
+
+`-StartAfterResetTask` необязательно добавляет второй action в startup-задачу. Параметр
+принимает полный путь существующей включённой задачи Task Scheduler, включая папку. После
+штатного завершения `Reset-And-Connect.ps1` с любым кодом первый action завершается, а второй
+вызывает:
+
+```text
+C:\Windows\System32\schtasks.exe /Run /TN "\Drova\Streaming Service"
+```
+
+Установщик только проверяет задачу и не изменяет её. Перед перезагрузкой вручную удалите у
+`\Drova\Streaming Service` прежние триггеры, иначе она может получить два запроса запуска.
+Сама Drova-задача продолжает использовать собственные principal, actions и настройки
+`MultipleInstances`. Прямой ручной запуск `Reset-And-Connect.ps1` её не запускает.
+
+Цепочка гарантируется только при нормальном завершении процесса Reset. Принудительное
+завершение всей startup-задачи по timeout, остановка Task Scheduler или выключение питания
+может не запустить второй action. `LastTaskResult` общей startup-задачи может отражать результат
+`schtasks.exe`; подробный результат Reset остаётся в
+`C:\ProgramData\IscsiReset\logs\reset.jsonl`.
 
 ## Режимы launcher sync
 

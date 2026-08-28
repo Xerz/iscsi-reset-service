@@ -1,5 +1,58 @@
 # Verification record
 
+## Post-reset Scheduled Task chaining v0.5.2 — 2026-08-29
+
+### Реализация
+
+- Client installer принимает необязательный полный Task Scheduler path
+  `-StartAfterResetTask`, включая вложенную папку, например
+  `\Drova\Streaming Service`. Путь разбирается без wildcard, а точная задача до любых
+  installer mutations проверяется как существующая, доступная, включённая и разрешающая
+  demand start. Неканонические/небезопасные пути и ссылка на саму Reset-задачу отклоняются.
+- При opt-in startup-задача `iSCSI Reset and Connect` получает два action в порядке Reset
+  PowerShell → `schtasks.exe /Run /TN "<полный путь>"`. Без параметра сохраняется один action;
+  повторная установка по-прежнему заменяет определение через `Register-ScheduledTask -Force`.
+- Внешняя задача не экспортируется и не изменяется. Оставшиеся triggers дают installer
+  warning и должны быть удалены оператором вручную. Прямой запуск `Reset-And-Connect.ps1`
+  внешнюю задачу не запускает.
+- README фиксирует вложенный пример Drova, ручное удаление triggers, возможное отражение
+  результата `schtasks.exe` в `LastTaskResult` и отсутствие гарантии второго action при
+  принудительном завершении всей задачи. Версия повышена до `0.5.2`; Reset API, YAML schema,
+  SQLite, storage state machines и runtime client script не менялись.
+
+### Автоматические проверки
+
+- Parser всех production/test `.ps1` в локальном образе
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04` — успешно. Полный Pester 5.7.1 в том же
+  Linux/amd64 образе — **187 passed, 0 failed, 2 skipped** из 189 за 18.54 секунды.
+  Пропущены Windows-only ACL и Transactional Registry проверки; это не Windows PowerShell 5.1
+  и не реальный Windows Task Scheduler.
+- Новые installer-тесты покрывают root/nested path parsing, unsafe/missing/disabled/self
+  случаи, demand-start, warning при существующих triggers, отсутствие внешних mutations,
+  один action без opt-in и точный порядок/аргументы двух action с вложенным Drova path.
+- После уточнения фактического пути до `\Drova\Streaming Service` профильный installer Pester
+  5.7.1 повторно выполнен в том же Linux/amd64 образе: **35 passed, 0 failed, 1 skipped** из 36
+  за 2.27 секунды. Пропущен Windows-only ACL test.
+- `ruff check src tests` — успешно; `pytest -q -p no:cacheprovider` — **133 passed** за
+  1.89 секунды. `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose config --quiet` — успешно.
+  `docker compose up --build --abort-on-container-exit --exit-code-from windows-simulation` —
+  **Interaction suite passed** с версией `0.5.2`; после проверки выполнен
+  `docker compose down --volumes`.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Полный Pester на Windows PowerShell 5.1 и проверка native `Get-ScheduledTask`,
+  `New-ScheduledTaskAction` и `Register-ScheduledTask` для вложенного пути
+  `\Drova\Streaming Service`.
+- Физически подтвердить два action и запуск Drova только после нормального завершения первого
+  процесса с кодами `0`, `10`, `20` и `40`, отсутствие дублирования после повторной установки,
+  неизменность Drova-задачи и warning при оставшихся triggers.
+- Отдельно проверить поведение Windows Task Scheduler при общем `ExecutionTimeLimit` и
+  принудительной остановке. Реальный TrueNAS/iSCSI цикл этим изменением не проверялся; все
+  существующие storage-пункты `TEST-PLAN.md` остаются ожидающими своего стенда.
+
 ## Windows PowerShell 5.1 GTA5RP TxR test hotfix v0.5.1 — 2026-08-28
 
 ### Причина и исправление

@@ -1,4 +1,15 @@
 BeforeAll {
+    if (-not (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:Get-ScheduledTask" -Value {
+            param($TaskPath, $ErrorAction)
+        }
+    }
+    if (-not (Get-Command New-ScheduledTaskAction -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "function:New-ScheduledTaskAction" -Value {
+            param($Execute, $Argument)
+        }
+    }
+
     $script:InstallerPath = Join-Path `
         (Split-Path $PSScriptRoot -Parent) `
         "Install-IscsiResetClient.ps1"
@@ -53,6 +64,7 @@ Describe "iSCSI reset client installer inputs" {
         $parameterNames | Should -Contain "EpicGamesManifestSync"
         $parameterNames | Should -Contain "MajesticLauncherSettingsSync"
         $parameterNames | Should -Contain "Gta5RpLauncherSettingsSync"
+        $parameterNames | Should -Contain "StartAfterResetTask"
         $parameterNames | Should -Not -Contain "Token"
         $parameterNames | Should -Not -Contain "ApiBaseUrl"
     }
@@ -125,6 +137,159 @@ Describe "iSCSI reset client installer inputs" {
         $arguments | Should -Match '-ApiBaseUrl "https://10\.20\.40\.10:8443"'
         $arguments | Should -Match '-TokenPath "C:\\ProgramData\\IscsiReset\\client\.token"'
         $arguments | Should -Not -Match 'one-time-client-token|Authorization|Bearer'
+    }
+
+    It "parses root and nested Task Scheduler paths" {
+        $root = ConvertFrom-ScheduledTaskFullPath -FullPath '\Root Task'
+        $nested = ConvertFrom-ScheduledTaskFullPath `
+            -FullPath '\Drova\Streaming Service'
+
+        $root.TaskPath | Should -Be '\'
+        $root.TaskName | Should -Be 'Root Task'
+        $nested.TaskPath | Should -Be '\Drova\'
+        $nested.TaskName | Should -Be 'Streaming Service'
+        $nested.FullPath | Should -Be '\Drova\Streaming Service'
+    }
+
+    It "rejects an invalid Task Scheduler path" -ForEach @(
+        @{ FullPath = "" }
+        @{ FullPath = "\" }
+        @{ FullPath = "Drova\Task" }
+        @{ FullPath = "\Drova\" }
+        @{ FullPath = "\Drova\\Task" }
+        @{ FullPath = "\Drova\..\Task" }
+        @{ FullPath = '\Drova\Task"Name' }
+        @{ FullPath = "\Drova\Task`nName" }
+        @{ FullPath = " \Drova\Task" }
+    ) {
+        { ConvertFrom-ScheduledTaskFullPath -FullPath $FullPath } | Should -Throw
+    }
+
+    It "resolves an exact enabled nested task without changing it" {
+        $script:testScheduledTasks = @(
+            [pscustomobject]@{
+                TaskPath = '\Drova\'
+                TaskName = 'Streaming Service Old'
+                State = 'Ready'
+                Settings = [pscustomobject]@{ AllowDemandStart = $true }
+                Triggers = @()
+            },
+            [pscustomobject]@{
+                TaskPath = '\Drova\'
+                TaskName = 'Streaming Service'
+                State = 'Ready'
+                Settings = [pscustomobject]@{ AllowDemandStart = $true }
+                Triggers = @()
+            }
+        )
+        Mock Get-ScheduledTask { return $script:testScheduledTasks }
+
+        $resolved = Resolve-StartAfterResetTask `
+            -FullPath '\Drova\Streaming Service'
+
+        $resolved.FullPath | Should -Be '\Drova\Streaming Service'
+        $resolved.TaskPath | Should -Be '\Drova\'
+        $resolved.TaskName | Should -Be 'Streaming Service'
+        Should -Invoke Get-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+            $TaskPath -eq '\Drova\'
+        }
+    }
+
+    It "warns when the follow-up task still has triggers" {
+        Mock Get-ScheduledTask {
+            return [pscustomobject]@{
+                TaskPath = '\Drova\'
+                TaskName = 'Streaming Service'
+                State = 'Ready'
+                Settings = [pscustomobject]@{ AllowDemandStart = $true }
+                Triggers = @([pscustomobject]@{ TriggerType = 'Boot' })
+            }
+        }
+
+        $warnings = @()
+        $null = Resolve-StartAfterResetTask `
+            -FullPath '\Drova\Streaming Service' -WarningVariable warnings
+
+        @($warnings).Count | Should -Be 1
+        [string]$warnings[0] | Should -Match 'Remove them manually before reboot'
+    }
+
+    It "rejects a missing, disabled, or non-demand-start task" {
+        Mock Get-ScheduledTask { return @() }
+        {
+            Resolve-StartAfterResetTask -FullPath '\Drova\Missing'
+        } | Should -Throw '*not found or is inaccessible*'
+
+        Mock Get-ScheduledTask {
+            return [pscustomobject]@{
+                TaskPath = '\Drova\'
+                TaskName = 'Disabled Task'
+                State = 'Disabled'
+                Settings = [pscustomobject]@{ AllowDemandStart = $true }
+                Triggers = @()
+            }
+        }
+        {
+            Resolve-StartAfterResetTask -FullPath '\Drova\Disabled Task'
+        } | Should -Throw '*must be enabled*'
+
+        Mock Get-ScheduledTask {
+            return [pscustomobject]@{
+                TaskPath = '\Drova\'
+                TaskName = 'No Demand Start'
+                State = 'Ready'
+                Settings = [pscustomobject]@{ AllowDemandStart = $false }
+                Triggers = @()
+            }
+        }
+        {
+            Resolve-StartAfterResetTask -FullPath '\Drova\No Demand Start'
+        } | Should -Throw '*must allow on-demand start*'
+    }
+
+    It "rejects a reference to the reset task itself before lookup" {
+        Mock Get-ScheduledTask { throw 'must not be called' }
+
+        {
+            Resolve-StartAfterResetTask -FullPath '\iSCSI Reset and Connect'
+        } | Should -Throw '*must not reference the reset task itself*'
+        Should -Invoke Get-ScheduledTask -Times 0 -Exactly
+    }
+
+    It "builds only the reset action when no follow-up task is configured" {
+        Mock New-ScheduledTaskAction {
+            return [pscustomobject]@{ Execute = $Execute; Arguments = $Argument }
+        }
+
+        $actions = @(New-ResetScheduledTaskActions `
+            -PowerShellPath 'C:\Windows\powershell.exe' `
+            -ResetArguments '-File "C:\Reset-And-Connect.ps1"' `
+            -SchtasksPath 'C:\Windows\System32\schtasks.exe' `
+            -FollowUpTask $null)
+
+        $actions.Count | Should -Be 1
+        $actions[0].Execute | Should -Be 'C:\Windows\powershell.exe'
+    }
+
+    It "builds reset then schtasks Run actions in exact order" {
+        Mock New-ScheduledTaskAction {
+            return [pscustomobject]@{ Execute = $Execute; Arguments = $Argument }
+        }
+        $followUpTask = [pscustomobject]@{
+            FullPath = '\Drova\Streaming Service'
+        }
+
+        $actions = @(New-ResetScheduledTaskActions `
+            -PowerShellPath 'C:\Windows\powershell.exe' `
+            -ResetArguments '-File "C:\Reset-And-Connect.ps1"' `
+            -SchtasksPath 'C:\Windows\System32\schtasks.exe' `
+            -FollowUpTask $followUpTask)
+
+        $actions.Count | Should -Be 2
+        $actions[0].Execute | Should -Be 'C:\Windows\powershell.exe'
+        $actions[1].Execute | Should -Be 'C:\Windows\System32\schtasks.exe'
+        $actions[1].Arguments | Should -Be `
+            '/Run /TN "\Drova\Streaming Service"'
     }
 
     It "accepts an existing non-SYSTEM Majestic user profile" {
@@ -227,6 +392,14 @@ Describe "Installer secret and ACL regression" {
         $source | Should -Not -Match '(?m)^\s*Write-(Host|Output).*\$token'
         $source | Should -Not -Match '\$arguments\s*=.*\$token'
         $source | Should -Not -Match '-Token\s+`?"?\$token'
+    }
+
+    It "does not mutate or export the configured follow-up task" {
+        $source = Get-Content -LiteralPath $script:InstallerPath -Raw
+
+        $source | Should -Match 'Get-ScheduledTask -TaskPath \$parsed\.TaskPath'
+        $source | Should -Not -Match `
+            '(?m)\b(Set|Export|Unregister)-ScheduledTask\b'
     }
 
     It "creates ACL entries directly from SIDs on Windows" {

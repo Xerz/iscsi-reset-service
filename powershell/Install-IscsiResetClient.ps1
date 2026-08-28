@@ -9,7 +9,8 @@ param(
     [ValidateSet("Enabled", "Disabled")]
     [string]$MajesticLauncherSettingsSync = "Disabled",
     [ValidateSet("Enabled", "Disabled")]
-    [string]$Gta5RpLauncherSettingsSync = "Disabled"
+    [string]$Gta5RpLauncherSettingsSync = "Disabled",
+    [string]$StartAfterResetTask = ""
 )
 
 Set-StrictMode -Version 2.0
@@ -161,6 +162,97 @@ function New-ResetScheduledTaskArguments {
         "-TokenPath `"$ClientTokenPath`""
 }
 
+function ConvertFrom-ScheduledTaskFullPath {
+    param([Parameter(Mandatory = $true)][string]$FullPath)
+
+    if ([string]::IsNullOrWhiteSpace($FullPath) -or $FullPath -ne $FullPath.Trim()) {
+        throw "StartAfterResetTask must be an exact Task Scheduler path"
+    }
+    if ($FullPath.Length -gt 260 -or
+        -not $FullPath.StartsWith("\") -or
+        $FullPath.EndsWith("\") -or
+        $FullPath -match '[\x00-\x1f<>:"/|?*]') {
+        throw "StartAfterResetTask must be an exact Task Scheduler path"
+    }
+
+    $segments = @($FullPath.Substring(1).Split("\"))
+    if ($segments.Count -eq 0) {
+        throw "StartAfterResetTask must include a task name"
+    }
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -in @(".", "..")) {
+            throw "StartAfterResetTask contains an invalid path segment"
+        }
+    }
+
+    $separator = $FullPath.LastIndexOf("\")
+    return [pscustomobject]@{
+        FullPath = $FullPath
+        TaskPath = $FullPath.Substring(0, $separator + 1)
+        TaskName = $FullPath.Substring($separator + 1)
+    }
+}
+
+function Resolve-StartAfterResetTask {
+    param([Parameter(Mandatory = $true)][string]$FullPath)
+
+    $parsed = ConvertFrom-ScheduledTaskFullPath -FullPath $FullPath
+    if ($parsed.TaskPath -eq "\" -and $parsed.TaskName -ieq "iSCSI Reset and Connect") {
+        throw "StartAfterResetTask must not reference the reset task itself"
+    }
+
+    try {
+        $tasks = @(Get-ScheduledTask -TaskPath $parsed.TaskPath -ErrorAction Stop)
+    }
+    catch {
+        throw "StartAfterResetTask was not found or is inaccessible"
+    }
+    $matches = @($tasks | Where-Object { $_.TaskName -ieq $parsed.TaskName })
+    if ($matches.Count -ne 1) {
+        throw "StartAfterResetTask was not found or is inaccessible"
+    }
+
+    $task = $matches[0]
+    if ([string]$task.State -eq "Disabled") {
+        throw "StartAfterResetTask must be enabled"
+    }
+    $allowDemandStart = $task.Settings.PSObject.Properties["AllowDemandStart"]
+    if ($null -ne $allowDemandStart -and $allowDemandStart.Value -eq $false) {
+        throw "StartAfterResetTask must allow on-demand start"
+    }
+    if (@($task.Triggers).Count -gt 0) {
+        Write-Warning (
+            "StartAfterResetTask still has triggers. Remove them manually before reboot " +
+            "to avoid an additional start request."
+        )
+    }
+
+    return [pscustomobject]@{
+        FullPath = "$($task.TaskPath)$($task.TaskName)"
+        TaskPath = [string]$task.TaskPath
+        TaskName = [string]$task.TaskName
+    }
+}
+
+function New-ResetScheduledTaskActions {
+    param(
+        [Parameter(Mandatory = $true)][string]$PowerShellPath,
+        [Parameter(Mandatory = $true)][string]$ResetArguments,
+        [Parameter(Mandatory = $true)][string]$SchtasksPath,
+        [AllowNull()]$FollowUpTask
+    )
+
+    $actions = @(
+        New-ScheduledTaskAction -Execute $PowerShellPath -Argument $ResetArguments
+    )
+    if ($null -ne $FollowUpTask) {
+        $followUpArguments = "/Run /TN `"$($FollowUpTask.FullPath)`""
+        $actions += New-ScheduledTaskAction `
+            -Execute $SchtasksPath -Argument $followUpArguments
+    }
+    return $actions
+}
+
 function Invoke-IscsiResetClientInstall {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -169,6 +261,11 @@ function Invoke-IscsiResetClientInstall {
     }
     if (-not (Test-Path -LiteralPath $ClientScriptPath)) { throw "Client script not found" }
     if (-not (Test-Path -LiteralPath $CaCertificatePath)) { throw "CA certificate not found" }
+
+    $followUpTask = $null
+    if (-not [string]::IsNullOrWhiteSpace($StartAfterResetTask)) {
+        $followUpTask = Resolve-StartAfterResetTask -FullPath $StartAfterResetTask
+    }
 
     $api = Resolve-ResetApiAddress -Address $ResetApiIp
     $tokenInput = Read-ClientToken
@@ -231,7 +328,9 @@ function Invoke-IscsiResetClientInstall {
         $powerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
         $arguments = New-ResetScheduledTaskArguments -ScriptPath $installedScript `
             -BaseUrl $api.BaseUrl -ClientTokenPath $tokenPath
-        $action = New-ScheduledTaskAction -Execute $powerShell -Argument $arguments
+        $schtasks = "$env:SystemRoot\System32\schtasks.exe"
+        $actions = @(New-ResetScheduledTaskActions -PowerShellPath $powerShell `
+            -ResetArguments $arguments -SchtasksPath $schtasks -FollowUpTask $followUpTask)
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $trigger.Delay = "PT15S"
         $principalTask = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
@@ -240,13 +339,16 @@ function Invoke-IscsiResetClientInstall {
         $settings = New-ScheduledTaskSettingsSet `
             -ExecutionTimeLimit (New-TimeSpan -Minutes $taskLimitMinutes) `
             -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-        Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $action `
+        Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $actions `
             -Trigger $trigger -Principal $principalTask -Settings $settings -Force | Out-Null
 
         Write-Host "Installed iSCSI reset client for Reset API $($api.Ip):8443."
         Write-Host "Epic Games manifest sync: $EpicGamesManifestSync."
         Write-Host "Majestic Launcher settings sync: $MajesticLauncherSettingsSync."
         Write-Host "GTA5RP Launcher settings sync: $Gta5RpLauncherSettingsSync."
+        if ($null -ne $followUpTask) {
+            Write-Host "Start after reset task: $($followUpTask.FullPath)."
+        }
         Write-Host "Reboot to run the first reset and non-persistent login."
     }
     finally {

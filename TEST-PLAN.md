@@ -1,4 +1,4 @@
-# Механический тест-план v0.5.1
+# Механический тест-план v0.5.2
 
 Физические и destructive-проверки выполняются только на отдельных master/client zvol размером
 1 GiB. Перед началом сохраните конфигурацию TrueNAS и копию `/state/releases.sqlite3`. Никакой
@@ -114,30 +114,44 @@
 1. На русской Windows PowerShell 5.1 запустить `Install-IscsiResetClient.ps1` без token в
    аргументах. Проверить скрытый ввод token, default и явно заданный `ResetApiIp`, а также ACL
    каталога и `client.token` только для SID `S-1-5-18` и `S-1-5-32-544`.
-2. На первом подключении новых клонов разрешить Windows автоматически переставить ожидаемые
+2. Создать включённую тестовую задачу `\Drova\Streaming Service`, разрешающую ручной запуск,
+   и установить client helper с `-StartAfterResetTask "\Drova\Streaming Service"`.
+   Проверить два action в точном порядке: Reset PowerShell, затем
+   `schtasks.exe /Run /TN "\Drova\Streaming Service"`. Повторная установка не должна
+   дублировать action. Без параметра должен остаться один Reset action.
+3. Убедиться, что installer не меняет actions, principal, settings, XML или triggers Drova.
+   При оставшихся triggers должна появиться только warning; затем удалить их вручную. Отдельно
+   проверить отказ для отсутствующей, disabled, запрещающей demand start, некорректно
+   названной и ссылающейся на саму Reset-задачу.
+4. Заменить первый action безопасным тестовым helper, последовательно возвращающим `0`, `10`,
+   `20` и `40`. Во всех четырёх случаях marker Drova должен появляться только после завершения
+   первого процесса и ровно один раз. Проверить, что `LastTaskResult` может принадлежать
+   `schtasks.exe`, а исходный результат Reset остаётся в JSONL. Принудительный timeout всей
+   задачи отметить отдельно: запуск второго action в этом случае не гарантируется.
+5. На первом подключении новых клонов разрешить Windows автоматически переставить ожидаемые
    буквы двух client-дисков. Запустить задачу и проверить, что скрипт по NAA распознаёт оба
    диска, снимает конфликтующие access paths только с них, назначает конфигурационные буквы и
    оставляет session подключённой.
-3. На Windows без зарегистрированного `MSFT_iSCSITarget` для client IQN запустить задачу без
+6. На Windows без зарегистрированного `MSFT_iSCSITarget` для client IQN запустить задачу без
    ручного Refresh в iSCSI Initiator. После `prepared` должны появиться
    `target_discovery_started`, затем `target_discovered`; скрипт обязан обновить точный portal,
    дождаться target и подключить его раньше 60-й проверки. Повторный `/v1/prepare` во время
    ожидания не допускается.
-4. Занять одну желаемую букву внешним тестовым диском. Повтор должен завершиться кодом `40`,
+7. Занять одну желаемую букву внешним тестовым диском. Повтор должен завершиться кодом `40`,
    отключить только созданную session и не менять букву внешнего диска. Проверить этапы и
    сведения о дисках в `C:\ProgramData\IscsiReset\logs\reset.jsonl`.
-5. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
-6. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
+8. Создать marker в master, выполнить полный release workflow и загрузить тестовый игровой ПК.
+9. Создать на client clone локальный marker и перезагрузить ПК. Master marker должен остаться,
    client marker — исчезнуть после проверенного rollback к `@clean`.
-7. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
+10. Одновременно загрузить два клиента и сверить их target, LUN, NAA и clone paths. Targets и
    clones не должны пересекаться.
-8. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
+11. Проверить fail-closed поведение при неверном token/source IP, активной session, неверном NAA,
    неполном release mapping, неправильном origin и сбое после mutation.
-9. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
+12. Перезапустить оба контейнера и redeploy App с теми же mounts. Active release и dashboard
    должны сохраниться.
-10. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
+13. На копии стенда убрать/повредить SQLite. Reset `/readyz` и management mutations должны
    вернуть ошибку; Windows не должен подключить промежуточный набор LUN.
-11. После ошибки, возникшей уже после нового login, задержать исчезновение exact client session
+14. После ошибки, возникшей уже после нового login, задержать исчезновение exact client session
     на несколько секунд. Helper должен ждать до 15 секунд и при необходимости один раз повторить
     disconnect только для точного target IQN. Проверить `target_disconnected_after_error` лишь
     после подтверждённого исчезновения; постоянно остающаяся session должна дать
@@ -385,4 +399,5 @@
 | Dual-role ПК | Только одна активная роль, обе стороны fail-closed |  | ☐ |
 | Unused criterion | Только кандидат, dependencies показаны |  | ☐ |
 | Client reset | Полный доказанный набор LUN |  | ☐ |
+| Post-reset task | Два action; Drova запускается после любого штатного exit |  | ☐ |
 | Lost SQLite/API | Fail-closed и stale dashboard |  | ☐ |
