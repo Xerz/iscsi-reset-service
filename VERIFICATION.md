@@ -23,9 +23,11 @@
   `node tests/static_connection_presentations.test.mjs` — успешно.
 - `docker compose config --quiet` — успешно.
 
-### Ожидает удалённой проверки
+### Удалённая проверка
 
-- Повторный полный Pester на GitHub Actions Windows PowerShell 5.1 после hotfix commit.
+- GitHub Actions run `33192149478` для hotfix commit `0dc2cb8` — успешно: Python и interaction
+  jobs прошли, Windows PowerShell 5.1/Pester 5.7.1 выполнил **172 passed, 0 failed,
+  0 skipped** за 23.57 секунды.
 
 ## Epic Games client sync warning-only v0.5.1 — 2026-08-28
 
