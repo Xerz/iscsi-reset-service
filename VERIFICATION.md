@@ -41,11 +41,18 @@
   **Interaction suite passed** с версией `0.5.2`; после проверки выполнен
   `docker compose down --volumes`.
 
+### Удалённая проверка
+
+- GitHub Actions run `33204110736` для commit `f397725` завершён успешно: Python/Ruff/Pytest/
+  JavaScript, Compose interaction и полный Pester 5.7.1 на настоящем Windows PowerShell 5.1
+  прошли. ScheduledTasks-проверки остаются unit-тестами с mock-командами и не заменяют
+  физический запуск двух action через Windows Task Scheduler.
+
 ### Ожидает Windows/TrueNAS стенда
 
-- Полный Pester на Windows PowerShell 5.1 и проверка native `Get-ScheduledTask`,
-  `New-ScheduledTaskAction` и `Register-ScheduledTask` для вложенного пути
-  `\Drova\Streaming Service`.
+- Физическая проверка native `Get-ScheduledTask`, `New-ScheduledTaskAction` и
+  `Register-ScheduledTask` для вложенного пути `\Drova\Streaming Service`; CI Pester проверяет
+  эту ветку через mock-команды.
 - Физически подтвердить два action и запуск Drova только после нормального завершения первого
   процесса с кодами `0`, `10`, `20` и `40`, отсутствие дублирования после повторной установки,
   неизменность Drova-задачи и warning при оставшихся triggers.
