@@ -1,5 +1,26 @@
 # Verification record
 
+## GitHub Release v0.5.2 — 2026-08-29
+
+- Аннотированный tag `v0.5.2` указывает на commit `3663acf`; tag annotation содержит три
+  непустых release highlight. Предварительный branch CI run `33244159386` завершился успешно
+  для Python/JavaScript, Compose interaction и Windows PowerShell 5.1.
+- Publish workflow run `33244294257` успешно выполнил tag validation, повторный полный
+  verification, сборку и публикацию linux/amd64 GHCR image, provenance attestation, генерацию
+  TrueNAS bundle и создание обычного non-draft/non-prerelease GitHub Release
+  `https://github.com/Xerz/iscsi-reset-service/releases/tag/v0.5.2`.
+- Release API показывает ровно семь uploaded assets: TrueNAS YAML, `image-digest.txt`,
+  `SHA256SUMS` и четыре операторских PowerShell-файла. Release body, digest-файл и оба `image:`
+  в YAML совпадают:
+  `ghcr.io/xerz/iscsi-reset-service@sha256:01c92464a21fc36f9c4380bf496a0382f86655ea3f91a744c37ff2021fe47921`.
+- Workflow artifact скачан во временный каталог: все шесть записей `SHA256SUMS` прошли
+  `shasum -a 256 -c`, четыре PowerShell-файла byte-for-byte совпали с release tag, а TrueNAS
+  YAML прошёл `docker compose config --quiet`.
+- Прямая повторная загрузка тех же файлов через GitHub Release CDN дважды завершилась сетевым
+  timeout к `185.199.111.133`; поэтому checksum подтверждён для workflow artifact из того же
+  publish `dist/`, а для Release assets отдельно подтверждены успешный upload step и metadata,
+  но не повторное скачивание содержимого с CDN.
+
 ## Post-reset Scheduled Task chaining v0.5.2 — 2026-08-29
 
 ### Реализация
