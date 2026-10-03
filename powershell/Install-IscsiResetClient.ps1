@@ -335,9 +335,8 @@ function Invoke-IscsiResetClientInstall {
         $trigger.Delay = "PT15S"
         $principalTask = New-ScheduledTaskPrincipal -UserId "SYSTEM" `
             -LogonType ServiceAccount -RunLevel Highest
-        $taskLimitMinutes = if ($EpicGamesManifestSync -eq "Aggressive") { 20 } else { 5 }
         $settings = New-ScheduledTaskSettingsSet `
-            -ExecutionTimeLimit (New-TimeSpan -Minutes $taskLimitMinutes) `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 6) `
             -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
         Register-ScheduledTask -TaskName "iSCSI Reset and Connect" -Action $actions `
             -Trigger $trigger -Principal $principalTask -Settings $settings -Force | Out-Null

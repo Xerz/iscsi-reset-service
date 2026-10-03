@@ -391,6 +391,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 конфигурацию, SID и профиль игрового пользователя в `C:\ProgramData\IscsiReset`, закрывает ACL
 для SYSTEM и Administrators и создаёт startup-задачу под `SYSTEM`.
 
+При read-only диске `Reset-And-Connect.ps1` сначала сверяет полный NAA-набор, отключает
+созданную текущей попыткой client-сессию и подтверждает её исчезновение. Затем ждёт 60 секунд
+и повторяет весь цикл API → конфигурация → prepare → discovery → непостоянный login → проверка
+дисков. Максимум — 20 попыток, включая первую; после последней неудачи возвращается код `40`
+без дополнительной паузы. Неподтверждённый logout или другая ошибка завершают запуск сразу.
+Каждая полная попытка получает новый request ID, а внутренние повторы prepare сохраняют ID
+своей попытки. Событие `read_only_retry` содержит номер попытки, причину и длительность паузы.
+Launcher sync выполняется только после успешной проверки дисков.
+
+Startup-задача получает общий лимит 6 часов во всех режимах launcher sync: 19 минутных пауз
+плюс полные циклы с существующими сетевыми таймаутами должны успеть завершиться.
+
 `-StartAfterResetTask` необязательно добавляет второй action в startup-задачу. Параметр
 принимает полный путь существующей включённой задачи Task Scheduler, включая папку. После
 штатного завершения `Reset-And-Connect.ps1` с любым кодом первый action завершается, а второй
@@ -410,6 +422,27 @@ C:\Windows\System32\schtasks.exe /Run /TN "\Drova\Streaming Service"
 может не запустить второй action. `LastTaskResult` общей startup-задачи может отражать результат
 `schtasks.exe`; подробный результат Reset остаётся в
 `C:\ProgramData\IscsiReset\logs\reset.jsonl`.
+
+### Обновление уже установленного клиента
+
+В повышенной Windows PowerShell 5.1, из каталога с новым `Reset-And-Connect.ps1`, выполните:
+
+```powershell
+$resetTask = Get-ScheduledTask -TaskName "iSCSI Reset and Connect" -TaskPath "\" -ErrorAction Stop
+if ($resetTask.State -eq "Running") { throw "Дождитесь завершения текущей reset-задачи" }
+$installedReset = "C:\ProgramData\IscsiReset\Reset-And-Connect.ps1"
+$backupReset = $installedReset + "." + (Get-Date -Format "yyyyMMdd-HHmmss") + ".bak"
+Copy-Item -LiteralPath $installedReset -Destination $backupReset -ErrorAction Stop
+Copy-Item -LiteralPath .\Reset-And-Connect.ps1 -Destination $installedReset -Force -ErrorAction Stop
+$resetTask.Settings.ExecutionTimeLimit = "PT6H"
+Set-ScheduledTask -TaskName $resetTask.TaskName -TaskPath $resetTask.TaskPath `
+    -Settings $resetTask.Settings -ErrorAction Stop | Out-Null
+(Get-ScheduledTask -TaskName $resetTask.TaskName -TaskPath $resetTask.TaskPath).Settings.ExecutionTimeLimit
+```
+
+Проверьте итоговый лимит `PT6H`. Обновление сохраняет token, сертификат, launcher-конфигурацию,
+actions, triggers и principal существующей задачи. Одна замена `.ps1` оставляет прежний лимит
+5/20 минут и может оборвать retry раньше 20-й попытки.
 
 ## Режимы launcher sync
 

@@ -150,4 +150,66 @@ if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter
     throw "Wrong-NAA scenario modified the local disk"
 }
 
+# Exercise a complete read-only retry against the real mock API, including the minute pause.
+($state.disks | Where-Object unique_id -eq "wrong-naa").unique_id = "0x6589cfc000000001"
+foreach ($disk in @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
+    $disk.is_offline = $true
+    $disk.drive_letter = $null
+}
+($state.disks | Where-Object unique_id -eq "0x6589cfc000000001").is_read_only = $true
+$state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath
+Remove-Item -LiteralPath (Join-Path $root "client.log.jsonl") -Force
+. "/suite/powershell/Reset-And-Connect.ps1" `
+    -TokenPath $tokenPath `
+    -SimulationStatePath $statePath -SimulationSourceIp "10.20.40.101" `
+    -AllowHttpForSimulation -NoMain
+$script:ReadOnlyPauseCount = 0
+function Start-Sleep {
+    param([int]$Seconds, [int]$Milliseconds)
+    if ($Seconds -eq 60) {
+        $script:ReadOnlyPauseCount++
+        if (@(Get-ResetSessions -TargetIqn "iqn.2026-08.lab.games:chimera").Count -ne 0) {
+            throw "Read-only retry started before the session was removed"
+        }
+        $retryState = Read-SimulationState
+        foreach ($disk in @($retryState.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
+            if (-not $disk.is_offline -or $null -ne $disk.drive_letter) {
+                throw "Read-only attempt changed a simulated disk before retry"
+            }
+        }
+        Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds
+        # Model recovery of the observed Windows read-only state after logout and the pause.
+        ($retryState.disks | Where-Object unique_id -eq "0x6589cfc000000001").is_read_only = $false
+        Save-SimulationState $retryState
+    } elseif ($PSBoundParameters.ContainsKey("Seconds")) {
+        Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds
+    } else {
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+    }
+}
+$code = Invoke-ResetMain -BaseUrl "http://api:8080" -ClientTokenPath $tokenPath `
+    -TimeoutSeconds 15
+if ($code -ne 0 -or $script:ReadOnlyPauseCount -ne 1) {
+    throw "Read-only retry did not succeed after exactly one minute pause"
+}
+$records = @(Get-Content -LiteralPath (Join-Path $root "client.log.jsonl") | ConvertFrom-Json)
+foreach ($event in @("start", "api_ready", "client_configuration_loaded", "prepared", "target_discovered", "target_connected")) {
+    if (@($records | Where-Object event -eq $event).Count -ne 2) {
+        throw "Read-only retry did not repeat stage $event"
+    }
+}
+$starts = @($records | Where-Object event -eq "start")
+if ($starts[0].request_id -eq $starts[1].request_id) { throw "Retry reused the previous request ID" }
+if (@($records | Where-Object event -eq "ready").Count -ne 1) { throw "Unexpected ready count" }
+$state = Read-SimulationState
+if (@($state.sessions).Count -ne 1) { throw "Retry did not leave one verified session" }
+foreach ($disk in @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
+    if ($disk.is_offline -or [string]::IsNullOrWhiteSpace($disk.drive_letter)) {
+        throw "Retry did not mount the complete simulated disk set"
+    }
+}
+if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter -ne "C") {
+    throw "Read-only retry modified the local disk"
+}
+
 Write-Host "Interaction suite passed"

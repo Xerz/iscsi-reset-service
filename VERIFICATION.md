@@ -1,5 +1,67 @@
 # Verification record
 
+## Локальный read-only retry hotfix — 2026-10-04
+
+### Реализация
+
+- Runtime client helper выделяет `DISK_READ_ONLY` только после полного сопоставления session
+  disks по NAA. После подтверждённого logout созданной попыткой session он ждёт 60 секунд и
+  повторяет health/config/prepare/discovery/login/validation с новым request ID. Максимум —
+  20 полных попыток, включая первую; внутренние повторы prepare сохраняют свой ID.
+- После 20 read-only попыток возвращается `40`, без последней паузы. Другие ошибки и
+  неподтверждённый logout завершают запуск сразу. Launcher sync и `ready` выполняются после
+  успешной проверки дисков; другие targets и их sessions не отключаются.
+- Client installer задаёт `ExecutionTimeLimit` 6 часов для всех sync-режимов. README содержит
+  процедуру замены установленного runtime с резервной копией и изменения только settings
+  существующей startup-задачи, без переустановки token, сертификата или launcher config.
+- Хотфикс сохраняет версию 0.5.2; новый GitHub Release и установка на production Windows
+  в рамках этой проверки не выполнялись.
+  Reset API, schema, SQLite и storage state machines не изменялись. Причина появления
+  read-only не исследовалась.
+
+### Автоматические проверки
+
+- PowerShell parser всех production/test `.ps1` и interaction harness — успешно в
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, фактически PowerShell **7.5.0**, Ubuntu
+  **24.04.1 LTS**, Linux/amd64. Pester 5.7.1 скачан `Save-Module` во временный каталог.
+- `Invoke-Pester /suite/powershell/tests -Output Detailed -CI` в том же контейнере с
+  `--network none`, read-only project mount и working directory `/tmp` — **194 passed,
+  0 failed, 2 skipped** из 196, 30.75 секунды, exit code `0`. Пропущены Windows-only ACL и
+  Transactional Registry проверки. Это не Windows PowerShell 5.1.
+- Новые Pester cases проверяют полный retry на трёх произвольно названных томах, успех на
+  попытках 2/20, постоянный read-only с 20 login/logout и 19 паузами, новые request ID и
+  сохранение ID при внутреннем prepare retry, запрет retry при wrong NAA или cleanup failure,
+  отсутствие ранних disk mutations, однократный launcher sync, сохранность чужой session и
+  отсутствие token в JSONL. В Pester минутные паузы заменены mock-командой.
+- Первый Pester запуск выполнил те же **194 passed, 0 failed, 2 skipped**, но завершился
+  ошибкой экспорта `testResults.xml` в read-only `/suite`. Повтор с working directory `/tmp`
+  успешно записал отчёт во временную файловую систему контейнера.
+- `ruff check src tests` — успешно. `python -m pytest -q -p no:cacheprovider` на локальном
+  Python **3.12.4** — **133 passed** за 1.74 секунды.
+- `docker compose -p iscsi-readonly-hotfix config --quiet` — успешно. Первый interaction
+  запуск остановился в новом test harness до read-only цикла: dot-source helper заменил
+  test token path своим default. Harness исправлен явным `-TokenPath`; временный Compose
+  project удалён через `docker compose -p iscsi-readonly-hotfix down --volumes` перед повтором.
+- Повторный `docker compose -p iscsi-readonly-hotfix up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`.
+  Mock stage/activate, prepare failpoint/reconciliation, wrong NAA cleanup и новый read-only
+  сценарий прошли. Новый сценарий выполняет настоящую 60-секундную паузу, два полных
+  health/config/prepare/discovery/login цикла с разными request ID, одну финальную `ready`,
+  проверяет отсутствие ранних simulated disk mutations и сохранность локального диска.
+  После успешного запуска выполнен `docker compose -p iscsi-readonly-hotfix down --volumes`.
+  Этот изолированный mock-стенд не обращался к реальному TrueNAS.
+
+### Ожидает Windows/TrueNAS стенда
+
+- Windows PowerShell 5.1/Pester в этой сессии не запускался; Windows runner недоступен.
+  Linux Pester и Compose не подтверждают настоящие Storage/iSCSI cmdlets, NTFS и TrueNAS.
+- Физически проверить read-only после login, подтверждённый logout, полную минутную паузу и
+  повтор всего цикла; успех на 20-й попытке и постоянный read-only с кодом `40`, отсутствие
+  ранних disk mutations и сохранность посторонних targets. Сценарии внесены в `TEST-PLAN.md`.
+- Проверить native Task Scheduler: новый installer и обновление существующей задачи должны
+  давать `PT6H` во всех режимах, сохраняя actions, triggers, principal и follow-up action.
+  Документированная команда обновления существующей задачи на реальном Windows не выполнялась.
+
 ## GitHub Release v0.5.2 — 2026-08-29
 
 - Аннотированный tag `v0.5.2` указывает на commit `3663acf`; tag annotation содержит три

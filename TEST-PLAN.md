@@ -156,6 +156,20 @@
     disconnect только для точного target IQN. Проверить `target_disconnected_after_error` лишь
     после подтверждённого исчезновения; постоянно остающаяся session должна дать
     `target_disconnect_failed` без optimistic `ready`.
+15. На выделенном тестовом клиенте с полным набором из трёх произвольно названных томов
+    воспроизвести read-only после login. До disk mutations helper должен сверить весь NAA-набор,
+    отключить свою session, подтвердить её исчезновение, записать `read_only_retry` и ждать
+    60 секунд. Затем должны повториться health/config/prepare/discovery/login с новым request ID.
+    Внутренние повторы prepare одной попытки обязаны сохранять её ID. Проверить успех после
+    одного сбоя и на 20-й попытке; launcher sync и `ready` появляются только после успеха.
+16. Сохранить read-only во всех 20 попытках: должны быть 20 login/logout, 19 минутных пауз и
+    итоговый код `40`, без последней паузы и без `ready`. Диски не переводятся online, буквы
+    не меняются. При неверном NAA другого диска или неподтверждённом logout повтор запрещён;
+    посторонние sessions и диски сохраняются.
+17. Для новой установки и обновления существующей задачи проверить `ExecutionTimeLimit=PT6H`
+    во всех режимах sync. При обновлении только лимита сверить сохранность actions, triggers,
+    principal, follow-up action, token, сертификата и launcher-конфигурации. Прежний лимит
+    5/20 минут не должен обрывать последовательность retry.
 
 ## 7. Epic Games manifest sync
 
@@ -167,7 +181,7 @@
 2. Сначала повторно установить оба helper с `-EpicGamesManifestSync Enabled`, затем отдельно с
    `Aggressive`. Проверить защищённые schema 2 `egs-sync.json` и обратное чтение schema 1; при
    `Disabled` Publisher не должен создавать bundle, а клиент — закрывать EGS или менять файлы.
-   Для aggressive scheduled task execution limit должен быть 20 минут, для остальных — 5.
+   Для всех режимов scheduled task execution limit должен быть 6 часов.
 3. Запустить установленные client и Publisher helper отдельным `powershell.exe -File` без
    явного `-EgsSyncConfigPath`. Оба должны загрузиться без parameter-binding ошибки и выбрать
    соседний `egs-sync.json`. Повторить с явным произвольным безопасным путём и убедиться, что

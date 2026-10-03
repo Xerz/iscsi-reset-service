@@ -356,8 +356,7 @@ Describe "Installer secret and ACL regression" {
         $source | Should -Match 'schema_version = 2'
         $source | Should -Match 'mode = \$EpicGamesManifestSync\.ToLowerInvariant\(\)'
         $source | Should -Match 'ValidateSet\("Enabled", "Disabled", "Aggressive"\)'
-        $source | Should -Match '\$taskLimitMinutes = if \(\$EpicGamesManifestSync -eq "Aggressive"\)'
-        $source | Should -Match 'New-TimeSpan -Minutes \$taskLimitMinutes'
+        $source | Should -Match 'ExecutionTimeLimit \(New-TimeSpan -Hours 6\)'
         foreach ($installerSource in @($source, $publisherSource)) {
             $installerSource | Should -Match 'schema_version = 2'
             $installerSource | Should -Match `

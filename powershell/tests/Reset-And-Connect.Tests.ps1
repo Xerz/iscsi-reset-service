@@ -389,6 +389,25 @@ Describe "Windows drive-letter reconciliation" {
         Should -Invoke Set-Partition -Times 0 -Exactly
     }
 
+    It "classifies read-only only after the full native NAA set matches" {
+        $script:SessionDisks[0].IsReadOnly = $true
+        try {
+            Get-ResetDiskMappings -ExpectedVolumes $script:ExpectedVolumes `
+                -Disks $script:SessionDisks
+            throw "Expected read-only validation to fail"
+        } catch {
+            $_.Exception.Data["Code"] | Should -Be "DISK_READ_ONLY"
+        }
+        $script:SessionDisks[1].UniqueId = "wrong-naa"
+
+        { Mount-ResetVolumes -ExpectedVolumes $script:ExpectedVolumes `
+            -Disks $script:SessionDisks } | Should -Throw "*exactly one session disk*"
+
+        Should -Invoke Set-Disk -Times 0 -Exactly
+        Should -Invoke Set-Partition -Times 0 -Exactly
+        Should -Invoke Remove-PartitionAccessPath -Times 0 -Exactly
+    }
+
     It "retries transiently unavailable volume metadata" {
         $script:VolumeReads = 0
         Mock Start-Sleep { }
@@ -1326,6 +1345,215 @@ Describe "Majestic Launcher client settings sync" {
 
         Should -Invoke Close-MajesticUserHive -Times 2 -Exactly
         $script:MajesticRegistrySetCalls | Should -Be 4
+    }
+}
+
+Describe "Read-only full reset retries" {
+    BeforeEach {
+        $script:SimulationStatePath = Join-Path $TestDrive "readonly-state.json"
+        $script:SimulationSourceIp = "10.20.40.101"
+        $script:AllowHttpForSimulation = $true
+        $script:RetryTarget = "iqn.2026-08.lab.games:readonly-client"
+        $script:RetryTokenPath = Join-Path $TestDrive "readonly.token"
+        Set-Content -LiteralPath $script:RetryTokenPath -Value "readonly-test-token" -NoNewline
+        $script:RetryLogPath = Join-Path $TestDrive "client.log.jsonl"
+        Remove-Item -LiteralPath $script:RetryLogPath -Force -ErrorAction SilentlyContinue
+        $script:RetryVolumes = @(
+            [pscustomobject]@{ name = "primary"; disk_unique_id = "aaa"; drive_letter = "E"; label = "PRIMARY" },
+            [pscustomobject]@{ name = "archive"; disk_unique_id = "bbb"; drive_letter = "F"; label = "ARCHIVE" },
+            [pscustomobject]@{ name = "third-volume"; disk_unique_id = "ccc"; drive_letter = "G"; label = "THIRD" }
+        )
+        $disks = @()
+        foreach ($volume in $script:RetryVolumes) {
+            $disks += [pscustomobject]@{
+                target_iqn = $script:RetryTarget
+                unique_id = "0x" + $volume.disk_unique_id
+                label = $volume.label
+                drive_letter = $null
+                is_offline = $true
+                is_read_only = $volume.disk_unique_id -eq "aaa"
+            }
+        }
+        $disks += [pscustomobject]@{
+            target_iqn = "other-target"
+            unique_id = "local-system-disk"
+            label = "WINDOWS"
+            drive_letter = "C"
+            is_offline = $false
+            is_read_only = $false
+        }
+        @{
+            sessions = @([pscustomobject]@{ target_iqn = "other-target"; persistent = $true })
+            disks = $disks
+        } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:SimulationStatePath
+        $script:RetryRequests = New-Object 'System.Collections.Generic.List[object]'
+        $script:RetrySleeps = New-Object 'System.Collections.Generic.List[int]'
+        $script:RecoverOnAttempt = 0
+        $script:FailFirstPrepare = $false
+        Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "retry-revision" } }
+        Mock Invoke-ResetRequest {
+            $script:RetryRequests.Add([pscustomobject]@{
+                Method = $Method; Uri = $Uri; RequestId = $RequestId
+            })
+            if ($Method -eq "POST") {
+                @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
+            }
+            if ($Method -eq "POST" -and $script:FailFirstPrepare) {
+                $script:FailFirstPrepare = $false
+                throw (New-ApiException -StatusCode 409 -Code "SESSION_ACTIVE" -Message "transient")
+            }
+            return [pscustomobject]@{
+                target_iqn = $script:RetryTarget
+                portal = [pscustomobject]@{ address = "10.20.40.10"; port = 3260 }
+                volumes = $script:RetryVolumes
+            }
+        }
+        Mock Start-Sleep {
+            if ($Seconds -ne 60) { return }
+            $script:RetrySleeps.Add([int]$Seconds)
+            $state = Read-SimulationState
+            @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
+            foreach ($disk in @($state.disks | Where-Object target_iqn -eq $script:RetryTarget)) {
+                $disk.is_offline | Should -BeTrue
+                $disk.drive_letter | Should -BeNullOrEmpty
+            }
+            if ($script:RecoverOnAttempt -eq $script:RetrySleeps.Count + 1) {
+                ($state.disks | Where-Object unique_id -eq "0xaaa").is_read_only = $false
+                Save-SimulationState $state
+            }
+        }
+        Mock Get-EgsManifestSyncMode { return "Enabled" }
+        Mock Get-MajesticSyncConfig { return [pscustomobject]@{ Enabled = $false } }
+        Mock Get-Gta5RpSyncConfig { return [pscustomobject]@{ Enabled = $false } }
+        Mock Invoke-ClientEgsManifestSync {
+            return [pscustomobject]@{
+                ManifestCount = 3
+                AdoptedAppCount = 0
+                DisplacedManifestCount = 0
+                LauncherEntryRemovalCount = 0
+                LauncherEntryImportCount = 0
+                LauncherFallbackAppCount = 0
+                IncompleteWarningCount = 0
+            }
+        }
+    }
+
+    It "repeats the entire three-volume flow and succeeds on attempt <Recovery>" -TestCases @(
+        @{ Recovery = 2 }, @{ Recovery = 20 }
+    ) {
+        param($Recovery)
+        $script:RecoverOnAttempt = $Recovery
+
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2
+
+        $code | Should -Be 0
+        $script:RetrySleeps.Count | Should -Be ($Recovery - 1)
+        Should -Invoke Wait-ResetApi -Times $Recovery -Exactly
+        Should -Invoke Invoke-ResetRequest -Times ($Recovery * 2) -Exactly
+        Should -Invoke Start-Sleep -Times ($Recovery - 1) -Exactly -ParameterFilter {
+            $Seconds -eq 60
+        }
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 1 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        $starts = @($records | Where-Object event -eq "start")
+        @($starts.request_id | Select-Object -Unique).Count | Should -Be $Recovery
+        for ($attempt = 1; $attempt -le $Recovery; $attempt++) {
+            $requests = @($script:RetryRequests | Where-Object {
+                $_.RequestId -eq $starts[$attempt - 1].request_id
+            })
+            $requests.Count | Should -Be 2
+            $requests[0].Method | Should -Be "GET"
+            $requests[1].Method | Should -Be "POST"
+            $starts[$attempt - 1].attempt | Should -Be $attempt
+        }
+        foreach ($event in @("prepared", "target_discovered", "target_connected")) {
+            @($records | Where-Object event -eq $event).Count | Should -Be $Recovery
+        }
+        $retries = @($records | Where-Object event -eq "read_only_retry")
+        $retries.Count | Should -Be ($Recovery - 1)
+        foreach ($retry in $retries) {
+            $retry.level | Should -Be "WARN"
+            $retry.reason | Should -Be "DISK_READ_ONLY"
+            $retry.delay_seconds | Should -Be 60
+            $retry.max_attempts | Should -Be 20
+        }
+        @($records | Where-Object event -eq "ready").Count | Should -Be 1
+        @($records | Where-Object level -eq "ERROR").Count | Should -Be 0
+        $state = Read-SimulationState
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+        foreach ($volume in $script:RetryVolumes) {
+            $disk = $state.disks | Where-Object unique_id -eq ("0x" + $volume.disk_unique_id)
+            $disk.drive_letter | Should -Be $volume.drive_letter
+            $disk.is_offline | Should -BeFalse
+        }
+        ($state.sessions | Where-Object target_iqn -eq "other-target").persistent | Should -BeTrue
+        ($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter | Should -Be "C"
+        Get-Content -LiteralPath $script:RetryLogPath -Raw |
+            Should -Not -Match "readonly-test-token|Authorization|Bearer"
+    }
+
+    It "stops after exactly twenty read-only logins and nineteen minute pauses" {
+        $code = Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2
+
+        $code | Should -Be 40
+        $script:RetrySleeps.Count | Should -Be 19
+        Should -Invoke Invoke-ResetRequest -Times 40 -Exactly
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "target_connected").Count | Should -Be 20
+        @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 20
+        @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 19
+        $failure = @($records | Where-Object event -eq "DISK_READ_ONLY")
+        $failure.Count | Should -Be 1
+        $failure[0].attempt | Should -Be 20
+        @($records | Where-Object event -eq "ready").Count | Should -Be 0
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
+    }
+
+    It "keeps the request ID during prepare retries but changes it for a new login" {
+        $script:RecoverOnAttempt = 2
+        $script:FailFirstPrepare = $true
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+
+        $prepareRequests = @($script:RetryRequests | Where-Object Method -eq "POST")
+        $prepareRequests.Count | Should -Be 3
+        $prepareRequests[0].RequestId | Should -Be $prepareRequests[1].RequestId
+        $prepareRequests[2].RequestId | Should -Not -Be $prepareRequests[0].RequestId
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+    }
+
+    It "does not retry when a later NAA is wrong even if the first disk is read-only" {
+        $state = Read-SimulationState
+        ($state.disks | Where-Object unique_id -eq "0xccc").unique_id = "wrong-naa"
+        Save-SimulationState $state
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
+
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
+    }
+
+    It "does not retry when removal of its read-only session cannot be verified" {
+        Mock Disconnect-ResetTarget { throw "session remained connected" }
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
+
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "target_disconnect_failed").Count | Should -Be 1
+        @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 0
+        @($records | Where-Object event -eq "ready").Count | Should -Be 0
     }
 }
 

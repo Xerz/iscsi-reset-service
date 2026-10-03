@@ -1365,14 +1365,18 @@ function Get-ResetDiskMappings {
         if ($matches.Count -ne 1) {
             throw "Expected exactly one session disk for ID $expectedId"
         }
-        if ($matches[0].IsReadOnly) {
-            throw "Expected disk is unexpectedly read-only: $expectedId"
-        }
         $mappings += [pscustomobject]@{
             Expected = $expected
             ExpectedId = $expectedId
             DesiredLetter = $desiredLetter
             Disk = $matches[0]
+        }
+    }
+    # Read-only is retryable only after the entire session disk set matches by NAA.
+    foreach ($mapping in $mappings) {
+        if ($mapping.Disk.IsReadOnly) {
+            throw (New-ApiException -StatusCode 0 -Code "DISK_READ_ONLY" `
+                -Message "Expected disk is unexpectedly read-only: $($mapping.ExpectedId)")
         }
     }
     return $mappings
@@ -1604,7 +1608,6 @@ function Mount-SimulationVolumes {
         })
         if ($matches.Count -ne 1) { throw "Expected exactly one disk for ID $expectedId" }
         $disk = $matches[0]
-        if ($disk.is_read_only) { throw "Expected disk is read-only: $expectedId" }
         if ([string]$disk.label -ne [string]$expected.label) {
             throw "Volume label mismatch for $($expected.name)"
         }
@@ -1624,6 +1627,12 @@ function Mount-SimulationVolumes {
         }
     }
 
+    foreach ($assignment in $assignments) {
+        if ($assignment.Disk.is_read_only) {
+            throw (New-ApiException -StatusCode 0 -Code "DISK_READ_ONLY" `
+                -Message "Expected disk is read-only: $($assignment.ExpectedId)")
+        }
+    }
     foreach ($assignment in $assignments) {
         Write-ResetProgress -RequestId $RequestId -Event "disk_verified" `
             -Message "Simulation client disk verified" -Details @{
@@ -4821,205 +4830,228 @@ function Invoke-ResetMain {
         -Path $MajesticSettingsConfigPath
     $Gta5RpSettingsConfigPath = Resolve-Gta5RpSyncConfigPath `
         -Path $Gta5RpSettingsConfigPath
-    $requestId = [Guid]::NewGuid().ToString("D")
-    $connectedTarget = ""
-    $stage = "startup"
-    try {
-        Write-ResetProgress -RequestId $requestId -Event "start" `
-            -Message "Client reset task started"
-        if (-not (Test-Path -LiteralPath $ClientTokenPath)) { throw "Token file not found" }
-        $token = (Get-Content -LiteralPath $ClientTokenPath -Raw).Trim()
-        if ([string]::IsNullOrWhiteSpace($token)) { throw "Token file is empty" }
-        if ($BaseUrl.StartsWith("http://") -and
-            ([string]::IsNullOrWhiteSpace($script:SimulationStatePath) -or -not $script:AllowHttpForSimulation)) {
-            throw "Plain HTTP is permitted only in explicit simulation mode"
-        }
-        if ([string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
-            Set-Service -Name MSiSCSI -StartupType Automatic
-            Start-Service -Name MSiSCSI
-        }
-        $egsSyncMode = Get-EgsManifestSyncMode -Path $SyncConfigPath
-        $health = Wait-ResetApi -BaseUrl $BaseUrl -RequestId $requestId `
-            -TimeoutSeconds $TimeoutSeconds
-        Write-ResetProgress -RequestId $requestId -Event "api_ready" `
-            -Message "Reset API is reachable"
-        $stage = "client_configuration"
-        $client = Invoke-ResetRequest -Method GET -Uri "$BaseUrl/v1/client" -Token $token -RequestId $requestId
-        Write-ResetProgress -RequestId $requestId -Event "client_configuration_loaded" `
-            -Message "Client target configuration loaded" -Details @{
-                target_iqn = [string]$client.target_iqn
-            }
-        if (@(Get-ResetSessions -TargetIqn ([string]$client.target_iqn)).Count -gt 0) {
-            throw (New-ApiException -StatusCode 409 -Code "LOCAL_SESSION_ACTIVE" -Message "Target is already connected locally")
-        }
-        $stage = "prepare"
-        $prepared = Invoke-PrepareWithRetry -BaseUrl $BaseUrl -Token $token -RequestId $requestId -TimeoutSeconds $TimeoutSeconds
-        Write-ResetProgress -RequestId $requestId -Event "prepared" `
-            -Message "Server prepared the complete client volume set" -Details @{
-                target_iqn = [string]$prepared.target_iqn
-                volume_count = @($prepared.volumes).Count
-            }
-        $stage = "connect"
-        Ensure-ResetPortal -Portal $prepared.portal
-        Wait-ResetTargetDiscovery -TargetIqn ([string]$prepared.target_iqn) `
-            -Portal $prepared.portal -RequestId $requestId | Out-Null
-        $session = Connect-ResetTarget -TargetIqn ([string]$prepared.target_iqn) -Portal $prepared.portal
-        $connectedTarget = [string]$prepared.target_iqn
-        Write-ResetProgress -RequestId $requestId -Event "target_connected" `
-            -Message "Created a non-persistent iSCSI session" -Details @{
-                target_iqn = $connectedTarget
-            }
-        $stage = "disk_validation"
-        $disks = @(Wait-ResetSessionDisks -Session $session -ExpectedCount @($prepared.volumes).Count)
-        Mount-ResetVolumes -ExpectedVolumes @($prepared.volumes) -Disks $disks `
-            -RequestId $requestId
+    $maxAttempts = 20
+    $retryDelaySeconds = 60
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $requestId = [Guid]::NewGuid().ToString("D")
+        $connectedTarget = ""
+        $stage = "startup"
         try {
-            $majesticConfig = Get-MajesticSyncConfig -Path $MajesticSettingsConfigPath
-            if ($majesticConfig.Enabled) {
-                $majesticResult = Invoke-ClientMajesticSettingsSync `
-                    -Config $majesticConfig -ExpectedVolumes @($prepared.volumes) `
-                    -ConfigRevision ([string]$health.config_revision)
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "majestic_settings_sync_ready" `
-                    -Message "Majestic Launcher settings match the mounted release" `
-                    -Details @{
-                        prefs_bytes = [Int64]$majesticResult.PrefsLength
-                        verification_hash_map_bytes = [Int64]$majesticResult.HashMapLength
-                        general_hash_map_bytes = [Int64]$majesticResult.HashMapGeneralLength
-                        backup_file_count = [int]$majesticResult.BackupFileCount
-                        backup_total_bytes = [Int64]$majesticResult.BackupTotalBytes
-                        file_count = [int]$majesticResult.FileCount
-                        registry_value_count = [int]$majesticResult.RegistryValueCount
-                    }
+            Write-ResetProgress -RequestId $requestId -Event "start" `
+                -Message "Client reset attempt $attempt of $maxAttempts started" `
+                -Details @{ attempt = $attempt; max_attempts = $maxAttempts }
+            if (-not (Test-Path -LiteralPath $ClientTokenPath)) { throw "Token file not found" }
+            $token = (Get-Content -LiteralPath $ClientTokenPath -Raw).Trim()
+            if ([string]::IsNullOrWhiteSpace($token)) { throw "Token file is empty" }
+            if ($BaseUrl.StartsWith("http://") -and
+                ([string]::IsNullOrWhiteSpace($script:SimulationStatePath) -or -not $script:AllowHttpForSimulation)) {
+                throw "Plain HTTP is permitted only in explicit simulation mode"
             }
-        } catch {
-            Write-ResetLog -Level "WARN" -Event "majestic_settings_sync_warning" `
-                -RequestId $requestId `
-                -Message "Majestic Launcher settings were not applied" `
-                -Details @{ stage = "majestic_settings_sync" }
-        }
-        try {
-            $gta5RpConfig = Get-Gta5RpSyncConfig -Path $Gta5RpSettingsConfigPath
-            if ($gta5RpConfig.Enabled) {
-                $gta5RpResult = Invoke-ClientGta5RpSettingsSync `
-                    -Config $gta5RpConfig -ExpectedVolumes @($prepared.volumes) `
-                    -ConfigRevision ([string]$health.config_revision)
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "gta5rp_settings_sync_ready" `
-                    -Message "GTA5RP Launcher settings match the mounted release" `
-                    -Details @{
-                        registry_tree_count = [int]$gta5RpResult.TreeCount
-                        registry_key_count = [int]$gta5RpResult.KeyCount
-                        registry_value_count = [int]$gta5RpResult.ValueCount
-                        registry_data_bytes = [int64]$gta5RpResult.TotalDataBytes
-                    }
+            if ([string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
+                Set-Service -Name MSiSCSI -StartupType Automatic
+                Start-Service -Name MSiSCSI
             }
-        } catch {
-            Write-ResetLog -Level "WARN" -Event "gta5rp_settings_sync_warning" `
-                -RequestId $requestId `
-                -Message "GTA5RP Launcher settings were not applied" `
-                -Details @{ stage = "gta5rp_settings_sync" }
-        }
-        if ($egsSyncMode -ne "Disabled") {
-            $stage = "egs_manifest_sync"
+            $egsSyncMode = Get-EgsManifestSyncMode -Path $SyncConfigPath
+            $health = Wait-ResetApi -BaseUrl $BaseUrl -RequestId $requestId `
+                -TimeoutSeconds $TimeoutSeconds
+            Write-ResetProgress -RequestId $requestId -Event "api_ready" `
+                -Message "Reset API is reachable"
+            $stage = "client_configuration"
+            $client = Invoke-ResetRequest -Method GET -Uri "$BaseUrl/v1/client" -Token $token -RequestId $requestId
+            Write-ResetProgress -RequestId $requestId -Event "client_configuration_loaded" `
+                -Message "Client target configuration loaded" -Details @{
+                    target_iqn = [string]$client.target_iqn
+                }
+            if (@(Get-ResetSessions -TargetIqn ([string]$client.target_iqn)).Count -gt 0) {
+                throw (New-ApiException -StatusCode 409 -Code "LOCAL_SESSION_ACTIVE" -Message "Target is already connected locally")
+            }
+            $stage = "prepare"
+            $prepared = Invoke-PrepareWithRetry -BaseUrl $BaseUrl -Token $token -RequestId $requestId -TimeoutSeconds $TimeoutSeconds
+            Write-ResetProgress -RequestId $requestId -Event "prepared" `
+                -Message "Server prepared the complete client volume set" -Details @{
+                    target_iqn = [string]$prepared.target_iqn
+                    volume_count = @($prepared.volumes).Count
+                }
+            $stage = "connect"
+            Ensure-ResetPortal -Portal $prepared.portal
+            Wait-ResetTargetDiscovery -TargetIqn ([string]$prepared.target_iqn) `
+                -Portal $prepared.portal -RequestId $requestId | Out-Null
+            $session = Connect-ResetTarget -TargetIqn ([string]$prepared.target_iqn) -Portal $prepared.portal
+            $connectedTarget = [string]$prepared.target_iqn
+            Write-ResetProgress -RequestId $requestId -Event "target_connected" `
+                -Message "Created a non-persistent iSCSI session" -Details @{
+                    target_iqn = $connectedTarget
+                }
+            $stage = "disk_validation"
+            $disks = @(Wait-ResetSessionDisks -Session $session -ExpectedCount @($prepared.volumes).Count)
+            Mount-ResetVolumes -ExpectedVolumes @($prepared.volumes) -Disks $disks `
+                -RequestId $requestId
             try {
-                if ($egsSyncMode -eq "Aggressive") {
-                    $syncResult = Invoke-ClientEgsAggressiveSync `
-                        -ExpectedVolumes @($prepared.volumes) `
-                        -ConfigRevision ([string]$health.config_revision) `
-                        -SyncConfigPath $SyncConfigPath
+                $majesticConfig = Get-MajesticSyncConfig -Path $MajesticSettingsConfigPath
+                if ($majesticConfig.Enabled) {
+                    $majesticResult = Invoke-ClientMajesticSettingsSync `
+                        -Config $majesticConfig -ExpectedVolumes @($prepared.volumes) `
+                        -ConfigRevision ([string]$health.config_revision)
                     Write-ResetProgress -RequestId $requestId `
-                        -Event "egs_eos_install_db_sync_ready" `
-                        -Message "Epic Games EOS shared installation database matches the mounted release" `
+                        -Event "majestic_settings_sync_ready" `
+                        -Message "Majestic Launcher settings match the mounted release" `
                         -Details @{
-                            file_count = [int]$syncResult.SharedInstallDbFileCount
-                            total_bytes = [Int64]$syncResult.SharedInstallDbTotalBytes
+                            prefs_bytes = [Int64]$majesticResult.PrefsLength
+                            verification_hash_map_bytes = [Int64]$majesticResult.HashMapLength
+                            general_hash_map_bytes = [Int64]$majesticResult.HashMapGeneralLength
+                            backup_file_count = [int]$majesticResult.BackupFileCount
+                            backup_total_bytes = [Int64]$majesticResult.BackupTotalBytes
+                            file_count = [int]$majesticResult.FileCount
+                            registry_value_count = [int]$majesticResult.RegistryValueCount
                         }
+                }
+            } catch {
+                Write-ResetLog -Level "WARN" -Event "majestic_settings_sync_warning" `
+                    -RequestId $requestId `
+                    -Message "Majestic Launcher settings were not applied" `
+                    -Details @{ stage = "majestic_settings_sync" }
+            }
+            try {
+                $gta5RpConfig = Get-Gta5RpSyncConfig -Path $Gta5RpSettingsConfigPath
+                if ($gta5RpConfig.Enabled) {
+                    $gta5RpResult = Invoke-ClientGta5RpSettingsSync `
+                        -Config $gta5RpConfig -ExpectedVolumes @($prepared.volumes) `
+                        -ConfigRevision ([string]$health.config_revision)
                     Write-ResetProgress -RequestId $requestId `
-                        -Event "egs_programdata_sync_ready" `
-                        -Message "Epic Games shared ProgramData matches the mounted release" `
+                        -Event "gta5rp_settings_sync_ready" `
+                        -Message "GTA5RP Launcher settings match the mounted release" `
                         -Details @{
-                            file_count = [int]$syncResult.FileCount
-                            game_count = [int]$syncResult.ManifestCount
-                            total_bytes = [Int64]$syncResult.TotalBytes
+                            registry_tree_count = [int]$gta5RpResult.TreeCount
+                            registry_key_count = [int]$gta5RpResult.KeyCount
+                            registry_value_count = [int]$gta5RpResult.ValueCount
+                            registry_data_bytes = [int64]$gta5RpResult.TotalDataBytes
+                        }
+                }
+            } catch {
+                Write-ResetLog -Level "WARN" -Event "gta5rp_settings_sync_warning" `
+                    -RequestId $requestId `
+                    -Message "GTA5RP Launcher settings were not applied" `
+                    -Details @{ stage = "gta5rp_settings_sync" }
+            }
+            if ($egsSyncMode -ne "Disabled") {
+                $stage = "egs_manifest_sync"
+                try {
+                    if ($egsSyncMode -eq "Aggressive") {
+                        $syncResult = Invoke-ClientEgsAggressiveSync `
+                            -ExpectedVolumes @($prepared.volumes) `
+                            -ConfigRevision ([string]$health.config_revision) `
+                            -SyncConfigPath $SyncConfigPath
+                        Write-ResetProgress -RequestId $requestId `
+                            -Event "egs_eos_install_db_sync_ready" `
+                            -Message "Epic Games EOS shared installation database matches the mounted release" `
+                            -Details @{
+                                file_count = [int]$syncResult.SharedInstallDbFileCount
+                                total_bytes = [Int64]$syncResult.SharedInstallDbTotalBytes
+                            }
+                        Write-ResetProgress -RequestId $requestId `
+                            -Event "egs_programdata_sync_ready" `
+                            -Message "Epic Games shared ProgramData matches the mounted release" `
+                            -Details @{
+                                file_count = [int]$syncResult.FileCount
+                                game_count = [int]$syncResult.ManifestCount
+                                total_bytes = [Int64]$syncResult.TotalBytes
+                            }
+                    } else {
+                        $syncResult = Invoke-ClientEgsManifestSync `
+                            -ExpectedVolumes @($prepared.volumes) `
+                            -ConfigRevision ([string]$health.config_revision) `
+                            -SyncConfigPath $SyncConfigPath
+                    }
+                    if ($egsSyncMode -eq "Enabled" -and
+                        ($syncResult.AdoptedAppCount -gt 0 -or
+                        $syncResult.DisplacedManifestCount -gt 0 -or
+                        $syncResult.LauncherEntryRemovalCount -gt 0)) {
+                        Write-ResetProgress -RequestId $requestId `
+                            -Event "egs_registration_takeover" `
+                            -Message "Epic Games registrations were switched to the mounted release" `
+                            -Details @{
+                                adopted_app_count = [int]$syncResult.AdoptedAppCount
+                                displaced_manifest_count = [int]$syncResult.DisplacedManifestCount
+                                launcher_entry_removal_count = [int]$syncResult.LauncherEntryRemovalCount
+                            }
+                    }
+                    if ($egsSyncMode -eq "Enabled") {
+                        Write-ResetProgress -RequestId $requestId `
+                            -Event "egs_launcher_registration_sync" `
+                            -Message "Epic Games launcher registrations match the mounted release" `
+                            -Details @{
+                                imported_registration_count = [int]$syncResult.LauncherEntryImportCount
+                                item_only_fallback_count = [int]$syncResult.LauncherFallbackAppCount
+                                incomplete_warning_count = [int]$syncResult.IncompleteWarningCount
+                            }
+                    }
+                    Write-ResetProgress -RequestId $requestId -Event "egs_manifest_sync_ready" `
+                        -Message "Epic Games manifests match the mounted release" -Details @{
+                            manifest_count = [int]$syncResult.ManifestCount
+                        }
+                } catch {
+                    Write-ResetLog -Level "WARN" -Event "egs_manifest_sync_warning" `
+                        -RequestId $requestId `
+                        -Message "Epic Games state was not synchronized" `
+                        -Details @{ stage = "egs_manifest_sync" }
+                }
+            }
+            Write-ResetLog -Level "INFO" -Event "ready" -RequestId $requestId `
+                -Message "Target connected and verified" -Details @{
+                    target_iqn = $connectedTarget
+                    volume_count = @($prepared.volumes).Count
+                }
+            return 0
+        } catch {
+            $failure = $_
+            $disconnectVerified = $false
+            if (-not [string]::IsNullOrWhiteSpace($connectedTarget)) {
+                try {
+                    Disconnect-ResetTarget -TargetIqn $connectedTarget
+                    $disconnectVerified = $true
+                } catch { }
+                if ($disconnectVerified) {
+                    Write-ResetProgress -RequestId $requestId `
+                        -Event "target_disconnected_after_error" `
+                        -Message "Disconnected the session created by this run" -Details @{
+                            target_iqn = $connectedTarget
+                            stage = $stage
                         }
                 } else {
-                    $syncResult = Invoke-ClientEgsManifestSync `
-                        -ExpectedVolumes @($prepared.volumes) `
-                        -ConfigRevision ([string]$health.config_revision) `
-                        -SyncConfigPath $SyncConfigPath
+                    Write-ResetLog -Level "ERROR" -Event "target_disconnect_failed" `
+                        -RequestId $requestId `
+                        -Message "Could not verify removal of the session created by this run" `
+                        -Details @{ target_iqn = $connectedTarget; stage = $stage }
                 }
-                if ($egsSyncMode -eq "Enabled" -and
-                    ($syncResult.AdoptedAppCount -gt 0 -or
-                    $syncResult.DisplacedManifestCount -gt 0 -or
-                    $syncResult.LauncherEntryRemovalCount -gt 0)) {
-                    Write-ResetProgress -RequestId $requestId `
-                        -Event "egs_registration_takeover" `
-                        -Message "Epic Games registrations were switched to the mounted release" `
-                        -Details @{
-                            adopted_app_count = [int]$syncResult.AdoptedAppCount
-                            displaced_manifest_count = [int]$syncResult.DisplacedManifestCount
-                            launcher_entry_removal_count = [int]$syncResult.LauncherEntryRemovalCount
-                        }
-                }
-                if ($egsSyncMode -eq "Enabled") {
-                    Write-ResetProgress -RequestId $requestId `
-                        -Event "egs_launcher_registration_sync" `
-                        -Message "Epic Games launcher registrations match the mounted release" `
-                        -Details @{
-                            imported_registration_count = [int]$syncResult.LauncherEntryImportCount
-                            item_only_fallback_count = [int]$syncResult.LauncherFallbackAppCount
-                            incomplete_warning_count = [int]$syncResult.IncompleteWarningCount
-                        }
-                }
-                Write-ResetProgress -RequestId $requestId -Event "egs_manifest_sync_ready" `
-                    -Message "Epic Games manifests match the mounted release" -Details @{
-                        manifest_count = [int]$syncResult.ManifestCount
-                    }
-            } catch {
-                Write-ResetLog -Level "WARN" -Event "egs_manifest_sync_warning" `
-                    -RequestId $requestId `
-                    -Message "Epic Games state was not synchronized" `
-                    -Details @{ stage = "egs_manifest_sync" }
             }
-        }
-        Write-ResetLog -Level "INFO" -Event "ready" -RequestId $requestId `
-            -Message "Target connected and verified" -Details @{
-                target_iqn = $connectedTarget
-                volume_count = @($prepared.volumes).Count
+            $code = "CLIENT_ERROR"
+            if ($failure.Exception.Data.Contains("Code")) {
+                $code = [string]$failure.Exception.Data["Code"]
             }
-        return 0
-    } catch {
-        $failure = $_
-        if (-not [string]::IsNullOrWhiteSpace($connectedTarget)) {
-            $disconnectVerified = $false
-            try {
-                Disconnect-ResetTarget -TargetIqn $connectedTarget
-                $disconnectVerified = $true
-            } catch { }
-            if ($disconnectVerified) {
-                Write-ResetProgress -RequestId $requestId `
-                    -Event "target_disconnected_after_error" `
-                    -Message "Disconnected the session created by this run" -Details @{
-                        target_iqn = $connectedTarget
+            if ($stage -eq "disk_validation" -and $code -eq "DISK_READ_ONLY" -and
+                $disconnectVerified -and $attempt -lt $maxAttempts) {
+                Write-ResetLog -Level "WARN" -Event "read_only_retry" -RequestId $requestId `
+                    -Message "Read-only disk on attempt $attempt of $maxAttempts; retrying the full reset in $retryDelaySeconds seconds" `
+                    -Details @{
                         stage = $stage
+                        reason = $code
+                        attempt = $attempt
+                        max_attempts = $maxAttempts
+                        delay_seconds = $retryDelaySeconds
                     }
-            } else {
-                Write-ResetLog -Level "ERROR" -Event "target_disconnect_failed" `
-                    -RequestId $requestId `
-                    -Message "Could not verify removal of the session created by this run" `
-                    -Details @{ target_iqn = $connectedTarget; stage = $stage }
+                Start-Sleep -Seconds $retryDelaySeconds
+                continue
             }
+            Write-ResetLog -Level "ERROR" -Event $code -RequestId $requestId `
+                -Message "$stage`: $($failure.Exception.Message)" -Details @{
+                    stage = $stage
+                    attempt = $attempt
+                    max_attempts = $maxAttempts
+                }
+            if ($stage -in @("disk_validation", "connect", "egs_manifest_sync")) { return 40 }
+            if ($stage -eq "prepare" -or $stage -eq "client_configuration") { return 20 }
+            return 10
         }
-        $code = "CLIENT_ERROR"
-        if ($failure.Exception.Data.Contains("Code")) {
-            $code = [string]$failure.Exception.Data["Code"]
-        }
-        Write-ResetLog -Level "ERROR" -Event $code -RequestId $requestId `
-            -Message "$stage`: $($failure.Exception.Message)" -Details @{ stage = $stage }
-        if ($stage -in @("disk_validation", "connect", "egs_manifest_sync")) { return 40 }
-        if ($stage -eq "prepare" -or $stage -eq "client_configuration") { return 20 }
-        return 10
     }
 }
 
