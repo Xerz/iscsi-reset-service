@@ -132,6 +132,16 @@ if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter
 }
 
 # A wrong NAA must fail after connection and remove the newly created session.
+# Do not spend nineteen real minutes on the permanent validation-error scenario.
+function Start-Sleep {
+    param([int]$Seconds, [int]$Milliseconds)
+    if ($Seconds -eq 60) { return }
+    if ($PSBoundParameters.ContainsKey("Seconds")) {
+        Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds
+    } else {
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+    }
+}
 $state.sessions = @()
 ($state.disks | Where-Object unique_id -eq "0x6589cfc000000001").unique_id = "wrong-naa"
 $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath
@@ -146,6 +156,10 @@ $code = & "/suite/powershell/Reset-And-Connect.ps1" `
 if ([int]$code -ne 40) { throw "Wrong NAA returned exit code $code instead of 40" }
 $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
 if (@($state.sessions).Count -ne 0) { throw "Failed disk validation left a session connected" }
+$failureRecords = @(Get-Content -LiteralPath (Join-Path $root "client.log.jsonl") | ConvertFrom-Json)
+if (@($failureRecords | Where-Object event -eq "attempt_retry").Count -ne 19) {
+    throw "Permanent NAA mismatch did not retry nineteen times"
+}
 if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter -ne "C") {
     throw "Wrong-NAA scenario modified the local disk"
 }

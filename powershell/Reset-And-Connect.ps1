@@ -1063,8 +1063,10 @@ function Invoke-ResetRequest {
         $statusCode = 0
         $code = "NETWORK_ERROR"
         $message = $_.Exception.Message
-        if ($null -ne $_.Exception.Response) {
+        $responseProperty = $_.Exception.PSObject.Properties["Response"]
+        if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
             try { $statusCode = [int]$_.Exception.Response.StatusCode } catch { $statusCode = 0 }
+            if ($statusCode -ne 0) { $code = "HTTP_ERROR" }
             try {
                 $stream = $_.Exception.Response.GetResponseStream()
                 $reader = New-Object System.IO.StreamReader($stream)
@@ -1232,8 +1234,15 @@ function Wait-ResetTargetDiscovery {
 function Connect-ResetTarget {
     param(
         [Parameter(Mandatory = $true)][string]$TargetIqn,
-        [Parameter(Mandatory = $true)]$Portal
+        [Parameter(Mandatory = $true)]$Portal,
+        [ref]$ConnectionTarget
     )
+    if (@(Get-ResetSessions -TargetIqn $TargetIqn).Count -gt 0) {
+        throw (New-ApiException -StatusCode 409 -Code "LOCAL_SESSION_ACTIVE" `
+            -Message "Target is already connected locally")
+    }
+    # Record the login attempt before mutation: the cmdlet may create a session then throw.
+    if ($null -ne $ConnectionTarget) { $ConnectionTarget.Value = $TargetIqn }
     if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
         $state = Read-SimulationState
         $sessions = @($state.sessions)
@@ -4876,7 +4885,8 @@ function Invoke-ResetMain {
             Ensure-ResetPortal -Portal $prepared.portal
             Wait-ResetTargetDiscovery -TargetIqn ([string]$prepared.target_iqn) `
                 -Portal $prepared.portal -RequestId $requestId | Out-Null
-            $session = Connect-ResetTarget -TargetIqn ([string]$prepared.target_iqn) -Portal $prepared.portal
+            $session = Connect-ResetTarget -TargetIqn ([string]$prepared.target_iqn) `
+                -Portal $prepared.portal -ConnectionTarget ([ref]$connectedTarget)
             $connectedTarget = [string]$prepared.target_iqn
             Write-ResetProgress -RequestId $requestId -Event "target_connected" `
                 -Message "Created a non-persistent iSCSI session" -Details @{
@@ -5028,13 +5038,19 @@ function Invoke-ResetMain {
             if ($failure.Exception.Data.Contains("Code")) {
                 $code = [string]$failure.Exception.Data["Code"]
             }
-            if ($stage -eq "disk_validation" -and $code -eq "DISK_READ_ONLY" -and
-                $disconnectVerified -and $attempt -lt $maxAttempts) {
-                Write-ResetLog -Level "WARN" -Event "read_only_retry" -RequestId $requestId `
-                    -Message "Read-only disk on attempt $attempt of $maxAttempts; retrying the full reset in $retryDelaySeconds seconds" `
+            $statusCode = 0
+            if ($failure.Exception.Data.Contains("StatusCode")) {
+                $statusCode = [int]$failure.Exception.Data["StatusCode"]
+            }
+            $cleanupSafe = [string]::IsNullOrWhiteSpace($connectedTarget) -or $disconnectVerified
+            if ($cleanupSafe -and $attempt -lt $maxAttempts) {
+                $retryEvent = if ($code -eq "DISK_READ_ONLY") { "read_only_retry" } else { "attempt_retry" }
+                Write-ResetLog -Level "WARN" -Event $retryEvent -RequestId $requestId `
+                    -Message "Attempt $attempt of $maxAttempts failed during $stage ($code); retrying the full reset in $retryDelaySeconds seconds" `
                     -Details @{
                         stage = $stage
                         reason = $code
+                        status_code = $statusCode
                         attempt = $attempt
                         max_attempts = $maxAttempts
                         delay_seconds = $retryDelaySeconds
@@ -5045,6 +5061,7 @@ function Invoke-ResetMain {
             Write-ResetLog -Level "ERROR" -Event $code -RequestId $requestId `
                 -Message "$stage`: $($failure.Exception.Message)" -Details @{
                     stage = $stage
+                    status_code = $statusCode
                     attempt = $attempt
                     max_attempts = $maxAttempts
                 }

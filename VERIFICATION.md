@@ -1,5 +1,54 @@
 # Verification record
 
+## Общий retry клиентских ошибок — 2026-10-04
+
+### Реализация
+
+- Полный цикл теперь повторяется после любой ошибки startup/API/prepare/discovery/login/
+  disk validation, с прежними 20 попытками и 60-секундными паузами. Перед retry начатого login
+  требуется подтверждённый logout; cleanup failure завершает запуск сразу. Уже существующая
+  session сохраняется и блокирует prepare/login на последующих попытках.
+- Login helper повторно проверяет отсутствие session и перед Connect фиксирует target начатой
+  операции через внутренний reference-параметр. Это позволяет убрать созданную session, даже
+  если Connect создал её и затем сообщил ошибку. Публичные параметры `.ps1`, Reset API,
+  SQLite, YAML и настройки storage не менялись.
+- JSONL сохраняет `read_only_retry` для read-only, добавляет `attempt_retry` для остальных
+  ошибок и `status_code` для диагностики HTTP. При неразобранном теле HTTP-ответа используется
+  `HTTP_ERROR`, а отсутствие HTTP-ответа остаётся `NETWORK_ERROR`. Номер попытки и пауза
+  записываются без token. Коды `10/20/40` и launcher warning policy сохраняются.
+
+### Автоматические проверки
+
+- Parser и `Invoke-Pester /suite/powershell/tests -Output Detailed -CI` в локальном
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, PowerShell 7.5.0 / Ubuntu 24.04.1 LTS,
+  Linux/amd64, network disabled, project read-only, working directory `/tmp` — **202 passed,
+  0 failed, 2 skipped** из 204, 35.17 секунды, exit code `0`. Windows-only ACL и Transactional
+  Registry cases пропущены; это не Windows PowerShell 5.1.
+- Добавлены transport/HTTP 409 classification, network failure на config/prepare,
+  истёкший prepare timeout с 409, startup timeout recovery, partial login cleanup/retry и
+  сохранность session, появившейся перед login. Permanent validation/discovery/API failures
+  проверяют общий cap 20; read-only и трёхтомный набор продолжают проверяться.
+- `ruff check src tests` — успешно. `python -B -m pytest -q -p no:cacheprovider` на Python
+  3.12.4 — **133 passed** за 1.63 секунды.
+- `docker compose -p iscsi-readonly-hotfix config --quiet` — успешно.
+- `docker compose -p iscsi-readonly-hotfix up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`.
+  Permanent NAA mismatch выполняет 20 prepare/login/cleanup циклов и 19 общих retry
+  (его минутные паузы заменены test harness). Read-only recovery выполняет настоящую
+  60-секундную паузу и новый полный цикл. Завершено
+  `docker compose -p iscsi-readonly-hotfix down --volumes`.
+- CI предыдущего read-only hotfix commit `330d1fc` проверен через `gh run list` и
+  `gh run view 37155355484 --json jobs`: все Python, Compose interaction и Windows PowerShell
+  5.1 jobs завершились успешно. Этот результат относится к предыдущему commit и не заменяет
+  проверку нового общего retry.
+
+### Ожидает физического Windows/TrueNAS стенда
+
+- Реальные network/HTTP failures, partial login и logout через Windows Storage/iSCSI cmdlets,
+  NTFS, dual-role session checks и TrueNAS в этой сессии не проверялись. Unit/Compose остаются
+  mock-проверками. Новые сценарии добавлены в `TEST-PLAN.md`; физические пункты не отмечены
+  пройденными.
+
 ## Локальный read-only retry hotfix — 2026-10-04
 
 ### Реализация

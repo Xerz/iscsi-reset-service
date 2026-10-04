@@ -523,6 +523,37 @@ Describe "Client JSONL diagnostics" {
     }
 }
 
+Describe "Reset request error classification" {
+    BeforeEach {
+        $script:SimulationStatePath = ""
+    }
+
+    It "keeps plain transport failures typed without requiring a Response property" {
+        Mock Invoke-RestMethod { throw (New-Object System.Exception("connection failed")) }
+        $failure = $null
+        try {
+            Invoke-ResetRequest -Method GET -Uri "https://mock/v1/client" -RequestId "request"
+        } catch { $failure = $_ }
+
+        $failure.Exception.Data["Code"] | Should -Be "NETWORK_ERROR"
+        $failure.Exception.Data["StatusCode"] | Should -Be 0
+    }
+
+    It "classifies an HTTP 409 as HTTP even when its response body cannot be parsed" {
+        $script:HttpFailure = New-Object System.Exception("HTTP conflict")
+        $script:HttpFailure | Add-Member -MemberType NoteProperty -Name Response `
+            -Value ([pscustomobject]@{ StatusCode = 409 })
+        Mock Invoke-RestMethod { throw $script:HttpFailure }
+        $failure = $null
+        try {
+            Invoke-ResetRequest -Method POST -Uri "https://mock/v1/prepare" -RequestId "request"
+        } catch { $failure = $_ }
+
+        $failure.Exception.Data["Code"] | Should -Be "HTTP_ERROR"
+        $failure.Exception.Data["StatusCode"] | Should -Be 409
+    }
+}
+
 Describe "Prepare retry policy" {
     It "reuses the request ID and retries a transient 503" {
         $script:attempt = 0
@@ -1348,7 +1379,10 @@ Describe "Majestic Launcher client settings sync" {
     }
 }
 
-Describe "Read-only full reset retries" {
+Describe "Full reset retries" {
+    BeforeAll {
+        $script:RealRetryConnect = (Get-Command Connect-ResetTarget).ScriptBlock
+    }
     BeforeEach {
         $script:SimulationStatePath = Join-Path $TestDrive "readonly-state.json"
         $script:SimulationSourceIp = "10.20.40.101"
@@ -1390,6 +1424,10 @@ Describe "Read-only full reset retries" {
         $script:RetrySleeps = New-Object 'System.Collections.Generic.List[int]'
         $script:RecoverOnAttempt = 0
         $script:FailFirstPrepare = $false
+        $script:RetryFailurePath = ""
+        $script:RetryFailureCount = 0
+        $script:RetryFailureCode = "NETWORK_ERROR"
+        $script:RetryFailureStatus = 0
         Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "retry-revision" } }
         Mock Invoke-ResetRequest {
             $script:RetryRequests.Add([pscustomobject]@{
@@ -1401,6 +1439,11 @@ Describe "Read-only full reset retries" {
             if ($Method -eq "POST" -and $script:FailFirstPrepare) {
                 $script:FailFirstPrepare = $false
                 throw (New-ApiException -StatusCode 409 -Code "SESSION_ACTIVE" -Message "transient")
+            }
+            if ($script:RetryFailureCount -gt 0 -and $Uri.EndsWith($script:RetryFailurePath)) {
+                $script:RetryFailureCount--
+                throw (New-ApiException -StatusCode $script:RetryFailureStatus `
+                    -Code $script:RetryFailureCode -Message "injected request failure")
             }
             return [pscustomobject]@{
                 target_iqn = $script:RetryTarget
@@ -1527,7 +1570,7 @@ Describe "Read-only full reset retries" {
         Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
     }
 
-    It "does not retry when a later NAA is wrong even if the first disk is read-only" {
+    It "retries a wrong NAA without changing disks or classifying it as read-only" {
         $state = Read-SimulationState
         ($state.disks | Where-Object unique_id -eq "0xccc").unique_id = "wrong-naa"
         Save-SimulationState $state
@@ -1535,8 +1578,8 @@ Describe "Read-only full reset retries" {
         Invoke-ResetMain -BaseUrl "http://mock" `
             -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
 
-        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
-        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Invoke-ResetRequest -Times 40 -Exactly
+        Should -Invoke Start-Sleep -Times 19 -Exactly
         @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
     }
 
@@ -1554,6 +1597,96 @@ Describe "Read-only full reset retries" {
         @($records | Where-Object event -eq "target_disconnect_failed").Count | Should -Be 1
         @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 0
         @($records | Where-Object event -eq "ready").Count | Should -Be 0
+    }
+
+    It "restarts the full cycle after a <Code> at <Path>" -TestCases @(
+        @{ Code = "NETWORK_ERROR"; Status = 0; Path = "/v1/client"; Stage = "client_configuration" },
+        @{ Code = "NETWORK_ERROR"; Status = 0; Path = "/v1/prepare"; Stage = "prepare" },
+        @{ Code = "HTTP_ERROR"; Status = 409; Path = "/v1/prepare"; Stage = "prepare" }
+    ) {
+        param($Code, $Status, $Path, $Stage)
+        $script:RecoverOnAttempt = 2
+        $script:RetryFailurePath = $Path
+        $script:RetryFailureCount = 1
+        $script:RetryFailureCode = $Code
+        $script:RetryFailureStatus = $Status
+
+        Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:RetryTokenPath `
+            -TimeoutSeconds 0 | Should -Be 0
+
+        Should -Invoke Wait-ResetApi -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 1 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        $retry = @($records | Where-Object event -eq "attempt_retry")
+        $retry.Count | Should -Be 1
+        $retry[0].reason | Should -Be $Code
+        $retry[0].stage | Should -Be $Stage
+        $retry[0].status_code | Should -Be $Status
+        @($records | Where-Object event -eq "target_connected").Count | Should -Be 1
+        @($records | Where-Object event -eq "ready").Count | Should -Be 1
+        @($records | Where-Object event -eq "start").Count | Should -Be 2
+    }
+
+    It "retries an API startup timeout with a new health/config/prepare cycle" {
+        $script:RecoverOnAttempt = 2
+        $script:HealthAttempts = 0
+        Mock Wait-ResetApi {
+            $script:HealthAttempts++
+            if ($script:HealthAttempts -eq 1) {
+                throw (New-ApiException -StatusCode 0 -Code "API_TIMEOUT" -Message "unreachable")
+            }
+            return [pscustomobject]@{ config_revision = "retry-revision" }
+        }
+
+        Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:RetryTokenPath `
+            -TimeoutSeconds 0 | Should -Be 0
+
+        Should -Invoke Wait-ResetApi -Times 2 -Exactly
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+    }
+
+    It "cleans a partial login before retrying an error thrown after session creation" {
+        $script:RecoverOnAttempt = 2
+        $script:FailLoginOnce = $true
+        Mock Connect-ResetTarget {
+            $session = & $script:RealRetryConnect -TargetIqn $TargetIqn -Portal $Portal `
+                -ConnectionTarget $ConnectionTarget
+            if ($script:FailLoginOnce) {
+                $script:FailLoginOnce = $false
+                throw (New-ApiException -StatusCode 0 -Code "NETWORK_ERROR" -Message "partial login")
+            }
+            return $session
+        }
+
+        Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:RetryTokenPath `
+            -TimeoutSeconds 0 | Should -Be 0
+
+        Should -Invoke Connect-ResetTarget -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 1
+        @($records | Where-Object event -eq "attempt_retry").Count | Should -Be 1
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+    }
+
+    It "does not claim or disconnect a foreign session appearing before login" {
+        Mock Ensure-ResetPortal {
+            $state = Read-SimulationState
+            $state.sessions += [pscustomobject]@{ target_iqn = $script:RetryTarget; persistent = $true }
+            Save-SimulationState $state
+        }
+        Mock Start-Sleep { }
+        Mock Disconnect-ResetTarget { }
+
+        Invoke-ResetMain -BaseUrl "http://mock" -ClientTokenPath $script:RetryTokenPath `
+            -TimeoutSeconds 0 | Should -Be 20
+
+        Should -Invoke Disconnect-ResetTarget -Times 0 -Exactly
+        Should -Invoke Ensure-ResetPortal -Times 1 -Exactly
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+        (Get-ResetSessions -TargetIqn $script:RetryTarget).persistent | Should -BeTrue
     }
 }
 
@@ -1596,6 +1729,7 @@ Describe "Startup flow failure handling" {
             )
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $script:SimulationStatePath
         Mock Wait-ResetApi { }
+        Mock Start-Sleep { }
     }
 
     It "records every successful stage without logging the token" {
@@ -1662,7 +1796,7 @@ Describe "Startup flow failure handling" {
 
         $code | Should -Be 20
         @(Get-ResetSessions -TargetIqn "iqn.2026-08.lab.games:chimera").Count | Should -Be 1
-        Should -Invoke Invoke-ResetRequest -Times 1 -Exactly
+        Should -Invoke Invoke-ResetRequest -Times 20 -Exactly
     }
 
     It "returns an API failure without creating an iSCSI session" {
@@ -1709,7 +1843,7 @@ Describe "Startup flow failure handling" {
             -ClientTokenPath $script:tokenPath -TimeoutSeconds 2
 
         $code | Should -Be 40
-        Should -Invoke Wait-ResetTargetDiscovery -Times 1 -Exactly
+        Should -Invoke Wait-ResetTargetDiscovery -Times 20 -Exactly
         Should -Invoke Connect-ResetTarget -Times 0 -Exactly
         Should -Invoke Mount-ResetVolumes -Times 0 -Exactly
         @((Read-SimulationState).sessions).Count | Should -Be 0
