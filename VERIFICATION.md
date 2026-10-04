@@ -41,6 +41,12 @@
   `gh run view 37155355484 --json jobs`: все Python, Compose interaction и Windows PowerShell
   5.1 jobs завершились успешно. Этот результат относится к предыдущему commit и не заменяет
   проверку нового общего retry.
+- Общий retry отправлен в `main` commit `3e84340` без tag/release. GitHub Actions CI run
+  `37217751806` подтверждён для точного SHA `3e8434082c74f741c3e26de77339332b6554adc6`:
+  Python, Compose interaction и Windows PowerShell 5.1/Pester 5.7.1 jobs — **success**.
+  Проверено через `gh run watch 37217751806 --exit-status --interval 30` (exit code `0`)
+  и `gh run view 37217751806 --json headSha,conclusion,jobs`. Это подтверждает выполнение
+  Windows unit suite; реальные iSCSI/TrueNAS сценарии по-прежнему ожидают стенда.
 
 ### Ожидает физического Windows/TrueNAS стенда
 
