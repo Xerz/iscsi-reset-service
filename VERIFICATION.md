@@ -46,6 +46,14 @@
   passed**, exit code `0`: stage/activate, prepare failpoint/reconciliation, wrong NAA,
   полный read-only retry с реальной минутной паузой, восстановление writable после двух
   реальных секунд без logout/retry. Выполнен `down --volumes` для этого изолированного проекта.
+- Первый CI run `37834206390` для commit `0cc1ade` прошёл Python и полный Compose build/
+  interaction. Windows PowerShell 5.1/Pester 5.7.1 выполнил **207 passed, 7 failed, 0 skipped**:
+  новый test helper копировал массив через `ConvertFrom-Json`, который в 5.1 сохранял массив
+  одним элементом pipeline. Присваивание `IsReadOnly` обращалось к read-only свойству массива,
+  а не к mocked disk. Helper исправлен явным созданием независимых disk objects; runtime
+  не менялся. Проверено по jobs API, annotations и полному Windows job log; повтор CI требуется.
+- После исправления test helper повторены parser и весь Linux PowerShell/Pester suite в том
+  же окружении: **212 passed, 0 failed, 2 skipped** из 214 за 29.14 секунды, exit code `0`.
 
 ### Ожидает физического Windows/TrueNAS стенда
 

@@ -1404,7 +1404,13 @@ Describe "Writable disk observation after login" {
         Mock Get-ResetSessionDisks {
             $Session.TargetNodeAddress | Should -Be "own-target"
             $script:ObservationReads++
-            $fresh = @($script:InitialObservationDisks | ConvertTo-Json | ConvertFrom-Json)
+            $fresh = @($script:InitialObservationDisks | ForEach-Object {
+                [pscustomobject]@{
+                    UniqueId = $_.UniqueId
+                    IsReadOnly = $_.IsReadOnly
+                    IsOffline = $_.IsOffline
+                }
+            })
             $fresh[0].IsReadOnly = $script:ObservationReads -lt $script:WritableAfterRead
             switch ($script:ObservationFailure) {
                 "naa" { $fresh[2].UniqueId = "wrong-naa" }
