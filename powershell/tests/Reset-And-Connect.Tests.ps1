@@ -1379,6 +1379,124 @@ Describe "Majestic Launcher client settings sync" {
     }
 }
 
+Describe "Writable disk observation after login" {
+    BeforeEach {
+        $script:SimulationStatePath = ""
+        $script:ObservedSession = [pscustomobject]@{ TargetNodeAddress = "own-target" }
+        $script:ObservationVolumes = @(
+            [pscustomobject]@{ name = "primary"; disk_unique_id = "aaa"; drive_letter = "E" },
+            [pscustomobject]@{ name = "archive"; disk_unique_id = "bbb"; drive_letter = "F" },
+            [pscustomobject]@{ name = "extra-volume"; disk_unique_id = "ccc"; drive_letter = "G" }
+        )
+        $script:InitialObservationDisks = @(
+            [pscustomobject]@{ UniqueId = "0xaaa"; IsReadOnly = $true; IsOffline = $true },
+            [pscustomobject]@{ UniqueId = "0xbbb"; IsReadOnly = $false; IsOffline = $true },
+            [pscustomobject]@{ UniqueId = "0xccc"; IsReadOnly = $false; IsOffline = $true }
+        )
+        $script:ObservationReads = 0
+        $script:WritableAfterRead = 2
+        $script:ObservationFailure = ""
+        Mock Write-ResetLog { }
+        Mock Start-Sleep { }
+        Mock Set-Disk { }
+        Mock Set-Partition { }
+        Mock Remove-PartitionAccessPath { }
+        Mock Get-ResetSessionDisks {
+            $Session.TargetNodeAddress | Should -Be "own-target"
+            $script:ObservationReads++
+            $fresh = @($script:InitialObservationDisks | ConvertTo-Json | ConvertFrom-Json)
+            $fresh[0].IsReadOnly = $script:ObservationReads -lt $script:WritableAfterRead
+            switch ($script:ObservationFailure) {
+                "naa" { $fresh[2].UniqueId = "wrong-naa" }
+                "missing" { $fresh = @($fresh[0], $fresh[1]) }
+                "extra" { $fresh += [pscustomobject]@{ UniqueId = "foreign"; IsReadOnly = $false } }
+                "session" { throw "session disappeared during observation" }
+            }
+            return $fresh
+        }
+    }
+
+    It "returns immediately when the complete disk set is already writable" {
+        $script:InitialObservationDisks[0].IsReadOnly = $false
+        $result = @(Wait-ResetWritableSessionDisks -Session $script:ObservedSession `
+            -ExpectedVolumes $script:ObservationVolumes -Disks $script:InitialObservationDisks)
+
+        $result.Count | Should -Be 3
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Get-ResetSessionDisks -Times 0 -Exactly
+        Should -Invoke Write-ResetLog -Times 0 -Exactly
+    }
+
+    It "rereads fresh disks and accepts recovery on observation <Read> without mutations" -TestCases @(
+        @{ Read = 2 }, @{ Read = 10 }
+    ) {
+        param($Read)
+        $script:WritableAfterRead = $Read
+        $result = @(Wait-ResetWritableSessionDisks -Session $script:ObservedSession `
+            -ExpectedVolumes $script:ObservationVolumes -Disks $script:InitialObservationDisks `
+            -RequestId "observe-test")
+
+        $result.Count | Should -Be 3
+        $result[0].IsReadOnly | Should -BeFalse
+        $script:InitialObservationDisks[0].IsReadOnly | Should -BeTrue
+        Should -Invoke Start-Sleep -Times $Read -Exactly -ParameterFilter { $Seconds -eq 1 }
+        Should -Invoke Get-ResetSessionDisks -Times $Read -Exactly
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "disk_read_only_wait" -and $Details.disk_states.Count -eq 3
+        }
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "disk_writable_after_wait" -and $RequestId -eq "observe-test"
+        }
+        Should -Invoke Set-Disk -Times 0 -Exactly
+        Should -Invoke Set-Partition -Times 0 -Exactly
+        Should -Invoke Remove-PartitionAccessPath -Times 0 -Exactly
+    }
+
+    It "preserves the typed error when read-only persists through the bounded window" {
+        $script:WritableAfterRead = 100
+        try {
+            Wait-ResetWritableSessionDisks -Session $script:ObservedSession `
+                -ExpectedVolumes $script:ObservationVolumes -Disks $script:InitialObservationDisks `
+                -TimeoutSeconds 2 -RequestId "observe-test"
+            throw "Expected read-only timeout"
+        } catch {
+            $_.Exception.Data["Code"] | Should -Be "DISK_READ_ONLY"
+        }
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+        Should -Invoke Get-ResetSessionDisks -Times 2 -Exactly
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "disk_read_only_timeout" -and $Details.disk_states.Count -eq 3
+        }
+        Should -Invoke Set-Disk -Times 0 -Exactly
+    }
+
+    It "does not wait for an initially wrong NAA even when another disk is read-only" {
+        $script:InitialObservationDisks[2].UniqueId = "wrong-naa"
+        { Wait-ResetWritableSessionDisks -Session $script:ObservedSession `
+            -ExpectedVolumes $script:ObservationVolumes -Disks $script:InitialObservationDisks } |
+            Should -Throw "*exactly one session disk*"
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Write-ResetLog -Times 0 -Exactly
+    }
+
+    It "stops observation on <Failure> during a fresh read" -TestCases @(
+        @{ Failure = "naa"; Message = "*exactly one session disk*" },
+        @{ Failure = "missing"; Message = "*Session exposed 2 disks*" },
+        @{ Failure = "extra"; Message = "*Session exposed 4 disks*" },
+        @{ Failure = "session"; Message = "*session disappeared*" }
+    ) {
+        param($Failure, $Message)
+        $script:ObservationFailure = $Failure
+        { Wait-ResetWritableSessionDisks -Session $script:ObservedSession `
+            -ExpectedVolumes $script:ObservationVolumes -Disks $script:InitialObservationDisks } |
+            Should -Throw $Message
+        Should -Invoke Get-ResetSessionDisks -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly
+        Should -Invoke Set-Disk -Times 0 -Exactly
+        Should -Invoke Set-Partition -Times 0 -Exactly
+    }
+}
+
 Describe "Full reset retries" {
     BeforeAll {
         $script:RealRetryConnect = (Get-Command Connect-ResetTarget).ScriptBlock
@@ -1481,6 +1599,45 @@ Describe "Full reset retries" {
         }
     }
 
+    It "mounts three volumes in the first attempt when read-only clears during observation" {
+        $script:WritablePolls = 0
+        Mock Start-Sleep {
+            $Seconds | Should -Be 1
+            $script:WritablePolls++
+            @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+            $state = Read-SimulationState
+            foreach ($disk in @($state.disks | Where-Object target_iqn -eq $script:RetryTarget)) {
+                $disk.is_offline | Should -BeTrue
+                $disk.drive_letter | Should -BeNullOrEmpty
+            }
+            if ($script:WritablePolls -eq 2) {
+                ($state.disks | Where-Object unique_id -eq "0xaaa").is_read_only = $false
+                Save-SimulationState $state
+            }
+        }
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 2 -Exactly
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 1 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "start").Count | Should -Be 1
+        @($records | Where-Object event -eq "disk_writable_after_wait").Count | Should -Be 1
+        @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 0
+        @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 0
+        @($records | Where-Object event -eq "ready").Count | Should -Be 1
+        $state = Read-SimulationState
+        foreach ($volume in $script:RetryVolumes) {
+            $disk = $state.disks | Where-Object unique_id -eq ("0x" + $volume.disk_unique_id)
+            $disk.drive_letter | Should -Be $volume.drive_letter
+            $disk.is_offline | Should -BeFalse
+        }
+        ($state.sessions | Where-Object target_iqn -eq "other-target").persistent | Should -BeTrue
+        ($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter | Should -Be "C"
+    }
+
     It "repeats the entire three-volume flow and succeeds on attempt <Recovery>" -TestCases @(
         @{ Recovery = 2 }, @{ Recovery = 20 }
     ) {
@@ -1548,6 +1705,8 @@ Describe "Full reset retries" {
         @($records | Where-Object event -eq "target_connected").Count | Should -Be 20
         @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 20
         @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 19
+        @($records | Where-Object event -eq "disk_read_only_timeout").Count | Should -Be 20
+        Should -Invoke Start-Sleep -Times 200 -Exactly -ParameterFilter { $Seconds -eq 1 }
         $failure = @($records | Where-Object event -eq "DISK_READ_ONLY")
         $failure.Count | Should -Be 1
         $failure[0].attempt | Should -Be 20
@@ -1590,7 +1749,8 @@ Describe "Full reset retries" {
             -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
 
         Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
-        Should -Invoke Start-Sleep -Times 0 -Exactly
+        Should -Invoke Start-Sleep -Times 10 -Exactly -ParameterFilter { $Seconds -eq 1 }
+        Should -Invoke Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
         Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
         @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
         $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)

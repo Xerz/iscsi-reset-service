@@ -1,5 +1,60 @@
 # Verification record
 
+## Ожидание writable после login — 2026-10-09
+
+### Реализация и границы вывода
+
+- Пользователь сообщил `NewDiskPolicy=OnlineAll` на проблемном Windows и writable-диски после
+  ручного подключения/перевода online. Это наблюдение пользователя; причину периодического
+  read-only на реальном Windows/TrueNAS в этой сессии не установили.
+- После появления дисков client helper сверяет полный NAA-набор. При `DISK_READ_ONLY` до
+  10 секунд перечитывает диски исходной session раз в секунду и повторяет полную NAA-проверку.
+  Внутри окна нет online/letter mutations, нового login/prepare или нового request ID.
+  Writable-набор продолжает исходную попытку; постоянный read-only сохраняет полный retry
+  20 попыток / 60 секунд после подтверждённого logout. Иные ошибки наблюдения сразу поступают
+  существующему cleanup/retry обработчику.
+- Добавлены `disk_read_only_wait`, `disk_writable_after_wait`, `disk_read_only_timeout`.
+  Начальный и последний read-only лог включают только собственные NAA и флаги Windows
+  `is_read_only`/`is_offline`. SAN policy, disk read-only атрибуты, TrueNAS extents, Reset API
+  и публичные параметры не меняются. Runtime обновляется заменой `.ps1`; `PT6H` сохраняется.
+
+### Автоматические проверки
+
+- Parser и `Invoke-Pester /suite/powershell/tests -Output Detailed -CI` в
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, PowerShell 7.5.0 / Ubuntu 24.04.1 LTS,
+  Linux/amd64, network disabled, project read-only, working directory `/tmp` — **212 passed,
+  0 failed, 2 skipped** из 214 за 26.17 секунды, exit code `0`. Это не Windows PowerShell 5.1;
+  Windows-only ACL и Transactional Registry cases пропущены.
+- Новые трёхтомные cases проверяют немедленный writable, свежие disk objects и восстановление
+  на проверках 2/10, timeout с типом `DISK_READ_ONLY`, неверный исходный NAA, замену NAA третьего
+  диска, неполный/лишний набор и ошибку чтения во время ожидания, отсутствие disk mutations,
+  mount/sync в исходной попытке и сохранность посторонних дисков/sessions. Постоянный read-only
+  по-прежнему проверяет 20 login/logout, 19 минутных пауз и код `40` после 20 окон наблюдения.
+- Первое получение Pester через `Save-Module` не нашло пакет из-за локального DNS, поэтому
+  первый parser/Pester run прошёл parser, но остановился до тестов на отсутствии модуля.
+  Повтор выполнен с официальным Pester 5.7.1, загруженным с PowerShell Gallery CDN во временную
+  папку по отдельно разрешённому DNS-адресу, с сохранённой HTTPS-проверкой.
+- `ruff check src tests` — успешно. `python -B -m pytest -q -p no:cacheprovider` на Python
+  3.12.4 — **133 passed** за 2.63 секунды.
+- `docker compose -p iscsi-writable-wait config --quiet` — успешно. Локальный запуск
+  `up --build --abort-on-container-exit --exit-code-from windows-simulation` остановился
+  на DNS failure при загрузке build dependency `hatchling`, до запуска interaction tests.
+- Повтор через `docker compose -p iscsi-writable-wait -f compose.yaml -f <temporary-cached-images>
+  up --no-build --abort-on-container-exit --exit-code-from windows-simulation` использовал
+  существующие mock API/management images `iscsi-readonly-hotfix-*` (Python backend в этом
+  изменении не менялся) и текущие PowerShell-файлы через read-only mount. **Interaction suite
+  passed**, exit code `0`: stage/activate, prepare failpoint/reconciliation, wrong NAA,
+  полный read-only retry с реальной минутной паузой, восстановление writable после двух
+  реальных секунд без logout/retry. Выполнен `down --volumes` для этого изолированного проекта.
+
+### Ожидает физического Windows/TrueNAS стенда
+
+- Проверить, меняется ли реальный `IsReadOnly` в течение окна без ручного online, помогают ли
+  эти 10 секунд и совпадают ли значения с фактической write protection на TrueNAS/Windows.
+  Ручной online и ожидание — разные действия; mock-переход флага не доказывает причину.
+- Реальные Windows Storage/iSCSI cmdlets, NTFS и TrueNAS readiness/cleanup остаются проверками
+  по `TEST-PLAN.md`. Новый Windows PowerShell 5.1 CI результат фиксируется отдельно после push.
+
 ## Общий retry клиентских ошибок — 2026-10-04
 
 ### Реализация

@@ -1391,6 +1391,83 @@ function Get-ResetDiskMappings {
     return $mappings
 }
 
+function Wait-ResetWritableSessionDisks {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)]$Disks,
+        [string]$RequestId = "",
+        [ValidateRange(0, 60)][int]$TimeoutSeconds = 10
+    )
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    $currentDisks = @($Disks)
+    # Bound the observation count too, so a mocked sleep cannot turn this into a busy loop.
+    for ($observation = 0; $observation -le $TimeoutSeconds; $observation++) {
+        if ($observation -gt 0) {
+            Start-Sleep -Seconds 1
+            $currentDisks = @(Get-ResetSessionDisks -Session $Session)
+        }
+        $validationDisks = $currentDisks
+        if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
+            $validationDisks = @($currentDisks | ForEach-Object {
+                [pscustomobject]@{
+                    UniqueId = [string]$_.unique_id
+                    IsReadOnly = [bool]$_.is_read_only
+                    IsOffline = [bool]$_.is_offline
+                }
+            })
+        }
+        try {
+            # Recheck the complete NAA set on every observation before trusting any flag.
+            Get-ResetDiskMappings -ExpectedVolumes $ExpectedVolumes `
+                -Disks $validationDisks | Out-Null
+        } catch {
+            if ([string]$_.Exception.Data["Code"] -ne "DISK_READ_ONLY") { throw }
+            $readOnlyError = $_.Exception
+            $diskStates = @($validationDisks | ForEach-Object {
+                [pscustomobject]@{
+                    disk_unique_id = Normalize-DiskId ([string]$_.UniqueId)
+                    is_read_only = [bool]$_.IsReadOnly
+                    is_offline = [bool]$_.IsOffline
+                }
+            })
+            if ($observation -eq 0 -and
+                -not [string]::IsNullOrWhiteSpace($RequestId)) {
+                Write-ResetLog -Level "WARN" -Event "disk_read_only_wait" `
+                    -RequestId $RequestId -Message "Waiting for freshly connected disks to become writable" `
+                    -Details @{
+                        timeout_seconds = $TimeoutSeconds
+                        poll_interval_seconds = 1
+                        disk_states = $diskStates
+                    }
+            }
+            if ($observation -ge $TimeoutSeconds -or
+                $timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                if (-not [string]::IsNullOrWhiteSpace($RequestId)) {
+                    Write-ResetLog -Level "WARN" -Event "disk_read_only_timeout" `
+                        -RequestId $RequestId -Message "Disks remained read-only during the observation window" `
+                        -Details @{
+                            timeout_seconds = $TimeoutSeconds
+                            elapsed_seconds = [Math]::Round($timer.Elapsed.TotalSeconds, 3)
+                            disk_states = $diskStates
+                        }
+                }
+                throw $readOnlyError
+            }
+            continue
+        }
+        if ($observation -gt 0) {
+            Write-ResetProgress -RequestId $RequestId -Event "disk_writable_after_wait" `
+                -Message "The complete NAA-matched disk set became writable without reconnecting" `
+                -Details @{
+                    elapsed_seconds = [Math]::Round($timer.Elapsed.TotalSeconds, 3)
+                    observations = $observation + 1
+                }
+        }
+        return $currentDisks
+    }
+}
+
 function Get-ResetPartitionVolumes {
     param([Parameter(Mandatory = $true)]$Partition)
     return @($Partition | Get-Volume)
@@ -4894,6 +4971,8 @@ function Invoke-ResetMain {
                 }
             $stage = "disk_validation"
             $disks = @(Wait-ResetSessionDisks -Session $session -ExpectedCount @($prepared.volumes).Count)
+            $disks = @(Wait-ResetWritableSessionDisks -Session $session `
+                -ExpectedVolumes @($prepared.volumes) -Disks $disks -RequestId $requestId)
             Mount-ResetVolumes -ExpectedVolumes @($prepared.volumes) -Disks $disks `
                 -RequestId $requestId
             try {
