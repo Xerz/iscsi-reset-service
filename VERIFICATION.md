@@ -39,7 +39,8 @@
 - `docker compose -p iscsi-writable-wait config --quiet` — успешно. Локальный запуск
   `up --build --abort-on-container-exit --exit-code-from windows-simulation` остановился
   на DNS failure при загрузке build dependency `hatchling`, до запуска interaction tests.
-- Повтор через `docker compose -p iscsi-writable-wait -f compose.yaml -f <temporary-cached-images>
+- Повтор через `docker compose -p iscsi-writable-wait -f compose.yaml
+  -f /private/tmp/iscsi-writable-wait-tools/cached-images.yaml
   up --no-build --abort-on-container-exit --exit-code-from windows-simulation` использовал
   существующие mock API/management images `iscsi-readonly-hotfix-*` (Python backend в этом
   изменении не менялся) и текущие PowerShell-файлы через read-only mount. **Interaction suite
@@ -51,9 +52,16 @@
   новый test helper копировал массив через `ConvertFrom-Json`, который в 5.1 сохранял массив
   одним элементом pipeline. Присваивание `IsReadOnly` обращалось к read-only свойству массива,
   а не к mocked disk. Helper исправлен явным созданием независимых disk objects; runtime
-  не менялся. Проверено по jobs API, annotations и полному Windows job log; повтор CI требуется.
+  не менялся. Проверено по jobs API, annotations и полному Windows job log; результат повтора ниже.
 - После исправления test helper повторены parser и весь Linux PowerShell/Pester suite в том
   же окружении: **212 passed, 0 failed, 2 skipped** из 214 за 29.14 секунды, exit code `0`.
+- Повторный GitHub Actions run `37835133864` для точного SHA
+  `9b195268bca1c840b9d9f63f438f4b0c9870138f` — **success**. Jobs Python, полный Compose build/
+  interaction и Windows PowerShell 5.1/Pester 5.7.1 завершились успешно. Проверено через
+  GitHub Actions run/jobs API; из-за локального DNS HTTPS-запросы использовали отдельно
+  разрешённый адрес `api.github.com` с обычной проверкой TLS. Это подтверждает Windows unit
+  suite, а не физические Storage/iSCSI cmdlets или TrueNAS. Commits `0cc1ade` и `9b19526`
+  отправлены в `main` без tag/GitHub Release.
 
 ### Ожидает физического Windows/TrueNAS стенда
 
@@ -61,7 +69,7 @@
   эти 10 секунд и совпадают ли значения с фактической write protection на TrueNAS/Windows.
   Ручной online и ожидание — разные действия; mock-переход флага не доказывает причину.
 - Реальные Windows Storage/iSCSI cmdlets, NTFS и TrueNAS readiness/cleanup остаются проверками
-  по `TEST-PLAN.md`. Новый Windows PowerShell 5.1 CI результат фиксируется отдельно после push.
+  по `TEST-PLAN.md`; успешный Windows PowerShell 5.1 CI их не заменяет.
 
 ## Общий retry клиентских ошибок — 2026-10-04
 
