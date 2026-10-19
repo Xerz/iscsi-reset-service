@@ -1,5 +1,34 @@
 # Verification record
 
+## Steam: обновление установленных приложений при запуске — 2026-10-19
+
+- Добавлен самостоятельный `powershell/Set-SteamUpdateOnLaunch.ps1` с целевым
+  `AutoUpdateBehavior=1`, автоматическим поиском библиотек, явным `-LibraryPath`, `-WhatIf`,
+  проверкой закрытого Steam и уникальными исходными `.bak` перед заменой через `File.Replace`.
+  UTF-8 BOM и переводы строк сохраняются. Код iSCSI helper, API и storage не менялся.
+- На macOS / Apple Silicon загружен официальный portable PowerShell 7.5.0 во временную
+  папку `/private/tmp/steam-update-pwsh`; системная установка не выполнялась. Pester 5.7.1
+  загружен из PowerShell Gallery во временную папку `/private/tmp/steam-update-modules`.
+- `/private/tmp/steam-update-pwsh/pwsh -NoLogo -NoProfile -File
+  /private/tmp/test-steam-update.ps1 -ScriptPath
+  /Users/xrzvs/Documents/ChatGPT/iscsi-reset-service/powershell/Set-SteamUpdateOnLaunch.ps1`
+  — parser и файловый smoke прошли. Проверены три библиотеки с пробелами/скобками в путях,
+  значения `0/1/2`, добавление отсутствующего поля, `-WhatIf` без записи, точная исходная
+  резервная копия, сохранение остальных байтов/BOM/кириллицы/CRLF, повторный запуск без
+  изменений, дедупликация путей, отказ для дублирующегося флага и mock активного Steam.
+- `/private/tmp/steam-update-pwsh/pwsh -NoLogo -NoProfile -Command
+  'Import-Module /private/tmp/steam-update-modules/Pester/5.7.1/Pester.psd1;
+  Invoke-Pester ./powershell/tests -Output Detailed -CI'` — **212 passed, 0 failed,
+  2 skipped** из 214, 16.36 секунды, exit code `0`. Пропущены Windows ACL и Transactional
+  Registry. Это дополнительный прогон на PowerShell 7.5.0, не Windows PowerShell 5.1.
+- `git diff --check` — успешно. `docker version --format '{{.Server.Version}}'` показал
+  недоступный локальный daemon (`~/.orbstack/run/docker.sock` отсутствует); контейнерные
+  проверки не выполнялись. Самостоятельная Steam-утилита не меняет Compose или backend.
+- Ожидают Windows PowerShell 5.1 и реального Steam: автоматический поиск по буквам дисков,
+  реестру и `libraryfolders.vdf`, запись/резервное копирование на NTFS, ошибки доступа и
+  отображение настройки в интерфейсе Steam. Реальные библиотеки не изменялись. Проверки
+  физического TrueNAS/Windows из предыдущих записей сохраняют прежний статус.
+
 ## Ожидание writable после login — 2026-10-09
 
 ### Реализация и границы вывода
