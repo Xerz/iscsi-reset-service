@@ -1532,11 +1532,32 @@ Describe "Offline-online read-only recovery" {
         Mock Get-ResetSessionDisks {
             $Session.TargetNodeAddress | Should -Be "own-cycle-target"
             return @($script:CycleDisks | ForEach-Object {
-                [pscustomobject]@{
+                $copy = [pscustomobject]@{
                     Number = $_.Number; UniqueId = $_.UniqueId
                     IsReadOnly = $_.IsReadOnly; IsOffline = $_.IsOffline
                     IsBoot = $_.IsBoot; IsSystem = $_.IsSystem
                 }
+                if ($env:OS -eq "Windows_NT") {
+                    # Storage's dynamic parameter binding requires genuine CIM input even
+                    # when Pester relaxes the static InputObject parameter type.
+                    $cimDisk = New-Object Microsoft.Management.Infrastructure.CimInstance `
+                        -ArgumentList "MSFT_Disk", "root/Microsoft/Windows/Storage"
+                    foreach ($name in @("Number", "UniqueId", "IsReadOnly", "IsOffline", "IsBoot", "IsSystem")) {
+                        $value = $copy.$name
+                        $type = [Microsoft.Management.Infrastructure.CimType]::Boolean
+                        if ($name -eq "Number") {
+                            $type = [Microsoft.Management.Infrastructure.CimType]::UInt32
+                            $value = [uint32]$value
+                        } elseif ($name -eq "UniqueId") {
+                            $type = [Microsoft.Management.Infrastructure.CimType]::String
+                        }
+                        $property = [Microsoft.Management.Infrastructure.CimProperty]::Create(
+                            $name, $value, $type, [Microsoft.Management.Infrastructure.CimFlags]0
+                        )
+                        $cimDisk.CimInstanceProperties.Add($property)
+                    }
+                    $cimDisk
+                } else { $copy }
             })
         }
         Mock Wait-ResetWritableSessionDisks {

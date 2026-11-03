@@ -55,7 +55,14 @@
   `-RemoveParameterType InputObject`; Linux stub теперь также объявляет строгий CIM-тип,
   чтобы этот контракт не оставался только Windows-проверкой. Runtime не менялся.
   После поправки повторены parser и полный Linux PowerShell/Pester suite: **225 passed,
-  0 failed, 2 skipped** из 227 за 34.35 секунды, exit code `0`. Повтор CI требуется.
+  0 failed, 2 skipped** из 227 за 34.35 секунды, exit code `0`.
+- Повторный CI `41632344232` для `3b037a5` снова прошёл Python/interaction, но Windows дал
+  **221 passed, 6 failed, 0 skipped**: Pester при получении dynamic parameters всё ещё
+  вызывает исходный CIM binder, который не принимает `PSCustomObject` даже после снятия
+  static parameter type. Подтверждено полным job log. Windows fixtures теперь создают
+  настоящие in-memory `CimInstance`/`CimProperty` с namespace/class `MSFT_Disk`, без подключения
+  к storage. Runtime не менялся. Parser и полный Linux suite после этой поправки:
+  **225 passed, 0 failed, 2 skipped** за 34.09 секунды. Windows-ветка fixtures требует CI.
 
 ### Ожидает стенда
 
