@@ -49,6 +49,13 @@
   online workaround без logout/нового prepare. Поведение write-protection моделирует harness,
   а не production simulation setter. Выполнен `docker compose -p iscsi-offline-online down
   --volumes`.
+- Первый CI run `41631494604` для commit `7823313` прошёл Python и полный Compose interaction;
+  Windows PowerShell 5.1 упал в 6 новых native recovery mocks: `Set-Disk -InputObject` требует
+  настоящий `CimInstance[]`, а fixture передаёт `PSCustomObject`. В mock добавлен
+  `-RemoveParameterType InputObject`; Linux stub теперь также объявляет строгий CIM-тип,
+  чтобы этот контракт не оставался только Windows-проверкой. Runtime не менялся.
+  После поправки повторены parser и полный Linux PowerShell/Pester suite: **225 passed,
+  0 failed, 2 skipped** из 227 за 34.35 секунды, exit code `0`. Повтор CI требуется.
 
 ### Ожидает стенда
 

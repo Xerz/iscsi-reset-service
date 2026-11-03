@@ -10,7 +10,9 @@ BeforeAll {
         return [int]$numbers[0]
     }
     if ($null -eq (Get-Command Set-Disk -ErrorAction SilentlyContinue)) {
-        Set-Item -Path "function:Set-Disk" -Value { param($Number, $InputObject, $IsOffline, $ErrorAction) }
+        Set-Item -Path "function:Set-Disk" -Value {
+            param($Number, [Microsoft.Management.Infrastructure.CimInstance[]]$InputObject, $IsOffline, $ErrorAction)
+        }
     }
     if ($null -eq (Get-Command Get-Partition -ErrorAction SilentlyContinue)) {
         Set-Item -Path "function:Get-Partition" -Value {
@@ -1541,7 +1543,7 @@ Describe "Offline-online read-only recovery" {
             Get-ResetDiskMappings -ExpectedVolumes $ExpectedVolumes -Disks $Disks | Out-Null
             return $Disks
         }
-        Mock Set-Disk {
+        Mock Set-Disk -RemoveParameterType InputObject {
             $disk = @($InputObject)[0]
             $matches = @($script:CycleDisks | Where-Object UniqueId -eq $disk.UniqueId)
             $matches.Count | Should -Be 1
