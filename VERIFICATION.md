@@ -62,14 +62,20 @@
   static parameter type. Подтверждено полным job log. Windows fixtures теперь создают
   настоящие in-memory `CimInstance`/`CimProperty` с namespace/class `MSFT_Disk`, без подключения
   к storage. Runtime не менялся. Parser и полный Linux suite после этой поправки:
-  **225 passed, 0 failed, 2 skipped** за 34.09 секунды. Windows-ветка fixtures требует CI.
+  **225 passed, 0 failed, 2 skipped** за 34.09 секунды; результат Windows-ветки ниже.
+- Итоговый GitHub Actions run `41633596860` для точного SHA
+  `013f00f4b076653721e29882fe94504a2d505a5f` — **success**. Python, Windows PowerShell 5.1/
+  Pester 5.7.1 и полный Compose build/interaction jobs завершились успешно. Подтверждено
+  `gh run view 41633596860 --json headSha,status,conclusion,jobs`. Commits `7823313`,
+  `3b037a5`, `013f00f` отправлены в `main` без tag/GitHub Release. Это Windows unit suite,
+  а не физическая проверка Storage/iSCSI cmdlets на дисках.
 
 ### Ожидает стенда
 
 - Реальные Windows Storage/iSCSI cmdlets, write protection/NTFS и TrueNAS здесь не проверялись.
   Пользователь сообщил об успешном ручном workaround; автоматический offline/online ещё
   требует физической проверки по `TEST-PLAN.md`. Эффект цикла и причина read-only не считаются
-  доказанными mock-тестами. Новый Windows PowerShell 5.1 CI результат фиксируется после push.
+  доказанными mock-тестами; успешный Windows PowerShell 5.1 CI их не заменяет.
 
 ## Steam: обновление установленных приложений при запуске — 2026-10-19
 
