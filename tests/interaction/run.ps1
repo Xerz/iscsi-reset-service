@@ -187,8 +187,8 @@ function Start-Sleep {
         }
         $retryState = Read-SimulationState
         foreach ($disk in @($retryState.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
-            if (-not $disk.is_offline -or $null -ne $disk.drive_letter) {
-                throw "Read-only attempt changed a simulated disk before retry"
+            if ($null -ne $disk.drive_letter) {
+                throw "Read-only attempt assigned a drive letter before retry"
             }
         }
         Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds
@@ -284,6 +284,61 @@ foreach ($disk in @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.
 }
 if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter -ne "C") {
     throw "Writable observation modified the local disk"
+}
+
+# Model the reported workaround: only the simulated offline-online transition clears read-only.
+$state.sessions = @()
+foreach ($disk in @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
+    $disk.is_offline = $false
+    $disk.drive_letter = $null
+}
+($state.disks | Where-Object unique_id -eq "0x6589cfc000000001").is_read_only = $true
+Save-SimulationState $state
+Remove-Item -LiteralPath (Join-Path $root "client.log.jsonl") -Force
+$script:ActualDiskOfflineSetter = (Get-Command Set-ResetSessionDiskOffline).ScriptBlock
+$script:CycleMutationCount = 0
+function Set-ResetSessionDiskOffline {
+    param($Session, $Disk, [bool]$IsOffline)
+    & $script:ActualDiskOfflineSetter -Session $Session -Disk $Disk -IsOffline $IsOffline
+    $script:CycleMutationCount++
+    if (-not $IsOffline) {
+        $observed = Read-SimulationState
+        ($observed.disks | Where-Object unique_id -eq $Disk.UniqueId).is_read_only = $false
+        Save-SimulationState $observed
+    }
+}
+function Start-Sleep {
+    param([int]$Seconds, [int]$Milliseconds)
+    if ($Seconds -eq 60) { throw "Offline-online workaround unexpectedly caused a full retry" }
+    if ($PSBoundParameters.ContainsKey("Seconds")) {
+        Microsoft.PowerShell.Utility\Start-Sleep -Seconds $Seconds
+    } else {
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+    }
+}
+$code = Invoke-ResetMain -BaseUrl "http://api:8080" -ClientTokenPath $tokenPath `
+    -TimeoutSeconds 15
+$expectedMutations = @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera").Count * 2
+if ($code -ne 0 -or $script:CycleMutationCount -ne $expectedMutations) {
+    throw "Offline-online workaround did not cycle each client disk exactly once"
+}
+$records = @(Get-Content -LiteralPath (Join-Path $root "client.log.jsonl") | ConvertFrom-Json)
+foreach ($event in @("start", "prepared", "target_connected", "disk_offline_online_start", "disk_offline_online_ready", "ready")) {
+    if (@($records | Where-Object event -eq $event).Count -ne 1) {
+        throw "Unexpected event count after offline-online recovery: $event"
+    }
+}
+if (@($records | Where-Object event -eq "target_disconnected_after_error").Count -ne 0) {
+    throw "Offline-online recovery disconnected its session"
+}
+$state = Read-SimulationState
+foreach ($disk in @($state.disks | Where-Object target_iqn -eq "iqn.2026-08.lab.games:chimera")) {
+    if ($disk.is_offline -or $disk.is_read_only -or [string]::IsNullOrWhiteSpace($disk.drive_letter)) {
+        throw "Offline-online recovery did not mount a complete writable disk set"
+    }
+}
+if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter -ne "C") {
+    throw "Offline-online recovery modified the local disk"
 }
 
 Write-Host "Interaction suite passed"

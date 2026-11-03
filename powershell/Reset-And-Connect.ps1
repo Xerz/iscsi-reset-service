@@ -1350,7 +1350,11 @@ function Get-ResetExpectedLetter {
 }
 
 function Get-ResetDiskMappings {
-    param([Parameter(Mandatory = $true)]$ExpectedVolumes, [Parameter(Mandatory = $true)]$Disks)
+    param(
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)]$Disks,
+        [switch]$AllowReadOnly
+    )
     if ($Disks.Count -ne $ExpectedVolumes.Count) {
         throw "Session exposed $($Disks.Count) disks; expected $($ExpectedVolumes.Count)"
     }
@@ -1383,12 +1387,26 @@ function Get-ResetDiskMappings {
     }
     # Read-only is retryable only after the entire session disk set matches by NAA.
     foreach ($mapping in $mappings) {
-        if ($mapping.Disk.IsReadOnly) {
+        if (-not $AllowReadOnly -and $mapping.Disk.IsReadOnly) {
             throw (New-ApiException -StatusCode 0 -Code "DISK_READ_ONLY" `
                 -Message "Expected disk is unexpectedly read-only: $($mapping.ExpectedId)")
         }
     }
     return $mappings
+}
+
+function ConvertTo-ResetValidationDisks {
+    param([Parameter(Mandatory = $true)]$Disks)
+    if ([string]::IsNullOrWhiteSpace($script:SimulationStatePath)) { return $Disks }
+    foreach ($disk in $Disks) {
+        [pscustomobject]@{
+            UniqueId = [string]$disk.unique_id
+            IsReadOnly = [bool]$disk.is_read_only
+            IsOffline = [bool]$disk.is_offline
+            IsBoot = $false
+            IsSystem = $false
+        }
+    }
 }
 
 function Wait-ResetWritableSessionDisks {
@@ -1407,16 +1425,7 @@ function Wait-ResetWritableSessionDisks {
             Start-Sleep -Seconds 1
             $currentDisks = @(Get-ResetSessionDisks -Session $Session)
         }
-        $validationDisks = $currentDisks
-        if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
-            $validationDisks = @($currentDisks | ForEach-Object {
-                [pscustomobject]@{
-                    UniqueId = [string]$_.unique_id
-                    IsReadOnly = [bool]$_.is_read_only
-                    IsOffline = [bool]$_.is_offline
-                }
-            })
-        }
+        $validationDisks = @(ConvertTo-ResetValidationDisks -Disks $currentDisks)
         try {
             # Recheck the complete NAA set on every observation before trusting any flag.
             Get-ResetDiskMappings -ExpectedVolumes $ExpectedVolumes `
@@ -1465,6 +1474,115 @@ function Wait-ResetWritableSessionDisks {
                 }
         }
         return $currentDisks
+    }
+}
+
+function Get-ResetRecoveryMappings {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)]$ExpectedVolumes
+    )
+    $disks = @(Get-ResetSessionDisks -Session $Session)
+    $validationDisks = @(ConvertTo-ResetValidationDisks -Disks $disks)
+    $mappings = @(Get-ResetDiskMappings -ExpectedVolumes $ExpectedVolumes `
+        -Disks $validationDisks -AllowReadOnly)
+    foreach ($mapping in $mappings) {
+        foreach ($flag in @("IsBoot", "IsSystem")) {
+            $property = $mapping.Disk.PSObject.Properties[$flag]
+            if ($null -eq $property -or $null -eq $property.Value -or [bool]$property.Value) {
+                throw "Cannot cycle disk $($mapping.ExpectedId): $flag is true or unknown"
+            }
+        }
+    }
+    return $mappings
+}
+
+function Set-ResetSessionDiskOffline {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)]$Disk,
+        [Parameter(Mandatory = $true)][bool]$IsOffline
+    )
+    if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
+        $state = Read-SimulationState
+        $diskId = Normalize-DiskId ([string]$Disk.UniqueId)
+        $matches = @($state.disks | Where-Object {
+            $_.target_iqn -ceq $Session.TargetNodeAddress -and
+            (Normalize-DiskId ([string]$_.unique_id)) -eq $diskId
+        })
+        if ($matches.Count -ne 1) { throw "Recovery disk disappeared from its session: $diskId" }
+        $matches[0].is_offline = $IsOffline
+        Save-SimulationState $state
+        return
+    }
+    # Use the freshly NAA-matched CIM object, never a remembered disk number.
+    Set-Disk -InputObject $Disk -IsOffline $IsOffline -ErrorAction Stop | Out-Null
+}
+
+function Wait-ResetDiskOfflineState {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)][string]$ExpectedId,
+        [Parameter(Mandatory = $true)][bool]$IsOffline
+    )
+    for ($observation = 0; $observation -le 5; $observation++) {
+        $mappings = @(Get-ResetRecoveryMappings -Session $Session -ExpectedVolumes $ExpectedVolumes)
+        $mapping = @($mappings | Where-Object ExpectedId -eq $ExpectedId)[0]
+        if ($mapping.Disk.IsOffline -eq $IsOffline) { return }
+        if ($observation -lt 5) { Start-Sleep -Seconds 1 }
+    }
+    throw (New-ApiException -StatusCode 0 -Code "DISK_STATE_TIMEOUT" `
+        -Message "Disk $ExpectedId did not reach IsOffline=$IsOffline during recovery")
+}
+
+function Get-ResetWritableDisksWithRecovery {
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)]$ExpectedVolumes,
+        [Parameter(Mandatory = $true)]$Disks,
+        [string]$RequestId = ""
+    )
+    try {
+        return @(Wait-ResetWritableSessionDisks -Session $Session `
+            -ExpectedVolumes $ExpectedVolumes -Disks $Disks -RequestId $RequestId)
+    } catch {
+        if ([string]$_.Exception.Data["Code"] -ne "DISK_READ_ONLY") { throw }
+    }
+    try {
+        $initialMappings = @(Get-ResetRecoveryMappings -Session $Session `
+            -ExpectedVolumes $ExpectedVolumes)
+        if ([string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
+            Assert-ResetDesiredLettersPreflight -Mappings $initialMappings
+        }
+        Write-ResetProgress -RequestId $RequestId -Event "disk_offline_online_start" `
+            -Message "Cycling each NAA-matched client disk offline and online once" `
+            -Details @{ volume_count = $initialMappings.Count }
+        foreach ($initialMapping in $initialMappings) {
+            foreach ($offline in @($true, $false)) {
+                $mappings = @(Get-ResetRecoveryMappings -Session $Session `
+                    -ExpectedVolumes $ExpectedVolumes)
+                $mapping = @($mappings | Where-Object ExpectedId -eq $initialMapping.ExpectedId)[0]
+                Set-ResetSessionDiskOffline -Session $Session -Disk $mapping.Disk -IsOffline $offline
+                Wait-ResetDiskOfflineState -Session $Session -ExpectedVolumes $ExpectedVolumes `
+                    -ExpectedId $mapping.ExpectedId -IsOffline $offline
+                Write-ResetProgress -RequestId $RequestId -Event "disk_offline_online_state" `
+                    -Message "Confirmed client disk state during recovery" -Details @{
+                        disk_unique_id = $mapping.ExpectedId
+                        is_offline = $offline
+                    }
+            }
+        }
+        $freshDisks = @(Get-ResetSessionDisks -Session $Session)
+        $writableDisks = @(Wait-ResetWritableSessionDisks -Session $Session `
+            -ExpectedVolumes $ExpectedVolumes -Disks $freshDisks -RequestId $RequestId)
+        Write-ResetProgress -RequestId $RequestId -Event "disk_offline_online_ready" `
+            -Message "All client disks are writable after one offline-online cycle"
+        return $writableDisks
+    } catch {
+        Write-ResetProgress -RequestId $RequestId -Event "disk_offline_online_failed" `
+            -Message "Offline-online recovery failed; normal attempt cleanup is required"
+        throw
     }
 }
 
@@ -4971,7 +5089,7 @@ function Invoke-ResetMain {
                 }
             $stage = "disk_validation"
             $disks = @(Wait-ResetSessionDisks -Session $session -ExpectedCount @($prepared.volumes).Count)
-            $disks = @(Wait-ResetWritableSessionDisks -Session $session `
+            $disks = @(Get-ResetWritableDisksWithRecovery -Session $session `
                 -ExpectedVolumes @($prepared.volumes) -Disks $disks -RequestId $requestId)
             Mount-ResetVolumes -ExpectedVolumes @($prepared.volumes) -Disks $disks `
                 -RequestId $requestId

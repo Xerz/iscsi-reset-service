@@ -22,6 +22,8 @@ OPERATOR_SCRIPTS = (
     "Publish-IscsiRelease.ps1",
     "Reset-And-Connect.ps1",
 )
+# The publish workflow already includes the standalone Steam utility via powershell/*.ps1.
+BUNDLED_SCRIPTS = (*OPERATOR_SCRIPTS, "Set-SteamUpdateOnLaunch.ps1")
 
 
 def test_render_bundle_pins_all_services_and_preserves_site_placeholders() -> None:
@@ -100,7 +102,7 @@ def test_publish_workflow_packages_exact_operator_scripts() -> None:
     scripts = tuple(sorted(path.name for path in (ROOT / "powershell").glob("*.ps1")))
     workflow = PUBLISH_WORKFLOW_PATH.read_text(encoding="utf-8")
 
-    assert scripts == OPERATOR_SCRIPTS
+    assert scripts == BUNDLED_SCRIPTS
     assert "install -m 0644 powershell/*.ps1 dist/" in workflow
     assert 'sha256sum "${BUNDLE_NAME}" image-digest.txt *.ps1 > SHA256SUMS' in workflow
     assert workflow.count("dist/*.ps1") == 3
@@ -110,7 +112,7 @@ def test_publish_workflow_packages_exact_operator_scripts() -> None:
     assert "publisher.json" in workflow
 
 
-def test_simulated_release_directory_has_seven_checksum_assets(tmp_path: Path) -> None:
+def test_simulated_release_directory_has_eight_checksum_assets(tmp_path: Path) -> None:
     bundle_name = "iscsi-reset-service-v0.4.4-truenas.yaml"
     rendered = render_truenas_bundle(
         TEMPLATE_PATH.read_text(encoding="utf-8"),
@@ -122,10 +124,10 @@ def test_simulated_release_directory_has_seven_checksum_assets(tmp_path: Path) -
         f"{IMAGE_REPOSITORY}@{VALID_DIGEST}\n",
         encoding="utf-8",
     )
-    for script in OPERATOR_SCRIPTS:
+    for script in BUNDLED_SCRIPTS:
         shutil.copyfile(ROOT / "powershell" / script, tmp_path / script)
 
-    checksummed = {bundle_name, "image-digest.txt", *OPERATOR_SCRIPTS}
+    checksummed = {bundle_name, "image-digest.txt", *BUNDLED_SCRIPTS}
     checksum_lines = []
     for name in sorted(checksummed):
         digest = hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
@@ -141,4 +143,4 @@ def test_simulated_release_directory_has_seven_checksum_assets(tmp_path: Path) -
         line.split("  ", 1)[1]
         for line in (tmp_path / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
     } == checksummed
-    assert len(assets) == 7
+    assert len(assets) == 8

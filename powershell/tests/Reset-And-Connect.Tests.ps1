@@ -10,7 +10,7 @@ BeforeAll {
         return [int]$numbers[0]
     }
     if ($null -eq (Get-Command Set-Disk -ErrorAction SilentlyContinue)) {
-        Set-Item -Path "function:Set-Disk" -Value { param($Number, $IsOffline) }
+        Set-Item -Path "function:Set-Disk" -Value { param($Number, $InputObject, $IsOffline, $ErrorAction) }
     }
     if ($null -eq (Get-Command Get-Partition -ErrorAction SilentlyContinue)) {
         Set-Item -Path "function:Get-Partition" -Value {
@@ -1503,9 +1503,153 @@ Describe "Writable disk observation after login" {
     }
 }
 
+Describe "Offline-online read-only recovery" {
+    BeforeEach {
+        $script:SimulationStatePath = ""
+        $script:CycleSession = [pscustomobject]@{ TargetNodeAddress = "own-cycle-target" }
+        $script:CycleVolumes = @(
+            [pscustomobject]@{ name = "primary"; disk_unique_id = "aaa"; drive_letter = "E" },
+            [pscustomobject]@{ name = "archive"; disk_unique_id = "bbb"; drive_letter = "F" },
+            [pscustomobject]@{ name = "third"; disk_unique_id = "ccc"; drive_letter = "G" }
+        )
+        $script:CycleDisks = @(
+            [pscustomobject]@{ Number = 10; UniqueId = "0xaaa"; IsReadOnly = $true; IsOffline = $false; IsBoot = $false; IsSystem = $false },
+            [pscustomobject]@{ Number = 11; UniqueId = "0xbbb"; IsReadOnly = $false; IsOffline = $false; IsBoot = $false; IsSystem = $false },
+            [pscustomobject]@{ Number = 12; UniqueId = "0xccc"; IsReadOnly = $false; IsOffline = $false; IsBoot = $false; IsSystem = $false }
+        )
+        $script:CycleTransitions = New-Object 'System.Collections.Generic.List[object]'
+        $script:CycleHelps = $true
+        $script:FailAfterCycleState = ""
+        $script:ChangeNaaAfterOffline = $false
+        $script:IgnoreOffline = $false
+        Mock Start-Sleep { }
+        Mock Write-ResetLog { }
+        Mock Assert-ResetDesiredLettersPreflight { }
+        Mock Set-Partition { }
+        Mock Remove-PartitionAccessPath { }
+        Mock Get-ResetSessionDisks {
+            $Session.TargetNodeAddress | Should -Be "own-cycle-target"
+            return @($script:CycleDisks | ForEach-Object {
+                [pscustomobject]@{
+                    Number = $_.Number; UniqueId = $_.UniqueId
+                    IsReadOnly = $_.IsReadOnly; IsOffline = $_.IsOffline
+                    IsBoot = $_.IsBoot; IsSystem = $_.IsSystem
+                }
+            })
+        }
+        Mock Wait-ResetWritableSessionDisks {
+            Get-ResetDiskMappings -ExpectedVolumes $ExpectedVolumes -Disks $Disks | Out-Null
+            return $Disks
+        }
+        Mock Set-Disk {
+            $disk = @($InputObject)[0]
+            $matches = @($script:CycleDisks | Where-Object UniqueId -eq $disk.UniqueId)
+            $matches.Count | Should -Be 1
+            $script:CycleTransitions.Add([pscustomobject]@{
+                Id = $disk.UniqueId; IsOffline = $IsOffline; Number = $disk.Number
+            })
+            if (-not ($IsOffline -and $script:IgnoreOffline)) {
+                $matches[0].IsOffline = $IsOffline
+            }
+            if (-not $IsOffline -and $script:CycleHelps) { $matches[0].IsReadOnly = $false }
+            if ($IsOffline -and $script:ChangeNaaAfterOffline) {
+                $script:CycleDisks[2].UniqueId = "foreign-naa"
+            }
+            # Model Windows assigning a new disk number while retaining the NAA identity.
+            $matches[0].Number += 100
+            if (($IsOffline -and $script:FailAfterCycleState -eq "offline") -or
+                (-not $IsOffline -and $script:FailAfterCycleState -eq "online")) {
+                throw "injected after disk state mutation"
+            }
+        }
+    }
+
+    It "cycles all three matched disks once with fresh objects and keeps the session" {
+        $result = @(Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+            -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks -RequestId "cycle-test")
+
+        $result.Count | Should -Be 3
+        $script:CycleTransitions.Count | Should -Be 6
+        for ($index = 0; $index -lt 3; $index++) {
+            $script:CycleTransitions[$index * 2].Id | Should -Be $script:CycleDisks[$index].UniqueId
+            $script:CycleTransitions[$index * 2].IsOffline | Should -BeTrue
+            $script:CycleTransitions[$index * 2 + 1].IsOffline | Should -BeFalse
+            $script:CycleTransitions[$index * 2 + 1].Number | Should -Be (110 + $index)
+        }
+        Should -Invoke Set-Disk -Times 6 -Exactly -ParameterFilter { $null -ne $InputObject }
+        Should -Invoke Write-ResetLog -Times 1 -Exactly -ParameterFilter {
+            $Event -eq "disk_offline_online_ready" -and $RequestId -eq "cycle-test"
+        }
+        Should -Invoke Set-Partition -Times 0 -Exactly
+        Should -Invoke Remove-PartitionAccessPath -Times 0 -Exactly
+    }
+
+    It "does not repeat the cycle if disks remain read-only" {
+        $script:CycleHelps = $false
+        try {
+            Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+                -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks
+            throw "Expected persistent read-only"
+        } catch { $_.Exception.Data["Code"] | Should -Be "DISK_READ_ONLY" }
+        Should -Invoke Set-Disk -Times 6 -Exactly
+    }
+
+    It "rejects a wrong NAA before any state mutation" {
+        $script:CycleDisks[2].UniqueId = "foreign-naa"
+        { Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+            -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks } |
+            Should -Throw "*exactly one session disk*"
+        Should -Invoke Set-Disk -Times 0 -Exactly
+    }
+
+    It "stops before online when the third NAA changes after offline" {
+        $script:ChangeNaaAfterOffline = $true
+        { Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+            -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks } |
+            Should -Throw "*exactly one session disk*"
+        Should -Invoke Set-Disk -Times 1 -Exactly
+        $script:CycleDisks[0].IsOffline | Should -BeTrue
+    }
+
+    It "requires confirmed offline before attempting online" {
+        $script:IgnoreOffline = $true
+        try {
+            Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+                -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks
+            throw "Expected offline timeout"
+        } catch { $_.Exception.Data["Code"] | Should -Be "DISK_STATE_TIMEOUT" }
+        Should -Invoke Set-Disk -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 5 -Exactly
+    }
+
+    It "propagates failure immediately after <State> mutation" -TestCases @(
+        @{ State = "offline"; Mutations = 1 }, @{ State = "online"; Mutations = 2 }
+    ) {
+        param($State, $Mutations)
+        $script:FailAfterCycleState = $State
+        { Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+            -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks } |
+            Should -Throw "*after disk state mutation*"
+        Should -Invoke Set-Disk -Times $Mutations -Exactly
+    }
+
+    It "refuses a boot/system disk or unknown flag: <Flag> = <Value>" -TestCases @(
+        @{ Flag = "IsBoot"; Value = $true }, @{ Flag = "IsSystem"; Value = $true },
+        @{ Flag = "IsSystem"; Value = $null }
+    ) {
+        param($Flag, $Value)
+        $script:CycleDisks[2].$Flag = $Value
+        { Get-ResetWritableDisksWithRecovery -Session $script:CycleSession `
+            -ExpectedVolumes $script:CycleVolumes -Disks $script:CycleDisks } |
+            Should -Throw "*true or unknown*"
+        Should -Invoke Set-Disk -Times 0 -Exactly
+    }
+}
+
 Describe "Full reset retries" {
     BeforeAll {
         $script:RealRetryConnect = (Get-Command Connect-ResetTarget).ScriptBlock
+        $script:RealDiskOfflineSetter = (Get-Command Set-ResetSessionDiskOffline).ScriptBlock
     }
     BeforeEach {
         $script:SimulationStatePath = Join-Path $TestDrive "readonly-state.json"
@@ -1552,6 +1696,21 @@ Describe "Full reset retries" {
         $script:RetryFailureCount = 0
         $script:RetryFailureCode = "NETWORK_ERROR"
         $script:RetryFailureStatus = 0
+        $script:RecoverDuringCycle = $false
+        $script:DiskTransitions = New-Object 'System.Collections.Generic.List[object]'
+        Mock Set-ResetSessionDiskOffline {
+            @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+            $script:DiskTransitions.Add([pscustomobject]@{
+                Id = Normalize-DiskId ([string]$Disk.UniqueId)
+                IsOffline = $IsOffline
+            })
+            & $script:RealDiskOfflineSetter -Session $Session -Disk $Disk -IsOffline $IsOffline
+            if (-not $IsOffline -and $script:RecoverDuringCycle) {
+                $state = Read-SimulationState
+                ($state.disks | Where-Object unique_id -eq $Disk.UniqueId).is_read_only = $false
+                Save-SimulationState $state
+            }
+        }
         Mock Wait-ResetApi { return [pscustomobject]@{ config_revision = "retry-revision" } }
         Mock Invoke-ResetRequest {
             $script:RetryRequests.Add([pscustomobject]@{
@@ -1581,7 +1740,6 @@ Describe "Full reset retries" {
             $state = Read-SimulationState
             @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 0
             foreach ($disk in @($state.disks | Where-Object target_iqn -eq $script:RetryTarget)) {
-                $disk.is_offline | Should -BeTrue
                 $disk.drive_letter | Should -BeNullOrEmpty
             }
             if ($script:RecoverOnAttempt -eq $script:RetrySleeps.Count + 1) {
@@ -1642,6 +1800,64 @@ Describe "Full reset retries" {
         }
         ($state.sessions | Where-Object target_iqn -eq "other-target").persistent | Should -BeTrue
         ($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter | Should -Be "C"
+    }
+
+    It "recovers all three disks in the original attempt with one cycle each" {
+        $script:RecoverDuringCycle = $true
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+
+        $script:DiskTransitions.Count | Should -Be 6
+        Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
+        Should -Invoke Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 1 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        foreach ($event in @("start", "prepared", "target_connected", "disk_offline_online_start", "disk_offline_online_ready", "ready")) {
+            @($records | Where-Object event -eq $event).Count | Should -Be 1
+        }
+        @($records | Where-Object event -eq "disk_offline_online_state").Count | Should -Be 6
+        @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 0
+        @($records | Where-Object request_id -ne $records[0].request_id).Count | Should -Be 0
+        $state = Read-SimulationState
+        foreach ($volume in $script:RetryVolumes) {
+            $disk = $state.disks | Where-Object unique_id -eq ("0x" + $volume.disk_unique_id)
+            $disk.is_offline | Should -BeFalse
+            $disk.drive_letter | Should -Be $volume.drive_letter
+        }
+        ($state.sessions | Where-Object target_iqn -eq "other-target").persistent | Should -BeTrue
+        ($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter | Should -Be "C"
+    }
+
+    It "cleans up and reconciles after failure immediately after IsOffline=<Offline>" -TestCases @(
+        @{ Offline = $true }, @{ Offline = $false }
+    ) {
+        param($Offline)
+        $script:FaultOffline = $Offline
+        $script:FailTransitionOnce = $true
+        Mock Set-ResetSessionDiskOffline {
+            & $script:RealDiskOfflineSetter -Session $Session -Disk $Disk -IsOffline $IsOffline
+            if ($script:FailTransitionOnce -and $IsOffline -eq $script:FaultOffline) {
+                $script:FailTransitionOnce = $false
+                throw "injected immediately after offline-online mutation"
+            }
+            if (-not $script:FailTransitionOnce -and -not $IsOffline) {
+                $state = Read-SimulationState
+                ($state.disks | Where-Object unique_id -eq $Disk.UniqueId).is_read_only = $false
+                Save-SimulationState $state
+            }
+        }
+
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+
+        $script:RetrySleeps.Count | Should -Be 1
+        Should -Invoke Invoke-ClientEgsManifestSync -Times 1 -Exactly
+        $records = @(Get-Content -LiteralPath $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "start").Count | Should -Be 2
+        @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 1
+        @($records | Where-Object event -eq "disk_offline_online_ready").Count | Should -Be 1
+        @($records | Where-Object event -eq "ready").Count | Should -Be 1
     }
 
     It "repeats the entire three-volume flow and succeeds on attempt <Recovery>" -TestCases @(
@@ -1711,8 +1927,10 @@ Describe "Full reset retries" {
         @($records | Where-Object event -eq "target_connected").Count | Should -Be 20
         @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 20
         @($records | Where-Object event -eq "read_only_retry").Count | Should -Be 19
-        @($records | Where-Object event -eq "disk_read_only_timeout").Count | Should -Be 20
-        Should -Invoke Start-Sleep -Times 200 -Exactly -ParameterFilter { $Seconds -eq 1 }
+        @($records | Where-Object event -eq "disk_read_only_timeout").Count | Should -Be 40
+        @($records | Where-Object event -eq "disk_offline_online_start").Count | Should -Be 20
+        $script:DiskTransitions.Count | Should -Be 120
+        Should -Invoke Start-Sleep -Times 400 -Exactly -ParameterFilter { $Seconds -eq 1 }
         $failure = @($records | Where-Object event -eq "DISK_READ_ONLY")
         $failure.Count | Should -Be 1
         $failure[0].attempt | Should -Be 20
@@ -1755,7 +1973,7 @@ Describe "Full reset retries" {
             -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
 
         Should -Invoke Invoke-ResetRequest -Times 2 -Exactly
-        Should -Invoke Start-Sleep -Times 10 -Exactly -ParameterFilter { $Seconds -eq 1 }
+        Should -Invoke Start-Sleep -Times 20 -Exactly -ParameterFilter { $Seconds -eq 1 }
         Should -Invoke Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
         Should -Invoke Invoke-ClientEgsManifestSync -Times 0 -Exactly
         @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1

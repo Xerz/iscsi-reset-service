@@ -1,5 +1,62 @@
 # Verification record
 
+## Однократный offline/online workaround перед retry — 2026-11-03
+
+### Реализация
+
+- После прежнего 10-секундного наблюдения при `DISK_READ_ONLY` client helper один раз за
+  полную попытку выполняет «Вне сети → В сети» для каждого диска своего полного NAA-набора.
+  Перед каждой mutation заново читается exact session и проверяется полный набор; Windows
+  получает свежий disk object через `Set-Disk -InputObject`, а не сохранённый номер диска.
+- Boot/system disks и неизвестные соответствующие flags блокируют цикл до первой mutation.
+  Перед циклом на Windows проверяются желаемые буквы. Каждое offline/online состояние должно
+  подтвердиться за 5 секунд с повторной полной NAA-проверкой; ошибки чтения/идентификации
+  останавливают цикл сразу. После всех переключений writable проверяется ещё до 10 секунд.
+- Успех сохраняет исходные session, prepare и request ID; mount/настроенные буквы/launcher
+  sync и `ready` допускаются после полной writable-проверки. При неуспехе выполняется прежний
+  cleanup только созданной session и полный retry: 20 попыток, 60 секунд между ними, без
+  последней паузы. Неподтверждённый logout по-прежнему завершает запуск сразу.
+- JSONL добавляет `disk_offline_online_start`, `disk_offline_online_state`,
+  `disk_offline_online_ready`, `disk_offline_online_failed`; неподтверждённая смена состояния
+  имеет тип `DISK_STATE_TIMEOUT`. Read-only не снимается принудительно; SAN policy, extents,
+  Reset API, публичные параметры, непостоянный login и лимит задачи `PT6H` не менялись.
+
+### Автоматические проверки
+
+- Parser всех PowerShell scripts и `Invoke-Pester /suite/powershell/tests -Output Detailed
+  -CI` в `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, PowerShell 7.5.0 / Ubuntu 24.04.1 LTS,
+  Linux/amd64, network disabled, source read-only, working directory `/tmp` — **225 passed,
+  0 failed, 2 skipped** из 227 за 37.19 секунды, exit code `0`. Pester 5.7.1 установлен во
+  временную папку через `Save-Module`. Windows ACL и Transactional Registry пропущены;
+  это дополнительный Linux run, а не Windows PowerShell 5.1.
+- Трёхтомные cases проверяют один цикл каждого диска в исходной попытке, неизменный request
+  ID, свежий disk object при смене номера, wrong NAA до mutation и подмену третьего NAA после
+  offline, неизвестные/boot/system flags, неподтверждённый offline, сбой сразу после каждой
+  mutation phase и успешный новый полный цикл после cleanup. Persistent read-only проверяет
+  20 циклов по три диска, 20 login/logout, 19 минутных пауз и код `40`. Посторонние sessions,
+  системный диск и его буква сохраняются; configured letters/sync на неудачных попытках нет.
+- `ruff check src tests` — успешно. Первый `python -B -m pytest -q -p no:cacheprovider` дал
+  **132 passed, 1 failed**: после уже существующего commit `d2e6e27` тест release inventory
+  не учитывал `Set-SteamUpdateOnLaunch.ps1`, хотя текущий publish wildcard уже включает его.
+  Актуализирован только ожидаемый inventory/checksum fixture (8 assets). Steam utility и
+  publish workflow не менялись. Повтор той же команды на Python 3.12.4 — **133 passed** за
+  1.91 секунды; Ruff снова прошёл.
+- `docker compose -p iscsi-offline-online config --quiet` — успешно.
+  `docker compose -p iscsi-offline-online up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`.
+  Выполнены stage/activate, prepare reconciliation, wrong NAA, неуспешный offline/online с
+  полным retry и настоящей минутной паузой, writable observation и новый успешный offline/
+  online workaround без logout/нового prepare. Поведение write-protection моделирует harness,
+  а не production simulation setter. Выполнен `docker compose -p iscsi-offline-online down
+  --volumes`.
+
+### Ожидает стенда
+
+- Реальные Windows Storage/iSCSI cmdlets, write protection/NTFS и TrueNAS здесь не проверялись.
+  Пользователь сообщил об успешном ручном workaround; автоматический offline/online ещё
+  требует физической проверки по `TEST-PLAN.md`. Эффект цикла и причина read-only не считаются
+  доказанными mock-тестами. Новый Windows PowerShell 5.1 CI результат фиксируется после push.
+
 ## Steam: обновление установленных приложений при запуске — 2026-10-19
 
 - Добавлен самостоятельный `powershell/Set-SteamUpdateOnLaunch.ps1` с целевым
