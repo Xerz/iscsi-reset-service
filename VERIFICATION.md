@@ -52,6 +52,13 @@
   добавлены `/t 0` после трёх ошибок уведомления, блокировка 2001 в новом boot со старым
   snapshot и fresh Arm после boot без state-файла. Drova POST/reboot исключительно
   simulated. Выполнен `docker compose -p iscsi-shadow-watcher down --volumes`.
+- Первый GitHub Actions run `42673369945` для
+  `0312d0b273302784c07e7936109d25f796335d14`, attempts 1 и 2: Python и полный Compose
+  interaction — success; общий conclusion — failure, Windows job в API/check-runs/logs
+  отсутствует. Pester на Windows в этих попытках не запускался. Точная причина не сообщена
+  доступными API/публичной страницей, поэтому ошибка не считается падением Windows tests.
+  После двух попыток Windows job закреплён на поддерживаемом `windows-2022`; в шаг добавлена
+  явная проверка Major/Minor PowerShell 5.1. Runtime хотфикса не менялся.
 
 ### Ожидает стенда
 

@@ -23,7 +23,7 @@ jobs:
       - run: node tests/static_connection_presentations.test.mjs
 
   powershell-51:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - name: Install Pester 5.7.1
@@ -31,7 +31,12 @@ jobs:
         run: Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
       - name: Test with Windows PowerShell 5.1
         shell: powershell
-        run: Invoke-Pester .\powershell\tests -Output Detailed -CI
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+            throw "Windows PowerShell 5.1 is required for this job"
+          }
+          $PSVersionTable
+          Invoke-Pester .\powershell\tests -Output Detailed -CI
 
   interaction:
     runs-on: ubuntu-latest
