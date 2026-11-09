@@ -21,7 +21,7 @@ Describe "Disk watcher installer ownership and preservation" {
         if (Test-Path $InstallRoot) { Remove-Item $InstallRoot -Recurse -Force }
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
         Set-Content (Join-Path $InstallRoot "Reset-And-Connect.ps1") "original-reset"
-        foreach ($file in @("client.token", "egs-sync.json", "majestic-sync.json", "gta5rp-sync.json")) {
+        foreach ($file in @("client.token", "reset-ca.crt", "egs-sync.json", "majestic-sync.json", "gta5rp-sync.json")) {
             Set-Content (Join-Path $InstallRoot $file) "preserve-$file"
         }
         $ClientScriptPath = Join-Path $TestDrive "new-reset.ps1"
@@ -77,24 +77,25 @@ Describe "Disk watcher installer ownership and preservation" {
         $backups.Count | Should -Be 1
         (Get-Content $backups[0].FullName -Raw).Trim() | Should -Be "original-reset"
         (Get-Content (Join-Path $InstallRoot "Reset-And-Connect.ps1") -Raw) | Should -Match 'Invoke-ResetDiskWatcherHook'
-        foreach ($file in @("client.token", "egs-sync.json", "majestic-sync.json", "gta5rp-sync.json")) {
+        foreach ($file in @("client.token", "reset-ca.crt", "egs-sync.json", "majestic-sync.json", "gta5rp-sync.json")) {
             (Get-Content (Join-Path $InstallRoot $file) -Raw).Trim() | Should -Be "preserve-$file"
         }
         Should -Invoke Register-ScheduledTask -Times 2 -Exactly -ParameterFilter { $TaskPath -eq "\IscsiReset\" }
         Should -Invoke Register-ScheduledTask -Times 0 -Exactly -ParameterFilter { $TaskPath -ne "\IscsiReset\" }
         $config = Get-WatchConfig
         $config.enabled | Should -BeTrue
-        $config.installed_boot_id | Should -Be (Get-WatchBootId)
+        $config.PSObject.Properties.Name | Should -Not -Contain "installed_boot_id"
+        (Get-WatchState (Get-WatchBootId)).install_blocked | Should -BeTrue
         Should -Invoke Set-WatcherRestrictedAcl -ParameterFilter { $Path -eq $InstallRoot -and $Directory }
     }
 
-    It "updates idempotently while retaining the reboot budget" {
+    It "updates idempotently while retaining the current-boot session latch" {
         Invoke-DiskWatcherInstall
         $state = Get-WatchState (Get-WatchBootId)
-        $state.recent_reboots = @([pscustomobject]@{ id = "previous"; ticks = [string]([DateTime]::UtcNow.AddMinutes(-1).Ticks) })
+        $state.session_latched = $true
         Save-WatchState $state
         Invoke-DiskWatcherInstall
-        @((Get-WatchState (Get-WatchBootId)).recent_reboots).Count | Should -Be 1
+        (Get-WatchState (Get-WatchBootId)).session_latched | Should -BeTrue
         $script:InstallerOwnedTasks.Count | Should -Be 2
         Should -Invoke Register-ScheduledTask -Times 4 -Exactly
     }
@@ -121,7 +122,7 @@ Describe "Disk watcher installer ownership and preservation" {
         (Get-WatchConfig).enabled | Should -BeFalse
     }
 
-    It "uninstalls only its tasks/config and keeps protected client files and history" {
+    It "uninstalls only its tasks/config and keeps protected client files and runtime" {
         Invoke-DiskWatcherInstall
         $WatcherScriptPath = Join-Path $TestDrive "removed-source.ps1"
         $Uninstall = $true
@@ -134,27 +135,101 @@ Describe "Disk watcher installer ownership and preservation" {
         Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly -ParameterFilter { $TaskPath -ne "\IscsiReset\" }
     }
 
-    It "cancels its own accepted pending reboot before stopping tasks on uninstall" {
+    It "stops the old worker and cancels legacy ownership on uninstall=<Remove>" -TestCases @(
+        @{ Remove = $false }, @{ Remove = $true }
+    ) {
+        param($Remove)
         Invoke-DiskWatcherInstall
-        $state = Get-WatchState (Get-WatchBootId)
-        $state.pending = [pscustomobject]@{
-            id = "owned-reboot"; phase = "scheduled"; boot_id = $state.boot_id
-            deadline_ticks = [string]([DateTime]::UtcNow.AddSeconds(30).Ticks)
+        $legacy = @{
+            schema_version = 1; boot_id = (Get-WatchBootId); session_latched = $true
+            last_event_record = 100; recent_reboots = @("discard-history")
+            pending = @{
+                id = "owned-reboot"; phase = "scheduled"; boot_id = (Get-WatchBootId)
+                deadline_ticks = [string]([DateTime]::UtcNow.AddSeconds(30).Ticks)
+            }
         }
-        Save-WatchState $state
+        Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") $legacy
         $process = [pscustomobject]@{ ExitCode = 0 }
         $process | Add-Member ScriptMethod WaitForExit { param($timeout) return $true }
         $process | Add-Member ScriptMethod Dispose { }
         $script:InstallerShutdownProcess = $process
-        Mock Start-Process { return $script:InstallerShutdownProcess }
+        $script:OldWorkerStopped = $false
+        Mock Stop-ScheduledTask { $script:OldWorkerStopped = $true }
+        Mock Start-Process {
+            if (-not $script:OldWorkerStopped) { throw "worker was not stopped before legacy cancellation" }
+            return $script:InstallerShutdownProcess
+        }
         $script:InstallerOwnedTasks[0].State = "Running"
-        $Uninstall = $true
+        $Uninstall = $Remove
         Invoke-DiskWatcherInstall
         Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $ArgumentList -eq "/a" }
         Should -Invoke Stop-ScheduledTask -Times 1 -Exactly -ParameterFilter {
             $TaskName -eq "Disk Watcher" -and $TaskPath -eq "\IscsiReset\"
         }
-        (Get-WatchState (Get-WatchBootId)).pending | Should -BeNullOrEmpty
+        $state = Get-WatchState (Get-WatchBootId)
+        $state.schema_version | Should -Be 2
+        $state.session_latched | Should -BeTrue
+        $state.PSObject.Properties.Name | Should -Not -Contain "pending"
+        $state.PSObject.Properties.Name | Should -Not -Contain "recent_reboots"
+        Invoke-DiskWatcherInstall
+        Should -Invoke Start-Process -Times 1 -Exactly
+    }
+
+    It "never aborts an unconfirmed legacy reboot: <Case>" -TestCases @(
+        @{ Case = "previous-boot" }, @{ Case = "expired" }, @{ Case = "not-accepted" }, @{ Case = "missing" }
+    ) {
+        param($Case)
+        Invoke-DiskWatcherInstall
+        $legacy = @{
+            schema_version = 1; boot_id = (Get-WatchBootId); session_latched = $false; last_event_record = 0
+            pending = @{
+                id = "owned-reboot"; phase = "scheduled"; boot_id = (Get-WatchBootId)
+                deadline_ticks = [string]([DateTime]::UtcNow.AddSeconds(30).Ticks)
+            }
+        }
+        switch ($Case) {
+            "previous-boot" { $legacy.boot_id = [string]([long]$legacy.boot_id - 1) }
+            "expired" { $legacy.pending.deadline_ticks = [string]([DateTime]::UtcNow.AddSeconds(-1).Ticks) }
+            "not-accepted" { $legacy.pending.phase = "scheduling" }
+            "missing" { $legacy.pending = $null }
+        }
+        Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") $legacy
+        Mock Start-Process { throw "must not cancel" }
+        Invoke-DiskWatcherInstall
+        Should -Invoke Start-Process -Times 0 -Exactly
+    }
+
+    It "stops an interrupted legacy cancellation before copy and reconciles on retry" {
+        Invoke-DiskWatcherInstall
+        $legacy = @{
+            schema_version = 1; boot_id = (Get-WatchBootId); session_latched = $true; last_event_record = 100
+            pending = @{
+                id = "owned-reboot"; phase = "scheduled"; boot_id = (Get-WatchBootId)
+                deadline_ticks = [string]([DateTime]::UtcNow.AddSeconds(30).Ticks)
+            }
+        }
+        Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") $legacy
+        $process = [pscustomobject]@{ ExitCode = 0 }
+        $process | Add-Member ScriptMethod WaitForExit { param($timeout) return $true }
+        $process | Add-Member ScriptMethod Dispose { }
+        $script:InstallerShutdownProcess = $process
+        Mock Start-Process { return $script:InstallerShutdownProcess }
+        $script:RealInstallerWrite = ${function:Write-WatchJson}
+        $script:FailCancelSave = $true
+        Mock Write-WatchJson {
+            if ($Value.schema_version -eq 1 -and $Value.PSObject.Properties.Name -contains "pending" -and
+                $null -eq $Value.pending -and $script:FailCancelSave) {
+                $script:FailCancelSave = $false
+                throw "simulated failure immediately after cancellation"
+            }
+            & $script:RealInstallerWrite -Path $Path -Value $Value
+        }
+        { Invoke-DiskWatcherInstall } | Should -Throw "*after cancellation*"
+        @(Get-ChildItem $InstallRoot -Filter '*.bak').Count | Should -Be 1
+        $script:InstallerShutdownProcess.ExitCode = 1116 # Windows: no shutdown remains pending.
+        Invoke-DiskWatcherInstall
+        Should -Invoke Start-Process -Times 2 -Exactly
+        (Get-WatchState (Get-WatchBootId)).session_latched | Should -BeTrue
     }
 }
 

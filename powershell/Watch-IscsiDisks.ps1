@@ -15,7 +15,6 @@ $script:WatchSimulationPath = $SimulationPath
 $script:WatchTaskPath = "\IscsiReset\"
 $script:WatchTaskName = "Disk Watcher"
 $script:WatchBootCached = $null
-$script:WatchAcceptedPending = $null
 
 function Get-WatchPath {
     param([string]$Name)
@@ -110,34 +109,45 @@ function Invoke-WatchLocked {
 
 function Get-WatchConfig {
     $config = Read-WatchJson -Path (Get-WatchPath "disk-watchdog.json")
-    $installedBoot = [long]0
-    if ($config.schema_version -ne 1 -or $config.enabled -isnot [bool] -or
-        -not [long]::TryParse([string]$config.installed_boot_id, [ref]$installedBoot) -or
-        $installedBoot -le 0) { throw "Invalid watcher configuration" }
+    if ($config.schema_version -ne 1 -or $config.enabled -isnot [bool]) {
+        throw "Invalid watcher configuration"
+    }
     return $config
 }
 
 function Get-WatchState {
-    param([string]$BootId, [switch]$Initialize)
+    # Callers create/save runtime state under the shared state mutex. Nothing is required
+    # to survive a boot: shadow mode may restore an old file or remove it entirely.
+    param([string]$BootId)
     $path = Get-WatchPath "disk-watchdog-state.json"
+    $latched = $false
+    $lastRecord = 0
     if (Test-Path -LiteralPath $path) {
         $state = Read-WatchJson -Path $path
-        if ($state.schema_version -ne 1 -or $state.session_latched -isnot [bool] -or
-            $state.failures -lt 0 -or $null -eq $state.recent_reboots) { throw "Invalid watcher state" }
-        foreach ($entry in @($state.recent_reboots)) {
-            $ticks = [long]$entry.ticks
-            if ($ticks -le 0 -or $ticks -gt (Get-WatchNowTicks)) { throw "Invalid reboot history or clock" }
+        $storedBoot = [long]0
+        if (-not [long]::TryParse([string]$state.boot_id, [ref]$storedBoot) -or $storedBoot -le 0) {
+            throw "Invalid watcher boot identity"
         }
-        if ([string]$state.boot_id -eq $BootId) { return $state }
-        $history = @($state.recent_reboots)
-    } else {
-        if (-not $Initialize) { throw "Watcher state missing" }
-        $history = @()
+        if ([string]$state.boot_id -eq $BootId) {
+            if ($state.session_latched -isnot [bool] -or $state.last_event_record -lt 0) {
+                throw "Invalid watcher protection state"
+            }
+            if ($state.schema_version -eq 2) {
+                if ($state.install_blocked -isnot [bool] -or $state.reboot_requested -isnot [bool] -or
+                    $state.failures -lt 0) { throw "Invalid watcher state" }
+                return $state
+            }
+            if ($state.schema_version -ne 1) { throw "Unsupported watcher state" }
+            # Upgrade a current-boot v1 state disarmed, retaining its session protection.
+            $latched = $state.session_latched
+            $lastRecord = $state.last_event_record
+        }
     }
     return [pscustomobject]@{
-        schema_version = 1; boot_id = $BootId; session_latched = $false
-        arm = $null; pending = $null; incident = $null; failures = 0
-        recent_reboots = $history; last_event_record = 0; last_health = "waiting"
+        schema_version = 2; boot_id = $BootId; session_latched = $latched
+        install_blocked = $false; reboot_requested = $false
+        arm = $null; incident = $null; failures = 0
+        last_event_record = $lastRecord; last_health = "waiting"
     }
 }
 
@@ -210,49 +220,18 @@ function Add-WatchSimulationCommand {
 }
 
 function Invoke-WatchShutdown {
-    param([switch]$Cancel, [string]$Id)
+    param([string]$Id)
     if ($script:WatchSimulationPath) {
-        $name = if ($Cancel) { "reboot_aborted" } else { "reboot_scheduled" }
-        Add-WatchSimulationCommand -Name $name -Details @{ id = $Id; delay_seconds = 30 }
+        Add-WatchSimulationCommand -Name "reboot_requested" -Details @{ id = $Id; delay_seconds = 0 }
         return
     }
-    $arguments = if ($Cancel) { "/a" } else { "/r /f /t 30 /d p:4:1 /c `"iSCSI disk watcher $Id`"" }
+    $arguments = "/r /f /t 0 /d p:4:1 /c `"iSCSI disk watcher $Id`""
     $process = Start-Process -FilePath (Join-Path $env:SystemRoot "System32/shutdown.exe") `
         -ArgumentList $arguments -PassThru -WindowStyle Hidden -ErrorAction Stop
     try {
         if (-not $process.WaitForExit(5000)) { throw "Shutdown command timed out" }
-        if ($process.ExitCode -ne 0 -and -not ($Cancel -and $process.ExitCode -eq 1116)) {
-            throw "Shutdown command failed"
-        }
+        if ($process.ExitCode -ne 0) { throw "Shutdown command failed" }
     } finally { $process.Dispose() }
-}
-
-function Cancel-WatchPending {
-    param($State)
-    if ($null -ne $State.pending) {
-        if ($State.pending.phase -eq "scheduled" -and
-            [string]$State.pending.boot_id -eq [string]$State.boot_id -and
-            [long]$State.pending.deadline_ticks -gt (Get-WatchNowTicks)) {
-            Invoke-WatchShutdown -Cancel -Id $State.pending.id
-            Write-WatchLog "reboot_cancelled" @{ incident_id = $State.pending.id }
-        }
-        if ($null -ne $script:WatchAcceptedPending -and $script:WatchAcceptedPending.id -eq $State.pending.id) {
-            $script:WatchAcceptedPending = $null
-        }
-        $State.pending = $null
-    }
-}
-
-function Cancel-WatchAcceptedPending {
-    # This process personally observed acceptance; no state/event query is needed to cancel
-    # if protected storage becomes unreadable during the cancellation window.
-    if ($null -ne $script:WatchAcceptedPending) {
-        if ([long]$script:WatchAcceptedPending.deadline_ticks -gt (Get-WatchNowTicks)) {
-            Invoke-WatchShutdown -Cancel -Id $script:WatchAcceptedPending.id
-            Write-WatchLog "reboot_cancelled" @{ incident_id = $script:WatchAcceptedPending.id }
-        }
-        $script:WatchAcceptedPending = $null
-    }
 }
 
 function Stop-WatchTask {
@@ -262,49 +241,25 @@ function Stop-WatchTask {
 
 function Set-WatchSessionStarted {
     # This write must precede waiting for the state lock, including while HTTP is in flight.
-    $safeToStop = $false
     try {
         Write-WatchJson -Path (Get-WatchPath "disk-watchdog-session.json") -Value @{
             schema_version = 1; observed_utc_ticks = [string](Get-WatchNowTicks)
         }
         $bootId = Get-WatchBootId
-        $cached = Read-WatchJson (Get-WatchPath "disk-watchdog-state.json")
-        $cancelledId = ""
-        if ($cached.schema_version -eq 1 -and $null -ne $cached.pending -and
-            $cached.pending.phase -eq "scheduled" -and
-            [string]$cached.pending.boot_id -eq $bootId -and
-            [long]$cached.pending.deadline_ticks -gt (Get-WatchNowTicks)) {
-            Invoke-WatchShutdown -Cancel -Id $cached.pending.id
-            $cancelledId = [string]$cached.pending.id
-            Write-WatchLog "reboot_cancelled" @{ incident_id = $cancelledId }
-        }
         Invoke-WatchLocked {
             $state = Get-WatchState -BootId $bootId
             $state.session_latched = $true
             $state.arm = $null
-            if ($null -ne $state.pending -and $state.pending.id -eq $cancelledId) { $state.pending = $null }
-            Cancel-WatchPending $state
             Save-WatchState $state
             Write-WatchLog "session_latched"
         }
-        $safeToStop = $true
-    } finally {
-        if ($safeToStop) { Stop-WatchTask }
-        else {
-            # Let the resident worker cancel using its in-memory acceptance proof and exit
-            # on the fast latch/guard error. Killing it here could strand an accepted reboot.
-            Write-WatchLog "session_stop_deferred_to_worker"
-        }
-    }
+    } finally { Stop-WatchTask }
 }
 
 function Reset-WatchObservation {
-    param([string]$CancelledPendingId = "")
     $bootId = Get-WatchBootId
     Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
-        if ($null -ne $state.pending -and $state.pending.id -eq $CancelledPendingId) { $state.pending = $null }
-        Cancel-WatchPending $state
         $state.arm = $null; $state.failures = 0; $state.incident = $null
         Save-WatchState $state
         Write-WatchLog "reset_starting"
@@ -399,7 +354,7 @@ function Set-WatchArm {
     param($VerifiedSnapshot)
     $bootId = Get-WatchBootId
     $config = Get-WatchConfig
-    if (-not $config.enabled -or [string]$config.installed_boot_id -eq $bootId) { return }
+    if (-not $config.enabled) { return }
     $arm = [pscustomobject]@{
         boot_id = $bootId; generation = [Guid]::NewGuid().ToString("D")
         request_id = [string]$VerifiedSnapshot.request_id
@@ -411,23 +366,22 @@ function Set-WatchArm {
     Assert-WatchArm $arm $bootId
     $canArm = Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
-        $allowed = Test-WatchSessionAllowed $state
-        if (-not $allowed) { Cancel-WatchPending $state; $state.arm = $null }
+        $allowed = (Test-WatchSessionAllowed $state) -and -not $state.install_blocked -and -not $state.reboot_requested
+        if (-not $allowed) { $state.arm = $null }
         Save-WatchState $state
         return $allowed
     }
-    if (-not $canArm) { Write-WatchLog "arm_blocked_by_session"; return }
+    if (-not $canArm) { Write-WatchLog "arm_blocked"; return }
     if (-not (Test-WatchResetGeneration $arm)) { throw "Reset generation changed before arm" }
     if (-not (Get-WatchDiskHealth $arm).Healthy) { throw "Cannot arm an unhealthy disk set" }
     Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
-        if (-not (Test-WatchSessionAllowed $state)) {
-            Cancel-WatchPending $state
+        if (-not (Test-WatchSessionAllowed $state) -or $state.install_blocked -or $state.reboot_requested) {
+            $state.arm = $null
             Save-WatchState $state
             Write-WatchLog "arm_blocked_by_session"
             return
         }
-        Cancel-WatchPending $state
         $state.arm = $arm; $state.failures = 0; $state.incident = $null
         Save-WatchState $state
         Write-WatchLog "armed" @{ request_id = $arm.request_id; target_iqn = $arm.target_iqn; disk_unique_ids = $arm.disk_unique_ids }
@@ -440,16 +394,14 @@ function Test-WatchGenerationAllowed {
     return Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
         $config = Get-WatchConfig
-        $allowed = $config.enabled -and [string]$config.installed_boot_id -ne $bootId -and
+        $allowed = $config.enabled -and -not $state.install_blocked -and -not $state.reboot_requested -and
             $null -ne $state.arm -and [string]$state.arm.generation -eq $Generation
-        if (-not $config.enabled -or [string]$config.installed_boot_id -eq $bootId) {
-            Cancel-WatchPending $state; $state.arm = $null
-        }
+        if (-not $config.enabled -or $state.install_blocked) { $state.arm = $null }
         if ($allowed -and -not (Test-WatchResetGeneration $state.arm)) {
-            Cancel-WatchPending $state; $state.arm = $null; $allowed = $false
+            $state.arm = $null; $allowed = $false
         }
         if (-not (Test-WatchSessionAllowed $state)) {
-            Cancel-WatchPending $state; $state.arm = $null
+            $state.arm = $null
             $allowed = $false
         }
         Save-WatchState $state
@@ -523,56 +475,36 @@ function Send-WatchOfflineBatch {
 
 function Request-WatchReboot {
     param([string]$Generation)
-    if (-not (Test-WatchGenerationAllowed $Generation)) { return }
+    if (-not (Test-WatchGenerationAllowed $Generation)) { return $false }
     $bootId = Get-WatchBootId
     Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
-        if ($null -eq $state.arm -or $state.arm.generation -ne $Generation) { return }
-        if (-not (Test-WatchSessionAllowed $state)) {
-            Cancel-WatchPending $state; $state.arm = $null; Save-WatchState $state
-            return
-        }
-        if ($null -ne $state.pending) { return }
-        $now = Get-WatchNowTicks
-        $state.recent_reboots = @($state.recent_reboots | Where-Object {
-            [long]$_.ticks -gt $now - [TimeSpan]::FromHours(1).Ticks
-        })
-        if ($state.recent_reboots.Count -ge 3) {
-            $oldest = ($state.recent_reboots | Sort-Object { [long]$_.ticks } | Select-Object -First 1)
-            $state.incident.next_eligible_ticks = [string]([long]$oldest.ticks + [TimeSpan]::FromHours(1).Ticks)
-            Save-WatchState $state
-            Write-WatchLog "reboot_rate_limited" @{ incident_id = $state.incident.id }
-            return
+        $config = Get-WatchConfig
+        if (-not $config.enabled -or $state.install_blocked -or $state.reboot_requested -or
+            $null -eq $state.arm -or $state.arm.generation -ne $Generation) { return $false }
+        if (-not (Test-WatchSessionAllowed $state) -or -not (Test-WatchResetGeneration $state.arm)) {
+            $state.arm = $null; Save-WatchState $state
+            return $false
         }
         $id = $state.incident.id
-        $state.pending = [pscustomobject]@{
-            id = $id; boot_id = $bootId; phase = "scheduling"
-            deadline_ticks = [string]($now + [TimeSpan]::FromSeconds(30).Ticks)
-        }
-        # Reserve before the command: a crash after acceptance must not erase the budget.
-        $state.recent_reboots = @($state.recent_reboots) + @([pscustomobject]@{ id = $id; ticks = [string]$now })
+        # Persist intent before the command: there is no cancellable phase after /t 0.
+        $state.reboot_requested = $true
         Save-WatchState $state
-        $accepted = $false
         try {
-            if ((Test-WatchFastLatch $bootId) -or -not (Test-WatchResetGeneration $state.arm)) {
-                throw "Watcher was disarmed before shutdown"
+            Write-WatchLog "reboot_request_prepared" @{ incident_id = $id; delay_seconds = 0 }
+            if (-not (Test-WatchSessionAllowed $state) -or -not (Test-WatchResetGeneration $state.arm) -or
+                (Test-WatchFastLatch $bootId)) {
+                $state.reboot_requested = $false; $state.arm = $null; Save-WatchState $state
+                Write-WatchLog "reboot_blocked"
+                return $false
             }
             Invoke-WatchShutdown -Id $id
-            $accepted = $true
-            $state.pending.phase = "scheduled"
-            $script:WatchAcceptedPending = $state.pending
-            Save-WatchState $state
-            if ((Test-WatchFastLatch $bootId) -or -not (Test-WatchResetGeneration $state.arm)) {
-                if (Test-WatchFastLatch $bootId) { $state.session_latched = $true }
-                $state.arm = $null
-                Cancel-WatchPending $state; Save-WatchState $state
-            } else { Write-WatchLog "reboot_scheduled" @{ incident_id = $id; delay_seconds = 30 } }
+            Write-WatchLog "reboot_accepted" @{ incident_id = $id; delay_seconds = 0 }
+            return $true
         } catch {
-            if ($accepted) { Cancel-WatchAcceptedPending }
-            $state.pending = $null
-            if (-not $accepted) { $state.recent_reboots = @($state.recent_reboots | Where-Object id -ne $id) }
+            $state.reboot_requested = $false
             Save-WatchState $state
-            throw "Reboot scheduling failed"
+            throw "Reboot request failed"
         }
     }
 }
@@ -580,28 +512,28 @@ function Request-WatchReboot {
 function Invoke-WatchTick {
     $bootId = Get-WatchBootId
     $config = Get-WatchConfig
-    if (-not $config.enabled -or [string]$config.installed_boot_id -eq $bootId) {
+    if (-not $config.enabled) {
         Invoke-WatchLocked {
             $state = Get-WatchState -BootId $bootId
-            Cancel-WatchPending $state; $state.arm = $null; Save-WatchState $state
+            $state.arm = $null; Save-WatchState $state
         }
         return "waiting"
     }
     $observation = Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
-        if ($null -eq $state.pending) { $script:WatchAcceptedPending = $null }
         if (-not (Test-WatchSessionAllowed $state)) {
-            Cancel-WatchPending $state; $state.arm = $null; Save-WatchState $state
-            return [pscustomobject]@{ arm = $null; stopped = $true; pending = $false }
+            $state.arm = $null; Save-WatchState $state
+            return [pscustomobject]@{ arm = $null; stopped = $true; requested = $false }
         }
+        if ($state.install_blocked) { $state.arm = $null }
         if ($null -ne $state.arm -and -not (Test-WatchResetGeneration $state.arm)) {
-            Cancel-WatchPending $state; $state.arm = $null; $state.failures = 0; $state.incident = $null
+            $state.arm = $null; $state.failures = 0; $state.incident = $null
         }
         Save-WatchState $state
-        return [pscustomobject]@{ arm = $state.arm; stopped = $false; pending = $null -ne $state.pending }
+        return [pscustomobject]@{ arm = $state.arm; stopped = $false; requested = $state.reboot_requested }
     }
     if ($observation.stopped) { return "stopped" }
-    if ($observation.pending) { return "pending" }
+    if ($observation.requested) { return "reboot_requested" }
     $arm = $observation.arm
     if ($null -eq $arm) {
         return "waiting"
@@ -611,7 +543,7 @@ function Invoke-WatchTick {
     $decision = Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
         if ($null -eq $state.arm -or $state.arm.generation -ne $arm.generation) { return "waiting" }
-        if ($null -ne $state.pending) { return "pending" }
+        if ($state.reboot_requested) { return "reboot_requested" }
         if ($null -eq $health) {
             $state.failures = 0; Set-WatchHealthState $state "unknown"
             Save-WatchState $state; return "unknown"
@@ -628,12 +560,9 @@ function Invoke-WatchTick {
         Set-WatchHealthState $state "failed"
         if ($null -eq $state.incident) {
             $state.incident = [pscustomobject]@{
-                id = [Guid]::NewGuid().ToString("D"); notified = $false; next_eligible_ticks = "0"
+                id = [Guid]::NewGuid().ToString("D"); notified = $false
             }
             Write-WatchLog "disk_failure_confirmed" @{ faults = $health.Faults; request_id = $arm.request_id }
-        }
-        if ($state.incident.notified -and [long]$state.incident.next_eligible_ticks -gt (Get-WatchNowTicks)) {
-            Save-WatchState $state; return "rate_limited"
         }
         Save-WatchState $state
         if ($state.incident.notified) { return "reboot" }
@@ -652,7 +581,9 @@ function Invoke-WatchTick {
                 }
             }
         }
-        Request-WatchReboot $arm.generation
+        if (Request-WatchReboot $arm.generation) { return "reboot_requested" }
+        if ((Get-WatchState -BootId $bootId).session_latched) { return "stopped" }
+        return "waiting"
     }
     return $decision
 }
@@ -669,14 +600,11 @@ function Invoke-WatchMain {
             try { $result = Invoke-WatchTick }
             catch {
                 Write-WatchLog "watcher_guard_error"
-                $cancelledId = if ($null -ne $script:WatchAcceptedPending) { [string]$script:WatchAcceptedPending.id } else { "" }
-                try { Cancel-WatchAcceptedPending } catch { $cancelledId = "" }
-                try { Reset-WatchObservation -CancelledPendingId $cancelledId } catch { }
+                try { Reset-WatchObservation } catch { }
                 return
             }
-            if ($result -eq "stopped") { return }
-            $delay = if ($result -eq "pending") { 1 } else { 5 }
-            Wait-WatchSeconds $delay
+            if ($result -in @("stopped", "reboot_requested")) { return }
+            Wait-WatchSeconds 5
         }
     } finally {
         if ($acquired) { $mutex.ReleaseMutex() }

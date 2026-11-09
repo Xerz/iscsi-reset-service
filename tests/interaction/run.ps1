@@ -359,9 +359,9 @@ $watchBoot = [DateTime]::UtcNow.AddMinutes(-10).Ticks
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $watchWindows
 . "/suite/powershell/Watch-IscsiDisks.ps1" -InstallRoot $watchRoot -SimulationPath $watchWindows -NoMain
 Write-WatchJson (Get-WatchPath "disk-watchdog.json") @{
-    schema_version = 1; enabled = $true; installed_boot_id = [string]($watchBoot - 1)
+    schema_version = 1; enabled = $true
 }
-Save-WatchState (Get-WatchState -BootId ([string]$watchBoot) -Initialize)
+Save-WatchState (Get-WatchState -BootId ([string]$watchBoot))
 Set-WatchArm ([pscustomobject]@{
     reset_id = ""; request_id = "compose-reset"; target_iqn = "watch-target"
     session_identifier = "watch-session"; disk_unique_ids = @("aaa", "bbb", "ccc")
@@ -374,14 +374,36 @@ Write-WatchJson $watchWindows $watchState
 1..3 | ForEach-Object { $null = Invoke-WatchTick; Wait-WatchSeconds 5 }
 $watchState = Read-WatchSimulation
 if (@($watchState.commands | Where-Object name -eq "report_offline").Count -ne 3 -or
-    @($watchState.commands | Where-Object name -eq "reboot_scheduled").Count -ne 1) {
+    @($watchState.commands | Where-Object name -eq "reboot_requested").Count -ne 1 -or
+    ($watchState.commands | Where-Object name -eq "reboot_requested").details.delay_seconds -ne 0) {
     throw "Watcher did not preserve the three-report failure/reboot policy"
 }
-Set-WatchSessionStarted
+# A shadow-restored previous-boot snapshot cannot arm a new boot; current-boot 2001 blocks it.
+$watchState.boot_id = [string]([long]$watchState.now_utc_ticks + [TimeSpan]::FromSeconds(1).Ticks)
+$watchState.now_utc_ticks = [string]([long]$watchState.boot_id + [TimeSpan]::FromSeconds(1).Ticks)
+$watchState.session_started = $true
+Write-WatchJson $watchWindows $watchState
+Set-WatchArm ([pscustomobject]@{
+    reset_id = ""; request_id = "compose-reset-2"; target_iqn = "watch-target"
+    session_identifier = "watch-session"; disk_unique_ids = @("aaa", "bbb", "ccc")
+})
+if ((Invoke-WatchTick) -ne "stopped") { throw "Current-boot Esme 2001 did not block monitoring" }
+# Missing runtime files after another shadow reboot are recreated disarmed.
 $watchState = Read-WatchSimulation
-if ((Invoke-WatchTick) -ne "stopped" -or
-    @($watchState.commands | Where-Object name -eq "reboot_aborted").Count -ne 1) {
-    throw "Esme 2001 did not cancel the watcher's pending reboot"
+$watchState.boot_id = [string]([long]$watchState.now_utc_ticks + [TimeSpan]::FromSeconds(1).Ticks)
+$watchState.now_utc_ticks = [string]([long]$watchState.boot_id + [TimeSpan]::FromSeconds(1).Ticks)
+$watchState.session_started = $false
+$watchState.disks[2].is_offline = $false
+Write-WatchJson $watchWindows $watchState
+Remove-Item (Get-WatchPath "disk-watchdog-state.json")
+if ((Invoke-WatchTick) -ne "waiting") { throw "Missing shadow runtime state was not recreated disarmed" }
+Set-WatchArm ([pscustomobject]@{
+    reset_id = ""; request_id = "compose-reset-3"; target_iqn = "watch-target"
+    session_identifier = "watch-session"; disk_unique_ids = @("aaa", "bbb", "ccc")
+})
+if ((Invoke-WatchTick) -ne "healthy" -or
+    @((Read-WatchSimulation).commands | Where-Object name -eq "reboot_requested").Count -ne 1) {
+    throw "Fresh reset did not rearm healthy disks after shadow reboot"
 }
 
 Write-Host "Interaction suite passed"

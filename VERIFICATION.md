@@ -1,6 +1,70 @@
 # Verification record
 
-## Вотчер iSCSI-дисков с защитой игровой сессии — 2026-11-09
+## Мгновенный reboot и shadow-состояние одной загрузки — 2026-11-09
+
+### Реализация
+
+- Обычный вотчер вызывает `shutdown /r /f /t 0` после пакета уведомлений и финальной проверки
+  esme/2001. Удалены 30-секундное окно, pending/cancel logic, in-memory acceptance proof,
+  скользящий часовой лимит и история между загрузками. После принятия мгновенного reboot
+  отмена не предусматривается. Intent сохраняется перед командой; после принятия worker
+  завершается и не дублирует POST/reboot при повторном запуске в той же загрузке.
+- Runtime state версии 2 принадлежит одному boot. Отсутствующее состояние создаётся под
+  mutex выключенным; shadow-restored старый boot отбрасывается до проверки его obsolete
+  history/arm/pending. Старые session/reset markers не разрешают наблюдение без свежего
+  успешного Reset. Текущий 2001, в том числе исторический, блокирует повторный Arm;
+  повреждённая защита или недоступный журнал запрещают запрос reboot.
+- Первый запуск после установки по-прежнему разрешён только в следующем boot после
+  успешного Reset. Install block находится в runtime state, конфигурация включения остаётся
+  версии 1 без обязательного `installed_boot_id`. Установка, задачи, скрипты и enabled config
+  должны быть зафиксированы в базовом образе; runtime/logs не требуют shadow exclusions.
+- При обновлении/удалении installer под общим mutex останавливает старые задачи. Единственный
+  `/a` находится в legacy migration: требуется v1 state, текущий boot, принятая фаза и
+  неистёкшее окно собственного назначения. Сохраняются latch этой загрузки, backup Reset,
+  token/certificate/sync и существующие Reset/Drova-задачи. История reboot не переносится.
+- Сохранены период 5 секунд, три наблюдения отказа, точные target/session/NAA, отсутствие disk
+  mutations, Registry64 Drova и три POST с timeout 10 секунд/паузами 5 секунд. Startup
+  workaround и публичные параметры Reset/API не изменялись; integration error warning-only.
+
+### Автоматические проверки
+
+- Parser всех `.ps1`, затем `Invoke-Pester /suite/powershell/tests -Output Detailed -CI`:
+  **284 passed, 0 failed, 3 skipped** из 287 за 38.84 секунды, exit code `0`. Окружение:
+  macOS/Apple Silicon, Docker Linux/amd64 `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`,
+  PowerShell 7.5.0 / Ubuntu 24.04.1 LTS, Pester 5.7.1; source read-only, network disabled,
+  working directory `/tmp`. Windows ACL (два теста) и Transactional Registry пропущены;
+  этот запуск не является Windows PowerShell 5.1.
+- Трёхтомные cases проверяют healthy/offline/missing/session loss/foreign disk/query error,
+  exact `/r /f /t 0` и отсутствие дополнительной паузы; шесть boot с отказами за час как без
+  runtime-файлов, так и с восстановленным старым shadow-снимком. Проверены 2001 до Arm,
+  во время POST и перед native command; отсутствие отмены после принятия, повреждение защиты
+  во время POST, потеря state при текущем latch/history, атомарный intent до команды и retry
+  без второго POST. Legacy tests покрывают update/uninstall, отсутствие права на `/a` у
+  старого boot/истёкшего/непринятого/missing назначения и сбой сразу после отмены с повтором.
+- `ruff check src tests` — успешно. `python -B -m pytest -q -p no:cacheprovider` на Python
+  3.12.4 — **133 passed** за 1.66 секунды. `git diff --check`,
+  `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose -p iscsi-shadow-watcher config --quiet` и
+  `docker compose -p iscsi-shadow-watcher up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`.
+  Полный API/stage/activate/prepare/reset interaction и симуляция трёх томов сохранены;
+  добавлены `/t 0` после трёх ошибок уведомления, блокировка 2001 в новом boot со старым
+  snapshot и fresh Arm после boot без state-файла. Drova POST/reboot исключительно
+  simulated. Выполнен `docker compose -p iscsi-shadow-watcher down --volumes`.
+
+### Ожидает стенда
+
+- Настоящие shadow rollback/фиксация базового образа, SYSTEM/Task Scheduler startup,
+  Storage/iSCSI/TrueNAS/NTFS, historical/live Esme, Registry64 Drova credentials, реальные
+  POST и `/t 0` не проверялись. Автоматические tests не отправляют реальный report-offline
+  и не перезагружают Windows. Физические сценарии обновлены в TEST-PLAN.
+- Причина самопроизвольного offline и эффект прежнего offline/online workaround остаются
+  отдельными ожидающими стендовыми проверками.
+
+## Предыдущая версия вотчера с окном отмены — 2026-11-09
+
+Историческая запись: `/t 30` и межзагрузочный лимит ниже заменены текущей реализацией выше.
 
 ### Реализация
 

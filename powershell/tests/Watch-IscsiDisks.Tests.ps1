@@ -9,8 +9,9 @@ BeforeAll {
         return ,@((Read-WatchSimulation).commands | Where-Object name -eq $Name)
     }
     function Arm-TestWatch {
+        Write-WatchJson (Get-WatchPath "disk-watchdog-reset.json") @{ schema_version = 1; reset_id = "test-reset" }
         Set-WatchArm -VerifiedSnapshot ([pscustomobject]@{
-            request_id = "reset-test"; reset_id = ""; target_iqn = "own-target"
+            request_id = "reset-test"; reset_id = "test-reset"; target_iqn = "own-target"
             session_identifier = "own-session"; disk_unique_ids = @("0xAAA", " bbb ", "ccc")
         })
     }
@@ -27,7 +28,6 @@ BeforeAll {
 
 Describe "iSCSI disk watcher safety state machine" {
     BeforeEach {
-        $script:WatchAcceptedPending = $null
         $script:WatchRoot = Join-Path $TestDrive "watcher"
         if (Test-Path $script:WatchRoot) { Remove-Item $script:WatchRoot -Recurse -Force }
         New-Item -ItemType Directory -Path (Join-Path $script:WatchRoot "logs") -Force | Out-Null
@@ -46,28 +46,28 @@ Describe "iSCSI disk watcher safety state machine" {
             commands = @(); report_status_codes = @(200)
         })
         Write-WatchJson (Get-WatchPath "disk-watchdog.json") @{
-            schema_version = 1; enabled = $true; installed_boot_id = [string]($boot - 1)
+            schema_version = 1; enabled = $true
         }
-        Save-WatchState (Get-WatchState -BootId ([string]$boot) -Initialize)
+        Save-WatchState (Get-WatchState -BootId ([string]$boot))
     }
 
     It "waits for a successful reset snapshot and ignores foreign offline disks" {
         Invoke-WatchTick | Should -Be "waiting"
         Arm-TestWatch
         1..4 | ForEach-Object { Invoke-WatchTick | Should -Be "healthy" }
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
         (Get-TestWatchCommands "report_offline").Count | Should -Be 0
     }
 
     It "does not activate in the installation boot" {
-        $config = Get-WatchConfig
-        $config.installed_boot_id = Get-WatchBootId
-        Write-WatchJson (Get-WatchPath "disk-watchdog.json") $config
+        $state = Get-WatchState (Get-WatchBootId)
+        $state.install_blocked = $true
+        Save-WatchState $state
         Arm-TestWatch
         Fail-TestWatchDisk
         Confirm-TestWatchFailure
         (Get-WatchState (Get-WatchBootId)).arm | Should -BeNullOrEmpty
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
     It "requires three observations for <Fault> and sends one incident report" -TestCases @(
@@ -87,11 +87,13 @@ Describe "iSCSI disk watcher safety state machine" {
         Invoke-WatchTick | Should -Be "suspect"
         (Get-TestWatchCommands "report_offline").Count | Should -Be 0
         Wait-WatchSeconds 5
-        Invoke-WatchTick | Should -Be "notify"
-        Invoke-WatchTick | Should -Be "pending"
+        $before = Get-WatchNowTicks
+        Invoke-WatchTick | Should -Be "reboot_requested"
+        (Get-WatchNowTicks) | Should -Be $before
+        Invoke-WatchTick | Should -Be "reboot_requested"
         (Get-TestWatchCommands "report_offline").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_scheduled")[0].details.delay_seconds | Should -Be 30
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested")[0].details.delay_seconds | Should -Be 0
     }
 
     It "resets the failure counter after recovery or a storage query error" {
@@ -111,7 +113,7 @@ Describe "iSCSI disk watcher safety state machine" {
         Invoke-WatchTick | Should -Be "healthy"
         Fail-TestWatchDisk
         Invoke-WatchTick | Should -Be "suspect"
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
     It "treats ambiguous NAA as an observation error" {
@@ -136,24 +138,22 @@ Describe "iSCSI disk watcher safety state machine" {
         (Get-WatchState (Get-WatchBootId)).arm | Should -BeNullOrEmpty
     }
 
-    It "cancels its queued reboot on 2001 and stops its task" {
+    It "stops on 2001 before reboot and cannot rearm after another reset" {
         Arm-TestWatch
         Fail-TestWatchDisk
-        Confirm-TestWatchFailure
+        Invoke-WatchTick | Out-Null
+        Invoke-WatchTick | Out-Null
         Set-WatchSessionStarted
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
         (Get-TestWatchCommands "watcher_stopped").Count | Should -Be 1
         Invoke-WatchTick | Should -Be "stopped"
+        Reset-WatchObservation
         Arm-TestWatch
         Invoke-WatchTick | Should -Be "stopped"
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
+        (Get-TestWatchCommands "report_offline").Count | Should -Be 0
     }
 
-    It "never aborts a reboot without an owned accepted pending record" {
-        Arm-TestWatch
-        Set-WatchSessionStarted
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 0
-    }
+
 
     It "gives 2001 priority while report-offline is in flight" {
         Arm-TestWatch
@@ -164,7 +164,7 @@ Describe "iSCSI disk watcher safety state machine" {
         }
         Confirm-TestWatchFailure
         (Get-TestWatchCommands "report_offline").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
     It "checks 2001 again after reporting and before scheduling" {
@@ -177,24 +177,41 @@ Describe "iSCSI disk watcher safety state machine" {
             return $true
         }
         Confirm-TestWatchFailure
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "cancels if the fast latch is written during shutdown acceptance" {
+    It "checks <Protection> after preparing intent and immediately before shutdown" -TestCases @(
+        @{ Protection = "fast_latch" }, @{ Protection = "event_history" }
+    ) {
+        param($Protection)
         Arm-TestWatch
         Fail-TestWatchDisk
-        Mock Invoke-WatchShutdown {
-            if ($Cancel) { Add-WatchSimulationCommand "reboot_aborted" }
-            else {
-                Add-WatchSimulationCommand "reboot_scheduled"
+        $script:FinalProtection = $Protection
+        Mock Write-WatchLog {
+            if ($script:FinalProtection -eq "fast_latch") {
                 Write-WatchJson (Get-WatchPath "disk-watchdog-session.json") @{
                     schema_version = 1; observed_utc_ticks = [string](Get-WatchNowTicks)
                 }
+            } else {
+                $windows = Read-WatchSimulation
+                $windows.session_started = $true
+                Save-TestWatchWindows $windows
             }
-        }
+        } -ParameterFilter { $Event -eq "reboot_request_prepared" }
         Confirm-TestWatchFailure
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
         (Get-WatchState (Get-WatchBootId)).session_latched | Should -BeTrue
+    }
+
+    It "never attempts cancellation after an immediate reboot was accepted" {
+        Arm-TestWatch
+        Fail-TestWatchDisk
+        Confirm-TestWatchFailure
+        Mock Start-Process { throw "unexpected native command" }
+        Set-WatchSessionStarted
+        Invoke-WatchTick | Should -Be "stopped"
+        Should -Invoke Start-Process -Times 0 -Exactly
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 1
     }
 
     It "reboots after three failed reports without logging sensitive failures" {
@@ -206,74 +223,89 @@ Describe "iSCSI disk watcher safety state machine" {
         }
         Confirm-TestWatchFailure
         Should -Invoke Invoke-WatchOfflinePost -Times 3 -Exactly
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 1
         Get-Content (Get-WatchPath "logs/disk-watchdog.jsonl") -Raw | Should -Not -Match 'secret-token|HTTP headers'
     }
 
-    It "does not cancel someone else's shutdown when its scheduling command fails" {
+    It "fails without cancellation if the immediate reboot command fails" {
         Arm-TestWatch
         Fail-TestWatchDisk
         Mock Invoke-WatchShutdown { throw "another reboot is already pending" }
+        Mock Start-Process { throw "unexpected cancellation" }
         Invoke-WatchTick | Out-Null
         Invoke-WatchTick | Out-Null
-        { Invoke-WatchTick } | Should -Throw "*scheduling failed*"
-        Should -Invoke Invoke-WatchShutdown -Times 0 -Exactly -ParameterFilter { $Cancel }
-        @((Get-WatchState (Get-WatchBootId)).recent_reboots).Count | Should -Be 0
+        { Invoke-WatchTick } | Should -Throw "*Reboot request failed*"
+        Should -Invoke Invoke-WatchShutdown -Times 1 -Exactly
+        Should -Invoke Start-Process -Times 0 -Exactly
+        (Get-WatchState (Get-WatchBootId)).reboot_requested | Should -BeFalse
     }
 
-    It "cancels acceptance if persisting the scheduled phase fails and can reconcile" {
+    It "does not issue shutdown before intent is durable and can retry without another POST" {
         Arm-TestWatch
         Fail-TestWatchDisk
         $script:RealSaveWatchState = ${function:Save-WatchState}
-        $script:FailScheduledSave = $true
+        $script:FailIntentSave = $true
         Mock Save-WatchState {
-            if ($null -ne $State.pending -and $State.pending.phase -eq "scheduled" -and $script:FailScheduledSave) {
-                $script:FailScheduledSave = $false
-                throw "simulated failure immediately after native acceptance"
+            if ($State.reboot_requested -and $script:FailIntentSave) {
+                $script:FailIntentSave = $false
+                throw "simulated failure before native command"
             }
             & $script:RealSaveWatchState $State
         }
         Invoke-WatchTick | Out-Null
         Invoke-WatchTick | Out-Null
-        { Invoke-WatchTick } | Should -Throw "*scheduling failed*"
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
-        (Get-WatchState (Get-WatchBootId)).pending | Should -BeNullOrEmpty
-        Invoke-WatchTick | Should -Be "reboot"
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 2
+        { Invoke-WatchTick } | Should -Throw "*before native command*"
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
+        Invoke-WatchTick | Should -Be "reboot_requested"
+        Invoke-WatchMain # A restarted worker must not duplicate accepted intent.
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 1
         (Get-TestWatchCommands "report_offline").Count | Should -Be 1
     }
 
-    It "persists the hourly limit across boots, reports once, and retries when it expires" {
-        $state = Get-WatchState (Get-WatchBootId)
-        $now = Get-WatchNowTicks
-        $state.recent_reboots = @(10, 20, 30 | ForEach-Object {
-            [pscustomobject]@{ id = "old-$_"; ticks = [string]($now - [TimeSpan]::FromMinutes($_).Ticks) }
-        })
-        Save-WatchState $state
-        $windows = Read-WatchSimulation
-        $windows.boot_id = [string]([long]$windows.boot_id + [TimeSpan]::FromMinutes(1).Ticks)
-        Save-TestWatchWindows $windows
+    It "allows six reboots within an hour with <Runtime> runtime files" -TestCases @(
+        @{ Runtime = "missing" }, @{ Runtime = "shadow-restored" }
+    ) {
+        param($Runtime)
         Arm-TestWatch
-        Fail-TestWatchDisk
-        Confirm-TestWatchFailure
-        1..5 | ForEach-Object { Invoke-WatchTick | Should -Be "rate_limited" }
-        (Get-TestWatchCommands "report_offline").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
-        Wait-WatchSeconds 1900
-        Invoke-WatchTick | Should -Be "reboot"
-        (Get-TestWatchCommands "report_offline").Count | Should -Be 1
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 1
-        @((Get-WatchState (Get-WatchBootId)).recent_reboots).Count | Should -Be 3
+        $oldArm = (Get-WatchState (Get-WatchBootId)).arm
+        Set-WatchSessionStarted
+        $baseline = Read-WatchJson (Get-WatchPath "disk-watchdog-state.json")
+        $baseline.arm = $oldArm
+        $baseline.install_blocked = $true
+        $oldLatch = Read-WatchJson (Get-WatchPath "disk-watchdog-session.json")
+        foreach ($number in 1..6) {
+            $windows = Read-WatchSimulation
+            $windows.boot_id = [string]([long]$windows.now_utc_ticks + [TimeSpan]::FromMinutes(1).Ticks)
+            $windows.now_utc_ticks = [string]([long]$windows.boot_id + [TimeSpan]::FromMinutes(1).Ticks)
+            $windows.disks[0].is_offline = $false
+            Save-TestWatchWindows $windows
+            foreach ($file in @("disk-watchdog-state.json", "disk-watchdog-session.json", "disk-watchdog-reset.json")) {
+                Remove-Item (Get-WatchPath $file) -ErrorAction SilentlyContinue
+            }
+            if ($Runtime -eq "shadow-restored") {
+                Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") $baseline
+                Write-WatchJson (Get-WatchPath "disk-watchdog-session.json") $oldLatch
+                Write-WatchJson (Get-WatchPath "disk-watchdog-reset.json") @{ schema_version = 1; reset_id = "old-reset" }
+            }
+            Invoke-WatchTick | Should -Be "waiting"
+            (Get-TestWatchCommands "reboot_requested").Count | Should -Be ($number - 1)
+            Arm-TestWatch
+            Fail-TestWatchDisk
+            Confirm-TestWatchFailure
+            Invoke-WatchMain
+            (Get-TestWatchCommands "reboot_requested").Count | Should -Be $number
+            (Get-TestWatchCommands "report_offline").Count | Should -Be $number
+        }
     }
 
     It "invalidates the old arm before intentional reset mutations" {
         Arm-TestWatch
         Fail-TestWatchDisk
-        Confirm-TestWatchFailure
+        Invoke-WatchTick | Out-Null
+        Invoke-WatchTick | Out-Null
         Write-WatchJson (Get-WatchPath "disk-watchdog-reset.json") @{ schema_version = 1; reset_id = "new-reset" }
         Invoke-WatchTick | Should -Be "waiting"
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
     It "waits rather than exiting if Reset starts during the report" {
@@ -283,7 +315,7 @@ Describe "iSCSI disk watcher safety state machine" {
         Invoke-WatchTick | Out-Null
         Invoke-WatchTick | Out-Null
         Invoke-WatchTick | Should -Be "waiting"
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
         $windows = Read-WatchSimulation
         $windows.disks[0].is_offline = $false
         Save-TestWatchWindows $windows
@@ -291,7 +323,7 @@ Describe "iSCSI disk watcher safety state machine" {
         Invoke-WatchTick | Should -Be "healthy"
     }
 
-    It "ignores previous-boot arms and latches while keeping reboot history" {
+    It "ignores previous-boot arms and latches" {
         Arm-TestWatch
         Set-WatchSessionStarted
         $windows = Read-WatchSimulation
@@ -311,65 +343,96 @@ Describe "iSCSI disk watcher safety state machine" {
         Arm-TestWatch
         Set-Content -LiteralPath (Get-WatchPath $File) -Value 'broken-json'
         { Invoke-WatchTick } | Should -Throw
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "cancels its accepted reboot if <File> becomes unreadable during the window" -TestCases @(
+    It "does not reboot if <File> becomes unreadable during the POST" -TestCases @(
         @{ File = "disk-watchdog-state.json" }, @{ File = "disk-watchdog-session.json" },
         @{ File = "disk-watchdog.json" }
     ) {
         param($File)
         Arm-TestWatch
         Fail-TestWatchDisk
-        Confirm-TestWatchFailure
-        Set-Content -LiteralPath (Get-WatchPath $File) -Value 'broken-json'
+        $script:BreakWatchFile = $File
+        Mock Invoke-WatchOfflinePost {
+            Set-Content -LiteralPath (Get-WatchPath $script:BreakWatchFile) -Value 'broken-json'
+        }
         Invoke-WatchMain
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "does not kill the worker before it can cancel when the stopper cannot read state" {
+    It "stops the task even if session handling cannot read the current state" {
         Arm-TestWatch
-        Fail-TestWatchDisk
-        Confirm-TestWatchFailure
         Set-Content -LiteralPath (Get-WatchPath "disk-watchdog-state.json") -Value 'broken-json'
         { Set-WatchSessionStarted } | Should -Throw
-        (Get-TestWatchCommands "watcher_stopped").Count | Should -Be 0
+        (Get-TestWatchCommands "watcher_stopped").Count | Should -Be 1
         Invoke-WatchMain
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "does not abort a previous-boot pending record when 2001 arrives in a new boot" {
+    It "ignores old v1 state before validating removed history or ownership" {
+        $oldBoot = [string]([long](Get-WatchBootId) - [TimeSpan]::FromMinutes(1).Ticks)
+        Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") @{
+            schema_version = 1; boot_id = $oldBoot; session_latched = $true
+            arm = "stale-arm"; recent_reboots = @(@{ ticks = "future-or-invalid" })
+            pending = @{ phase = "scheduled"; boot_id = $oldBoot; deadline_ticks = "irrelevant" }
+        }
+        Invoke-WatchTick | Should -Be "waiting"
         Arm-TestWatch
-        Fail-TestWatchDisk
-        Confirm-TestWatchFailure
-        $windows = Read-WatchSimulation
-        $windows.boot_id = [string]([long]$windows.now_utc_ticks + [TimeSpan]::FromSeconds(1).Ticks)
-        $windows.now_utc_ticks = [string]([long]$windows.boot_id + [TimeSpan]::FromSeconds(1).Ticks)
-        Save-TestWatchWindows $windows
-        $script:WatchAcceptedPending = $null # A new process after boot has no acceptance cache.
-        Set-WatchSessionStarted
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 0
-        (Get-WatchState (Get-WatchBootId)).session_latched | Should -BeTrue
+        Invoke-WatchTick | Should -Be "healthy"
+        (Get-WatchState (Get-WatchBootId)).schema_version | Should -Be 2
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "does not reset the budget when state disappears" {
+    It "migrates current-boot v1 protection but discards legacy reboot history" {
+        $legacy = @{
+            schema_version = 1; boot_id = (Get-WatchBootId); session_latched = $true
+            last_event_record = 100; recent_reboots = @("irrelevant-history"); pending = $null
+        }
+        Write-WatchJson (Get-WatchPath "disk-watchdog-state.json") $legacy
         Arm-TestWatch
+        Invoke-WatchTick | Should -Be "stopped"
+        $state = Get-WatchState (Get-WatchBootId)
+        $state.schema_version | Should -Be 2
+        $state.PSObject.Properties.Name | Should -Not -Contain "recent_reboots"
+        $state.PSObject.Properties.Name | Should -Not -Contain "pending"
+    }
+
+    It "recreates missing state disarmed and retains <Protection> protection" -TestCases @(
+        @{ Protection = "fast_latch" }, @{ Protection = "event_history" }, @{ Protection = "none" }
+    ) {
+        param($Protection)
+        Arm-TestWatch
+        if ($Protection -eq "fast_latch") { Set-WatchSessionStarted }
+        if ($Protection -eq "event_history") {
+            $windows = Read-WatchSimulation
+            $windows.session_started = $true
+            Save-TestWatchWindows $windows
+        }
         Remove-Item (Get-WatchPath "disk-watchdog-state.json")
-        { Invoke-WatchTick } | Should -Throw "*state missing*"
+        $expected = if ($Protection -eq "none") { "waiting" } else { "stopped" }
+        Invoke-WatchTick | Should -Be $expected
+        (Get-WatchState (Get-WatchBootId)).arm | Should -BeNullOrEmpty
+        Reset-WatchObservation
+        Arm-TestWatch
+        $expected = if ($Protection -eq "none") { "healthy" } else { "stopped" }
+        Invoke-WatchTick | Should -Be $expected
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
-    It "cancels a queued reboot if event history becomes unreadable or is cleared" -TestCases @(
+    It "does not reboot if event history becomes unreadable or is cleared" -TestCases @(
         @{ Cleared = $false }, @{ Cleared = $true }
     ) {
         param($Cleared)
         Arm-TestWatch
         Fail-TestWatchDisk
-        Confirm-TestWatchFailure
+        Invoke-WatchTick | Out-Null
+        Invoke-WatchTick | Out-Null
         $windows = Read-WatchSimulation
         if ($Cleared) { $windows.event_record_id = 1 } else { $windows.event_error = $true }
         Save-TestWatchWindows $windows
         Invoke-WatchMain
-        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
     }
 
     It "uses the same mutex for equivalent install paths" {
@@ -386,7 +449,22 @@ Describe "iSCSI disk watcher safety state machine" {
         Mock New-WatchMutex { return $script:WatchFakeMutex } -ParameterFilter { $Suffix -eq "Worker" }
         Invoke-WatchMain
         $fake.Disposed | Should -BeTrue
-        (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
+        (Get-TestWatchCommands "reboot_requested").Count | Should -Be 0
+    }
+
+    It "requests the exact immediate native shutdown command" {
+        $script:WatchSimulationPath = ""
+        if (-not $env:SystemRoot) { $env:SystemRoot = "/windows" }
+        $process = [pscustomobject]@{ ExitCode = 0 }
+        $process | Add-Member ScriptMethod WaitForExit { param($timeout) return $true }
+        $process | Add-Member ScriptMethod Dispose { }
+        $script:NativeShutdownProcess = $process
+        Mock Start-Process { return $script:NativeShutdownProcess }
+        Invoke-WatchShutdown -Id "test-id"
+        Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter {
+            $FilePath -like "*shutdown.exe" -and
+            $ArgumentList -eq '/r /f /t 0 /d p:4:1 /c "iSCSI disk watcher test-id"'
+        }
     }
 
     It "uses the exact Drova request contract and discards the response body" {
