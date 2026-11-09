@@ -67,10 +67,17 @@
   его нельзя описывать как полностью зелёный CI. Interaction уже прошёл локально и в обоих
   attempts предыдущего run с теми же runtime/interaction-файлами; после `0312d0b` менялись
   только CI runner/проверка версии и этот журнал. Попытка retry только failed jobs отклонена
-  API/CLI, поскольку доступных failed jobs нет. Все требуемые suites пройдены по отдельности;
+  API/CLI; failed jobs в доступном API отсутствуют. Все требуемые suites пройдены по отдельности;
   причина пропуска создания отдельных jobs не установлена.
+- Итоговый run `42675336498` для точного SHA
+  `763431a40f15e86af0a31c9254c30fb9dea5a80e` — **success по всем трём jobs**:
+  Python/Ruff/JavaScript, полный Compose build/interaction и Windows PowerShell 5.1.
+  Полный Windows job log подтверждает Windows Server 2022 / PowerShell **5.1.20348.5773
+  Desktop**, Pester 5.7.1: **287 passed, 0 failed, 0 skipped** за 48.49 секунды.
+  Проверены общий conclusion, все job conclusions и точный SHA; runtime после `0312d0b`
+  не менялся. Настоящие Drova POST и reboot в CI не выполнялись.
 - Хотфикс `0312d0b` и настройка Windows CI `c097fdd` отправлены в `main` без tag/Release.
-  Следующий коммит содержит только эту фактическую запись; `.DS_Store` оставлен вне коммитов.
+  Последующие commits меняют только этот журнал, сохраняя проверенный runtime.
 
 ### Ожидает стенда
 
