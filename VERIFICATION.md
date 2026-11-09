@@ -78,7 +78,14 @@
   за 32.67 секунды. Итоговый parser и полный Linux suite с path/mutex case:
   **272 passed, 0 failed, 3 skipped** из 275 за 32.81 секунды, exit code `0`.
   Run `42658287935` для `1ab1d091141d86c7419dbdfdf886e8eab62a2c04` (bundle notes/inventory)
-  также завершился success по всем трём jobs. CI финальных guard changes будет записан ниже.
+  также завершился success по всем трём jobs.
+- Итоговый GitHub Actions run `42659040436` для точного SHA
+  `5828f445917d75151f4b2f519a71a4de0b6b9858` — **success**. Windows PowerShell 5.1 /
+  Pester 5.7.1: **275 passed, 0 failed, 0 skipped** за 71.1 секунды; Python/Ruff/JavaScript
+  и полный Compose build/interaction также успешны. Подтверждены `headSha`, conclusion всех
+  трёх jobs и полный Windows job log. Реальные POST и reboot не выполнялись.
+  Commits `4563361`, `1ab1d09`, `5828f44` отправлены в `main` без tag/GitHub Release;
+  следующий коммит меняет только этот журнал и сохраняет проверенный runtime.
 
 ### Ожидает стенда
 
