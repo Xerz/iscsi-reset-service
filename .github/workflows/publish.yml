@@ -179,12 +179,14 @@ jobs:
             printf '%s\n' \
               "Контейнер: ${IMAGE_REPOSITORY}@${IMAGE_DIGEST}" \
               "" \
-              "Скачайте все семь приложенных файлов в один каталог и выполните: \`sha256sum --check SHA256SUMS\`." \
+              "Скачайте все приложенные файлы в один каталог и выполните: \`sha256sum --check SHA256SUMS\`." \
               "Файл \`${BUNDLE_NAME}\` содержит неизменяемый digest образа; перед установкой замените management IP и пути \`/mnt/tank\` для своей системы." \
-              "Файл \`image-digest.txt\` содержит полную ссылку на тот же образ, а \`SHA256SUMS\` проверяет YAML, digest-файл и четыре PowerShell-скрипта." \
+              "Файл \`image-digest.txt\` содержит полную ссылку на тот же образ, а \`SHA256SUMS\` проверяет YAML, digest-файл и все PowerShell-скрипты." \
               "" \
               "Publisher: \`Install-IscsiReleasePublisher.ps1\` и \`Publish-IscsiRelease.ps1\`. Файл \`publisher.json\` скачивается из Management UI своей установки." \
-              "Клиент: \`Install-IscsiResetClient.ps1\` и \`Reset-And-Connect.ps1\`."
+              "Клиент: \`Install-IscsiResetClient.ps1\` и \`Reset-And-Connect.ps1\`." \
+              "Необязательный вотчер: \`Install-IscsiDiskWatcher.ps1\` и \`Watch-IscsiDisks.ps1\`." \
+              "Утилита Steam: \`Set-SteamUpdateOnLaunch.ps1\`."
           } > dist/release-notes.md
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release edit "${GITHUB_REF_NAME}" \

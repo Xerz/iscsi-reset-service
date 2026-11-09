@@ -115,7 +115,7 @@ def test_publish_workflow_packages_exact_operator_scripts() -> None:
     assert "install -m 0644 powershell/*.ps1 dist/" in workflow
     assert 'sha256sum "${BUNDLE_NAME}" image-digest.txt *.ps1 > SHA256SUMS' in workflow
     assert workflow.count("dist/*.ps1") == 3
-    for script in OPERATOR_SCRIPTS:
+    for script in BUNDLED_SCRIPTS:
         assert script in workflow
     assert "dist/publisher.json" not in workflow
     assert "publisher.json" in workflow
