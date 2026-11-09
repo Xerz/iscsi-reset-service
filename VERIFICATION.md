@@ -59,6 +59,18 @@
   доступными API/публичной страницей, поэтому ошибка не считается падением Windows tests.
   После двух попыток Windows job закреплён на поддерживаемом `windows-2022`; в шаг добавлена
   явная проверка Major/Minor PowerShell 5.1. Runtime хотфикса не менялся.
+- Run `42674447269`, SHA `c097fdd9634034e5cbbd5c02eb5c1fc567952c47`: нативный Windows job
+  `129352252354` — **success**, Windows Server 2022 / Windows PowerShell
+  **5.1.20348.5773 Desktop**, Pester 5.7.1: **287 passed, 0 failed, 0 skipped** за
+  71.8 секунды. Версия interpreter и итог подтверждены полным job log. Python/Ruff/JavaScript
+  также success. В этом запуске отсутствует interaction job и общий conclusion — failure;
+  его нельзя описывать как полностью зелёный CI. Interaction уже прошёл локально и в обоих
+  attempts предыдущего run с теми же runtime/interaction-файлами; после `0312d0b` менялись
+  только CI runner/проверка версии и этот журнал. Попытка retry только failed jobs отклонена
+  API/CLI, поскольку доступных failed jobs нет. Все требуемые suites пройдены по отдельности;
+  причина пропуска создания отдельных jobs не установлена.
+- Хотфикс `0312d0b` и настройка Windows CI `c097fdd` отправлены в `main` без tag/Release.
+  Следующий коммит содержит только эту фактическую запись; `.DS_Store` оставлен вне коммитов.
 
 ### Ожидает стенда
 
