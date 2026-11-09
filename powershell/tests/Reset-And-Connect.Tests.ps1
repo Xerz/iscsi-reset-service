@@ -1682,6 +1682,9 @@ Describe "Full reset retries" {
         $script:RetryTokenPath = Join-Path $TestDrive "readonly.token"
         Set-Content -LiteralPath $script:RetryTokenPath -Value "readonly-test-token" -NoNewline
         $script:RetryLogPath = Join-Path $TestDrive "client.log.jsonl"
+        foreach ($file in @("disk-watchdog.json", "disk-watchdog-reset.json", "Watch-IscsiDisks.ps1", "watcher-hooks.jsonl")) {
+            Remove-Item -LiteralPath (Join-Path $TestDrive $file) -Force -ErrorAction SilentlyContinue
+        }
         Remove-Item -LiteralPath $script:RetryLogPath -Force -ErrorAction SilentlyContinue
         $script:RetryVolumes = @(
             [pscustomobject]@{ name = "primary"; disk_unique_id = "aaa"; drive_letter = "E"; label = "PRIMARY" },
@@ -1881,6 +1884,54 @@ Describe "Full reset retries" {
         @($records | Where-Object event -eq "target_disconnected_after_error").Count | Should -Be 1
         @($records | Where-Object event -eq "disk_offline_online_ready").Count | Should -Be 1
         @($records | Where-Object event -eq "ready").Count | Should -Be 1
+    }
+
+    It "signals reset start and arms the watcher only after success" {
+        $configPath = Join-Path $TestDrive "disk-watchdog.json"
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json | Set-Content $configPath
+        @'
+param($Mode, $InstallRoot, $Snapshot)
+@{ mode = $Mode; snapshot = $Snapshot } | ConvertTo-Json -Depth 6 -Compress | Add-Content (Join-Path $InstallRoot "watcher-hooks.jsonl")
+'@ | Set-Content (Join-Path $TestDrive "Watch-IscsiDisks.ps1")
+        $script:RecoverDuringCycle = $true
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+        $calls = @(Get-Content (Join-Path $TestDrive "watcher-hooks.jsonl") | ConvertFrom-Json)
+        $calls.Count | Should -Be 2
+        $calls[0].mode | Should -Be "ResetStarting"
+        $calls[1].mode | Should -Be "Arm"
+        @($calls[1].snapshot.disk_unique_ids).Count | Should -Be 3
+        $calls[1].snapshot.session_identifier | Should -Not -BeNullOrEmpty
+        $calls[1].snapshot.reset_id | Should -Not -BeNullOrEmpty
+    }
+
+    It "disarms but never arms the watcher after a failed reset" {
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json |
+            Set-Content (Join-Path $TestDrive "disk-watchdog.json")
+        @'
+param($Mode, $InstallRoot, $Snapshot)
+$Mode | Add-Content (Join-Path $InstallRoot "watcher-hooks.jsonl")
+'@ | Set-Content (Join-Path $TestDrive "Watch-IscsiDisks.ps1")
+        Mock Disconnect-ResetTarget { throw "disconnect failed" }
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 40
+        @(Get-Content (Join-Path $TestDrive "watcher-hooks.jsonl")) | Should -Be @("ResetStarting")
+    }
+
+    It "keeps successful storage connected when watcher integration fails" {
+        @{ schema_version = 1; enabled = $true } | ConvertTo-Json |
+            Set-Content (Join-Path $TestDrive "disk-watchdog.json")
+        'param($Mode, $InstallRoot, $Snapshot); throw "sensitive-integration-error"' |
+            Set-Content (Join-Path $TestDrive "Watch-IscsiDisks.ps1")
+        $script:RecoverDuringCycle = $true
+        Invoke-ResetMain -BaseUrl "http://mock" `
+            -ClientTokenPath $script:RetryTokenPath -TimeoutSeconds 2 | Should -Be 0
+        @(Get-ResetSessions -TargetIqn $script:RetryTarget).Count | Should -Be 1
+        $records = @(Get-Content $script:RetryLogPath | ConvertFrom-Json)
+        @($records | Where-Object event -eq "disk_watcher_warning").Count | Should -Be 2
+        @($records | Where-Object event -eq "ready").Count | Should -Be 1
+        Get-Content $script:RetryLogPath -Raw | Should -Not -Match "sensitive-integration-error"
+        Test-Path (Join-Path $TestDrive "disk-watchdog-reset.json") | Should -BeTrue
     }
 
     It "repeats the entire three-volume flow and succeeds on attempt <Recovery>" -TestCases @(

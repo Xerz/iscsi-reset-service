@@ -1246,10 +1246,15 @@ function Connect-ResetTarget {
     if (-not [string]::IsNullOrWhiteSpace($script:SimulationStatePath)) {
         $state = Read-SimulationState
         $sessions = @($state.sessions)
-        $sessions += [pscustomobject]@{ target_iqn = $TargetIqn; persistent = $false }
+        $simulationSessionId = [Guid]::NewGuid().ToString("D")
+        $sessions += [pscustomobject]@{
+            target_iqn = $TargetIqn; persistent = $false; session_identifier = $simulationSessionId
+        }
         $state.sessions = $sessions
         Save-SimulationState $state
-        return [pscustomobject]@{ TargetNodeAddress = $TargetIqn; Simulation = $true }
+        return [pscustomobject]@{
+            TargetNodeAddress = $TargetIqn; Simulation = $true; SessionIdentifier = $simulationSessionId
+        }
     }
     Connect-IscsiTarget -NodeAddress $TargetIqn `
         -TargetPortalAddress ([string]$Portal.address) `
@@ -5020,6 +5025,52 @@ function Invoke-ClientEgsAggressiveSync {
     }
 }
 
+function Invoke-ResetDiskWatcherHook {
+    param(
+        [ValidateSet("ResetStarting", "Arm")][string]$Action,
+        [string]$ClientTokenPath, [string]$RequestId,
+        $Session, $Prepared
+    )
+    $root = Split-Path ([IO.Path]::GetFullPath($ClientTokenPath)) -Parent
+    $configPath = Join-Path $root "disk-watchdog.json"
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return }
+    try {
+        $markerPath = Join-Path $root "disk-watchdog-reset.json"
+        if ($Action -eq "ResetStarting") {
+            # Independent of loading the watcher script: even a broken integration must
+            # prevent its resident process from treating reset mutations as disk failure.
+            $temporary = $markerPath + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+            try {
+                $json = @{ schema_version = 1; reset_id = [Guid]::NewGuid().ToString("D") } | ConvertTo-Json
+                [IO.File]::WriteAllText($temporary, $json, (New-Object Text.UTF8Encoding($false)))
+                if (Test-Path -LiteralPath $markerPath) { [IO.File]::Replace($temporary, $markerPath, [NullString]::Value) }
+                else { [IO.File]::Move($temporary, $markerPath) }
+            } finally {
+                if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+            }
+        }
+        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        if ($config.schema_version -ne 1 -or $config.enabled -isnot [bool]) { throw "Invalid watcher configuration" }
+        if (-not $config.enabled) { return }
+        $watcher = Join-Path $root "Watch-IscsiDisks.ps1"
+        if (-not (Test-Path -LiteralPath $watcher -PathType Leaf)) { throw "Watcher runtime missing" }
+        $snapshot = $null
+        if ($Action -eq "Arm") {
+            $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+            $snapshot = [pscustomobject]@{
+                request_id = $RequestId; reset_id = [string]$marker.reset_id
+                target_iqn = [string]$Prepared.target_iqn
+                session_identifier = [string]$Session.SessionIdentifier
+                disk_unique_ids = @($Prepared.volumes | ForEach-Object { [string]$_.disk_unique_id })
+            }
+        }
+        & $watcher -Mode $Action -InstallRoot $root -Snapshot $snapshot
+    } catch {
+        Write-ResetLog -Level "WARN" -Event "disk_watcher_warning" -RequestId $RequestId `
+            -Message "Disk watcher integration did not complete" -Details @{ action = $Action }
+    }
+}
+
 function Invoke-ResetMain {
     param(
         [string]$BaseUrl,
@@ -5044,6 +5095,10 @@ function Invoke-ResetMain {
             Write-ResetProgress -RequestId $requestId -Event "start" `
                 -Message "Client reset attempt $attempt of $maxAttempts started" `
                 -Details @{ attempt = $attempt; max_attempts = $maxAttempts }
+            if ($attempt -eq 1) {
+                Invoke-ResetDiskWatcherHook -Action ResetStarting -ClientTokenPath $ClientTokenPath `
+                    -RequestId $requestId
+            }
             if (-not (Test-Path -LiteralPath $ClientTokenPath)) { throw "Token file not found" }
             $token = (Get-Content -LiteralPath $ClientTokenPath -Raw).Trim()
             if ([string]::IsNullOrWhiteSpace($token)) { throw "Token file is empty" }
@@ -5208,6 +5263,8 @@ function Invoke-ResetMain {
                     target_iqn = $connectedTarget
                     volume_count = @($prepared.volumes).Count
                 }
+            Invoke-ResetDiskWatcherHook -Action Arm -ClientTokenPath $ClientTokenPath `
+                -RequestId $requestId -Session $session -Prepared $prepared
             return 0
         } catch {
             $failure = $_

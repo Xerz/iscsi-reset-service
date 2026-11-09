@@ -341,4 +341,47 @@ if (($state.disks | Where-Object unique_id -eq "local-system-disk").drive_letter
     throw "Offline-online recovery modified the local disk"
 }
 
+# Exercise the watcher using its real state machine and exclusively simulated side effects.
+$watchRoot = Join-Path $root "disk-watchdog"
+New-Item -ItemType Directory -Path (Join-Path $watchRoot "logs") -Force | Out-Null
+$watchWindows = Join-Path $root "watch-windows.json"
+$watchBoot = [DateTime]::UtcNow.AddMinutes(-10).Ticks
+@{
+    boot_id = [string]$watchBoot; now_utc_ticks = [string][DateTime]::UtcNow.Ticks
+    event_record_id = 100; session_started = $false; event_error = $false; storage_error = $false
+    sessions = @(@{ target_iqn = "watch-target"; session_identifier = "watch-session" })
+    disks = @(
+        @{ target_iqn = "watch-target"; unique_id = "aaa"; is_offline = $false; offline_reason = 0 },
+        @{ target_iqn = "watch-target"; unique_id = "bbb"; is_offline = $false; offline_reason = 0 },
+        @{ target_iqn = "watch-target"; unique_id = "ccc"; is_offline = $false; offline_reason = 0 }
+    )
+    commands = @(); report_status_codes = @(503, 503, 503)
+} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $watchWindows
+. "/suite/powershell/Watch-IscsiDisks.ps1" -InstallRoot $watchRoot -SimulationPath $watchWindows -NoMain
+Write-WatchJson (Get-WatchPath "disk-watchdog.json") @{
+    schema_version = 1; enabled = $true; installed_boot_id = [string]($watchBoot - 1)
+}
+Save-WatchState (Get-WatchState -BootId ([string]$watchBoot) -Initialize)
+Set-WatchArm ([pscustomobject]@{
+    reset_id = ""; request_id = "compose-reset"; target_iqn = "watch-target"
+    session_identifier = "watch-session"; disk_unique_ids = @("aaa", "bbb", "ccc")
+})
+if ((Invoke-WatchTick) -ne "healthy") { throw "Watcher did not accept the verified disk set" }
+$watchState = Read-WatchSimulation
+$watchState.disks[2].is_offline = $true
+$watchState.disks[2].offline_reason = 5
+Write-WatchJson $watchWindows $watchState
+1..3 | ForEach-Object { $null = Invoke-WatchTick; Wait-WatchSeconds 5 }
+$watchState = Read-WatchSimulation
+if (@($watchState.commands | Where-Object name -eq "report_offline").Count -ne 3 -or
+    @($watchState.commands | Where-Object name -eq "reboot_scheduled").Count -ne 1) {
+    throw "Watcher did not preserve the three-report failure/reboot policy"
+}
+Set-WatchSessionStarted
+$watchState = Read-WatchSimulation
+if ((Invoke-WatchTick) -ne "stopped" -or
+    @($watchState.commands | Where-Object name -eq "reboot_aborted").Count -ne 1) {
+    throw "Esme 2001 did not cancel the watcher's pending reboot"
+}
+
 Write-Host "Interaction suite passed"

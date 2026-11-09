@@ -1,5 +1,80 @@
 # Verification record
 
+## Вотчер iSCSI-дисков с защитой игровой сессии — 2026-11-09
+
+### Реализация
+
+- Добавлены `Watch-IscsiDisks.ps1` и отдельный `Install-IscsiDiskWatcher.ps1` для SYSTEM/
+  Windows PowerShell 5.1. XML-задачи: `\IscsiReset\Disk Watcher` при загрузке (IgnoreNew,
+  PT0S, без RestartOnFailure) и `\IscsiReset\Stop Disk Watcher On Session` по
+  Application/esme/2001. Worker mutex ограничивает процесс; state mutex и атомарные JSON
+  согласуют Reset/наблюдение/остановку. Config/state/logs закрываются для SYSTEM/Administrators.
+- Установщик сохраняет backup заменяемого Reset, token/certificate/sync и существующие
+  Reset/Drova-задачи; до следующей загрузки функция выключена. Удаление отменяет собственный
+  pending reboot и удаляет только две свои задачи и конфигурацию включения, сохраняя историю.
+  Сбой регистрации оставляет disabled; чужое владение именем задачи блокирует замену.
+- Reset до своей работы инвалидирует прежний снимок и снимает наблюдение; только после
+  `ready` передаёт boot/request/target/session/NAA. Ошибка интеграции warning-only. Публичные
+  параметры Reset и API не менялись; startup offline/online workaround сохранён.
+- Проверка каждые 5 секунд, три подтверждённых отказа своего набора; query error/ambiguous
+  identity не доказывают отсутствие. Нет disk mutations или порога свободного места.
+  История 2001 с начала загрузки и быстрый latch защищают POST/reboot и запрещают rearm
+  до следующего boot. Ошибки чтения защиты запрещают reboot.
+- Drova Registry64, максимум три POST с timeout 10 секунд/паузами 5 секунд. После трёх
+  ошибок возможен reboot `/t 30`; отмена `/a` только при записи о принятом собственном
+  назначении. Rolling history ограничивает назначения тремя за час между загрузками,
+  включая принятые и отменённые. Один пакет уведомлений на непрерывный инцидент, в том числе
+  после ожидания лимита. JSONL не содержит токены, headers и тела ошибок API.
+- Inventory будущего пакета обновлён до 7 скриптов / 10 assets; publish workflow по-прежнему
+  копирует общие `.ps1` wildcard. Тег, образ и GitHub Release для этой поставки не создаются.
+
+### Автоматические проверки
+
+- Окружение: macOS/Apple Silicon; Docker Linux/amd64
+  `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, PowerShell 7.5.0 / Ubuntu 24.04.1 LTS,
+  Pester 5.7.1 из временного каталога. Source read-only, `--network none`, working directory
+  `/tmp`. Parser всех `.ps1`, затем `Invoke-Pester /suite/powershell/tests -Output Detailed
+  -CI`. Первые прогоны обнаружили ошибки новых fixtures и marshaling `$null` в File.Replace:
+  исправлены NullString, array-return, scope helper, XML Subscription и стабильный boot fixture.
+  После исправлений полный suite: **265 passed, 0 failed, 3 skipped** из 268 за 32.34 секунды,
+  exit code `0`. Пропущены Windows ACL (два теста) и Transactional Registry. Это Linux
+  PowerShell, не Windows PowerShell 5.1. Итоговый дополнительный partial-failure case ниже.
+- После добавления теста сбоя сохранения сразу после принятия shutdown и последующего
+  reconciliation повторены parser и полный Linux Pester suite: **266 passed, 0 failed,
+  3 skipped** из 269 за 33.52 секунды, exit code `0`. Принятая команда отменяется при сбое
+  сохранения; повтор сохраняет budget и не дублирует POST. Ruff и Python suite повторно
+  прошли: **133 passed** за 1.80 секунды.
+- Трёхтомные тесты покрывают healthy/offline/missing disk/missing session, чужой offline-диск,
+  transient/query error/duplicate NAA; 2001 до Arm, во время POST, после POST и при принятии
+  shutdown; повторный Arm, неизвестную защиту/очистку Application, отсутствие state, singleton,
+  три ошибки POST, отсутствие секретов, лимит между boot и его истечение без повторного POST.
+  Installer cases проверяют XML, backup/preservation, обновление, отказ регистрации, чужое
+  имя, running Reset и удаление с отменой. Reset cases проверяют Arm после успеха,
+  отсутствие Arm после ошибки и сохранение `ready`/session при warning интеграции.
+- `ruff check src tests` — успешно; `python -B -m pytest -q -p no:cacheprovider` на Python
+  3.12.4 — **133 passed** за 1.62 секунды. `git diff --check`,
+  `node --check src/iscsi_reset_service/static/app.js` и
+  `node tests/static_connection_presentations.test.mjs` — успешно.
+- `docker compose -p iscsi-disk-watcher config --quiet` и
+  `docker compose -p iscsi-disk-watcher up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`.
+  Полный прежний mock API/stage/activate/prepare/reset interaction сохранён. Дополнительно
+  реальная state machine вотчера проверяет три тома, три ошибки уведомления, назначение и
+  отмену на 2001; HTTP/shutdown/task stop здесь исключительно simulated. Выполнен
+  `docker compose -p iscsi-disk-watcher down --volumes`.
+- Windows PowerShell 5.1 CI и окончательный SHA будут записаны после commit/push.
+
+### Ожидает стенда
+
+- Настоящие Windows Task Scheduler triggers/SYSTEM startup, Storage/iSCSI/CIM поведение,
+  historical/live Esme 2001, Registry64 Drova credentials, реальные POST/таймауты и reboot/
+  abort в 30-секундном окне ещё не проверены. Автоматические mocks не выполняли реальный
+  POST в Drova или перезагрузку. ACL unit test на Windows также не заменяет установку
+  на рабочую станцию.
+- Реальные TrueNAS/NTFS, причина самопроизвольного offline и эффективность прежнего
+  offline/online workaround остаются отдельными ожидающими физическими проверками.
+  Сценарии и сохранение настроек перечислены в новом разделе TEST-PLAN.
+
 ## Однократный offline/online workaround перед retry — 2026-11-03
 
 ### Реализация
