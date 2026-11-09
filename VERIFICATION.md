@@ -28,9 +28,18 @@
   `docker compose -p iscsi-task-xml up --build --abort-on-container-exit
   --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`;
   выполнен `docker compose -p iscsi-task-xml down --volumes`.
+- GitHub Actions `42684824653`, точный SHA
+  `4260178f780e269b4fd5332ae081b350f62cbe72` — **success по всем трём jobs**.
+  Windows Server 2022 / PowerShell **5.1.20348.5773**, Pester 5.7.1:
+  **289 passed, 0 failed, 0 skipped** за 51.86 секунды. Полный Windows log подтверждает
+  успешные native cases для Watch и SessionStarted: исходный XML принят валидатором,
+  отключённые задачи зарегистрированы через тот же `-Xml` overload, API principal —
+  ServiceAccount/SYSTEM, XML export — без LogonType; временные задачи/папки удалены.
+  Python/Ruff/JavaScript и полный Compose interaction также success. Проверены head SHA,
+  общий conclusion и job logs. Коммит отправлен в main без tag/GitHub Release.
 - README содержит повторную установку после `0x80041318`, TEST-PLAN — сверку XML/API principal.
   Полная установка и boot/esme/shadow/TrueNAS/Drova на рабочей станции остаются ожидающими
-  стенда; будущий native CI не заменяет эту end-to-end проверку.
+  стенда; native registration CI не заменяет эту end-to-end проверку.
 
 ## Мгновенный reboot и shadow-состояние одной загрузки — 2026-11-09
 
