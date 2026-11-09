@@ -1,5 +1,37 @@
 # Verification record
 
+## Исправление XML principal SYSTEM — 2026-11-10
+
+- Пользователь воспроизвёл `Register-ScheduledTask` / `0x80041318`,
+  `(4,91):LogonType:ServiceAccount` на реальной Windows-станции. Генератор ошибочно помещал
+  API enum `ServiceAccount` в XML, где это значение не входит в
+  [logonType schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-logontype-simpletype).
+  У обеих задач удалён XML-элемент LogonType; SYSTEM SID `S-1-5-18`, HighestAvailable,
+  boot/esme triggers и остальные настройки сохранены. Runtime/API/состояние shadow не менялись.
+- Прежний Windows Pester suite мокал Register-ScheduledTask, а XML assertions проверяли
+  well-formedness и отдельные поля. Он не доказывал принятие XML настоящим Task Scheduler,
+  поэтому пропустил эту ошибку. Portable regression теперь запрещает LogonType у обеих
+  generated SYSTEM principals. Добавлены два Windows-only native cases: TASK_VALIDATE_ONLY
+  исходного XML, затем настоящие Register-ScheduledTask/Export-ScheduledTask и проверка
+  API ServiceAccount/SYSTEM SID/triggers/settings. Тестовые задачи отключены, action заменён
+  безопасным `exit 0`; используется уникальная временная папка с удалением в finally.
+  Задачи продукта, Drova POST и reboot в этих tests не запускаются.
+- Parser и полный `Invoke-Pester /suite/powershell/tests -Output Detailed -CI` в Docker
+  Linux/amd64 `mcr.microsoft.com/powershell:7.5-ubuntu-24.04`, PowerShell 7.5.0 / Ubuntu
+  24.04.1 LTS, Pester 5.7.1, network none/source read-only/working directory `/tmp`:
+  **284 passed, 0 failed, 5 skipped** из 289 за 43.92 секунды, exit code `0`.
+  Пропущены два Windows ACL, Transactional Registry и два native Task Scheduler cases.
+  Это дополнительный Linux run, не Windows PowerShell 5.1.
+- `ruff check src tests` — успешно; `python -B -m pytest -q -p no:cacheprovider` на Python
+  3.12.4 — **133 passed** за 1.72 секунды. `git diff --check` — успешно.
+- `docker compose -p iscsi-task-xml config --quiet` и
+  `docker compose -p iscsi-task-xml up --build --abort-on-container-exit
+  --exit-code-from windows-simulation` — **Interaction suite passed**, exit code `0`;
+  выполнен `docker compose -p iscsi-task-xml down --volumes`.
+- README содержит повторную установку после `0x80041318`, TEST-PLAN — сверку XML/API principal.
+  Полная установка и boot/esme/shadow/TrueNAS/Drova на рабочей станции остаются ожидающими
+  стенда; будущий native CI не заменяет эту end-to-end проверку.
+
 ## Мгновенный reboot и shadow-состояние одной загрузки — 2026-11-09
 
 ### Реализация

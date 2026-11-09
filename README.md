@@ -502,6 +502,14 @@ Reset/Drova-задач сохраняются. Он создаёт через Ta
   (без ограничения), без автоматического перезапуска после остановки.
 - `\IscsiReset\Stop Disk Watcher On Session`: Application / provider `esme` / Event ID `2001`.
 
+В XML principal SYSTEM задаётся через `UserId=S-1-5-18` без элемента `LogonType`:
+значение `ServiceAccount` относится к API, но отсутствует в
+[XML schema logonType](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-logontype-simpletype).
+Если прежний установщик завершился с `0x80041318` на `LogonType:ServiceAccount`, замените
+`Install-IscsiDiskWatcher.ps1` исправленной версией и повторите ту же команду установки.
+Удалять token/certificate/sync или задачи Reset/Drova не требуется. Конфигурация вотчера
+останется disabled до успешной регистрации обеих собственных задач.
+
 Первое включение после установки или обновления допускается только в следующей загрузке
 и после успешного Reset. Запрет для загрузки установки хранится в её временном состоянии.
 Перед новым Reset наблюдение снимается. После `ready` публикуется новый снимок. Ошибка интеграции даёт

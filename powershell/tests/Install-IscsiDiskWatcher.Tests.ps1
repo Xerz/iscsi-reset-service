@@ -63,6 +63,8 @@ Describe "Disk watcher installer ownership and preservation" {
         $stop = [xml](New-WatcherTaskXml -Root $InstallRoot -Action SessionStarted)
         $watch.Task.Principals.Principal.UserId | Should -Be "S-1-5-18"
         $watch.Task.Principals.Principal.RunLevel | Should -Be "HighestAvailable"
+        $watch.GetElementsByTagName("LogonType").Count | Should -Be 0
+        $stop.GetElementsByTagName("LogonType").Count | Should -Be 0
         $watch.Task.Settings.MultipleInstancesPolicy | Should -Be "IgnoreNew"
         $watch.Task.Settings.ExecutionTimeLimit | Should -Be "PT0S"
         $watch.Task.Triggers.BootTrigger.Enabled | Should -Be "true"
@@ -252,5 +254,65 @@ Describe "Disk watcher native Windows ACL" {
         $sids | Should -Contain "S-1-5-18"
         $sids | Should -Contain "S-1-5-32-544"
         (Get-Acl -LiteralPath $root).AreAccessRulesProtected | Should -BeTrue
+    }
+}
+
+Describe "Disk watcher native Task Scheduler registration" {
+    It "validates and registers an inert SYSTEM <Mode> task" -TestCases @(
+        @{ Mode = "Watch" }, @{ Mode = "SessionStarted" }
+    ) {
+        param($Mode)
+        if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+            Set-ItResult -Skipped -Because "Native Windows Task Scheduler is required"
+            return
+        }
+        $scheduler = New-Object -ComObject Schedule.Service
+        $scheduler.Connect()
+        $rootFolder = $scheduler.GetFolder("\")
+        $folderName = "IscsiResetTest-" + [Guid]::NewGuid().ToString("N")
+        $taskPath = "\$folderName\"
+        $folder = $rootFolder.CreateFolder($folderName)
+        try {
+            $xmlText = New-WatcherTaskXml -Root (Join-Path $TestDrive "inert-watcher") -Action $Mode
+            # TASK_VALIDATE_ONLY=1, TASK_LOGON_SERVICE_ACCOUNT=5: no registration/execution.
+            $null = $folder.RegisterTask("ValidateOnly", $xmlText, 1, "S-1-5-18", $null, 5, $null)
+            # Exercise the same -Xml registration overload as the installer, with no
+            # credential overrides. Keep the task disabled and replace its action by exit 0.
+            $xml = [xml]$xmlText
+            $enabled = $xml.CreateElement("Enabled", $xml.DocumentElement.NamespaceURI)
+            $enabled.InnerText = "false"
+            $null = $xml.Task.Settings.AppendChild($enabled)
+            $xml.Task.Actions.Exec.Arguments = '-NoProfile -NonInteractive -Command "exit 0"'
+            $task = ScheduledTasks\Register-ScheduledTask -TaskPath $taskPath -TaskName "InertWatcher" `
+                -Xml $xml.OuterXml -Force -ErrorAction Stop
+            [string]$task.State | Should -Be "Disabled"
+            [string]$task.Principal.LogonType | Should -Be "ServiceAccount"
+            $user = [string]$task.Principal.UserId
+            if ($user -notmatch '^S-1-') {
+                $user = (New-Object Security.Principal.NTAccount($user)).Translate(
+                    [Security.Principal.SecurityIdentifier]).Value
+            }
+            $user | Should -Be "S-1-5-18"
+            $export = [xml](ScheduledTasks\Export-ScheduledTask -TaskPath $taskPath -TaskName "InertWatcher")
+            $export.Task.Principals.Principal.UserId | Should -Be "S-1-5-18"
+            $export.GetElementsByTagName("LogonType").Count | Should -Be 0
+            $export.Task.Settings.MultipleInstancesPolicy | Should -Be "IgnoreNew"
+            $expectedLimit = if ($Mode -eq "Watch") { "PT0S" } else { "PT1M" }
+            $export.Task.Settings.ExecutionTimeLimit | Should -Be $expectedLimit
+            if ($Mode -eq "Watch") {
+                $export.GetElementsByTagName("BootTrigger").Count | Should -Be 1
+            } else {
+                $export.GetElementsByTagName("EventTrigger").Count | Should -Be 1
+                $export.GetElementsByTagName("Subscription")[0].InnerText | Should -Match 'EventID=2001'
+            }
+        } finally {
+            $task = ScheduledTasks\Get-ScheduledTask -TaskPath $taskPath -TaskName "InertWatcher" `
+                -ErrorAction SilentlyContinue
+            if ($null -ne $task) {
+                ScheduledTasks\Unregister-ScheduledTask -TaskPath $taskPath -TaskName "InertWatcher" `
+                    -Confirm:$false -ErrorAction Stop
+            }
+            $rootFolder.DeleteFolder($folderName, 0)
+        }
     }
 }

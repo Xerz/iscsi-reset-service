@@ -63,11 +63,13 @@ function New-WatcherTaskXml {
         '<EventTrigger><Enabled>true</Enabled><Subscription><![CDATA[<QueryList><Query Id="0" Path="Application"><Select Path="Application">*[System[Provider[@Name=''esme''] and EventID=2001]]</Select></Query></QueryList>]]></Subscription></EventTrigger>'
     }
     $limit = if ($Action -eq "Watch") { "PT0S" } else { "PT1M" }
+    # SYSTEM uses its SID without LogonType in XML. ServiceAccount is an API enum,
+    # not an allowed value of the Task Scheduler XML logonType simple type.
     return @"
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>$($script:DiskWatcherOwner)</Description></RegistrationInfo>
   <Triggers>$trigger</Triggers>
-  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>$limit</ExecutionTimeLimit></Settings>
   <Actions Context="System"><Exec><Command>$powerShell</Command><Arguments>$arguments</Arguments></Exec></Actions>
 </Task>

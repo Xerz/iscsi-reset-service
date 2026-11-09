@@ -459,6 +459,9 @@ sync-файлов. Реальные POST и перезагрузки разре�
    сохранность исходных файлов/задач и ACL SYSTEM/Administrators. Export-ScheduledTask должен
    показать только две новые задачи `\IscsiReset\`: SYSTEM, boot и Application/esme/2001,
    `IgnoreNew`, `PT0S` у фоновой задачи, без RestartOnFailure. В текущей загрузке не включается.
+   SYSTEM principal должен иметь `UserId=S-1-5-18`, без `LogonType` в XML; API principal
+   показывает ServiceAccount. После прежней ошибки `0x80041318` повторная установка исправленным
+   скриптом должна завершаться без ручного удаления credentials или Reset/Drova-задач.
 2. После перезагрузки дождаться полного успешного Reset. Сверить защищённый снимок: boot,
    request ID, exact target/session, NAA всех трёх томов. При здоровых дисках и постороннем
    offline-диске не должно быть POST/перезагрузки. Проверить один фоновый процесс при ручном
