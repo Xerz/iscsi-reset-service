@@ -27,6 +27,7 @@ BeforeAll {
 
 Describe "iSCSI disk watcher safety state machine" {
     BeforeEach {
+        $script:WatchAcceptedPending = $null
         $script:WatchRoot = Join-Path $TestDrive "watcher"
         if (Test-Path $script:WatchRoot) { Remove-Item $script:WatchRoot -Recurse -Force }
         New-Item -ItemType Directory -Path (Join-Path $script:WatchRoot "logs") -Force | Out-Null
@@ -313,6 +314,44 @@ Describe "iSCSI disk watcher safety state machine" {
         (Get-TestWatchCommands "reboot_scheduled").Count | Should -Be 0
     }
 
+    It "cancels its accepted reboot if <File> becomes unreadable during the window" -TestCases @(
+        @{ File = "disk-watchdog-state.json" }, @{ File = "disk-watchdog-session.json" },
+        @{ File = "disk-watchdog.json" }
+    ) {
+        param($File)
+        Arm-TestWatch
+        Fail-TestWatchDisk
+        Confirm-TestWatchFailure
+        Set-Content -LiteralPath (Get-WatchPath $File) -Value 'broken-json'
+        Invoke-WatchMain
+        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+    }
+
+    It "does not kill the worker before it can cancel when the stopper cannot read state" {
+        Arm-TestWatch
+        Fail-TestWatchDisk
+        Confirm-TestWatchFailure
+        Set-Content -LiteralPath (Get-WatchPath "disk-watchdog-state.json") -Value 'broken-json'
+        { Set-WatchSessionStarted } | Should -Throw
+        (Get-TestWatchCommands "watcher_stopped").Count | Should -Be 0
+        Invoke-WatchMain
+        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+    }
+
+    It "does not abort a previous-boot pending record when 2001 arrives in a new boot" {
+        Arm-TestWatch
+        Fail-TestWatchDisk
+        Confirm-TestWatchFailure
+        $windows = Read-WatchSimulation
+        $windows.boot_id = [string]([long]$windows.now_utc_ticks + [TimeSpan]::FromSeconds(1).Ticks)
+        $windows.now_utc_ticks = [string]([long]$windows.boot_id + [TimeSpan]::FromSeconds(1).Ticks)
+        Save-TestWatchWindows $windows
+        $script:WatchAcceptedPending = $null # A new process after boot has no acceptance cache.
+        Set-WatchSessionStarted
+        (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 0
+        (Get-WatchState (Get-WatchBootId)).session_latched | Should -BeTrue
+    }
+
     It "does not reset the budget when state disappears" {
         Arm-TestWatch
         Remove-Item (Get-WatchPath "disk-watchdog-state.json")
@@ -331,6 +370,12 @@ Describe "iSCSI disk watcher safety state machine" {
         Save-TestWatchWindows $windows
         Invoke-WatchMain
         (Get-TestWatchCommands "reboot_aborted").Count | Should -Be 1
+    }
+
+    It "uses the same mutex for equivalent install paths" {
+        $name = Get-WatchMutexName
+        $script:WatchRoot += [IO.Path]::DirectorySeparatorChar
+        Get-WatchMutexName | Should -Be $name
     }
 
     It "refuses a duplicate worker" {

@@ -15,6 +15,7 @@ $script:WatchSimulationPath = $SimulationPath
 $script:WatchTaskPath = "\IscsiReset\"
 $script:WatchTaskName = "Disk Watcher"
 $script:WatchBootCached = $null
+$script:WatchAcceptedPending = $null
 
 function Get-WatchPath {
     param([string]$Name)
@@ -79,7 +80,9 @@ function Get-WatchMutexName {
     param([string]$Suffix = "State")
     $hash = [Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($script:WatchRoot).ToLowerInvariant())
+        $canonicalRoot = [IO.Path]::GetFullPath($script:WatchRoot).TrimEnd(
+            [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar).ToLowerInvariant()
+        $bytes = [Text.Encoding]::UTF8.GetBytes($canonicalRoot)
         $key = ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace("-", "")
         return "Global\IscsiResetDiskWatcher-$key-$Suffix"
     } finally { $hash.Dispose() }
@@ -233,7 +236,22 @@ function Cancel-WatchPending {
             Invoke-WatchShutdown -Cancel -Id $State.pending.id
             Write-WatchLog "reboot_cancelled" @{ incident_id = $State.pending.id }
         }
+        if ($null -ne $script:WatchAcceptedPending -and $script:WatchAcceptedPending.id -eq $State.pending.id) {
+            $script:WatchAcceptedPending = $null
+        }
         $State.pending = $null
+    }
+}
+
+function Cancel-WatchAcceptedPending {
+    # This process personally observed acceptance; no state/event query is needed to cancel
+    # if protected storage becomes unreadable during the cancellation window.
+    if ($null -ne $script:WatchAcceptedPending) {
+        if ([long]$script:WatchAcceptedPending.deadline_ticks -gt (Get-WatchNowTicks)) {
+            Invoke-WatchShutdown -Cancel -Id $script:WatchAcceptedPending.id
+            Write-WatchLog "reboot_cancelled" @{ incident_id = $script:WatchAcceptedPending.id }
+        }
+        $script:WatchAcceptedPending = $null
     }
 }
 
@@ -244,22 +262,22 @@ function Stop-WatchTask {
 
 function Set-WatchSessionStarted {
     # This write must precede waiting for the state lock, including while HTTP is in flight.
+    $safeToStop = $false
     try {
         Write-WatchJson -Path (Get-WatchPath "disk-watchdog-session.json") -Value @{
             schema_version = 1; observed_utc_ticks = [string](Get-WatchNowTicks)
         }
-        # Do not depend on WMI responding in order to stop a queued reboot.
+        $bootId = Get-WatchBootId
         $cached = Read-WatchJson (Get-WatchPath "disk-watchdog-state.json")
         $cancelledId = ""
         if ($cached.schema_version -eq 1 -and $null -ne $cached.pending -and
             $cached.pending.phase -eq "scheduled" -and
-            [string]$cached.pending.boot_id -eq [string]$cached.boot_id -and
+            [string]$cached.pending.boot_id -eq $bootId -and
             [long]$cached.pending.deadline_ticks -gt (Get-WatchNowTicks)) {
             Invoke-WatchShutdown -Cancel -Id $cached.pending.id
             $cancelledId = [string]$cached.pending.id
             Write-WatchLog "reboot_cancelled" @{ incident_id = $cancelledId }
         }
-        $bootId = [string]$cached.boot_id
         Invoke-WatchLocked {
             $state = Get-WatchState -BootId $bootId
             $state.session_latched = $true
@@ -269,13 +287,23 @@ function Set-WatchSessionStarted {
             Save-WatchState $state
             Write-WatchLog "session_latched"
         }
-    } finally { Stop-WatchTask }
+        $safeToStop = $true
+    } finally {
+        if ($safeToStop) { Stop-WatchTask }
+        else {
+            # Let the resident worker cancel using its in-memory acceptance proof and exit
+            # on the fast latch/guard error. Killing it here could strand an accepted reboot.
+            Write-WatchLog "session_stop_deferred_to_worker"
+        }
+    }
 }
 
 function Reset-WatchObservation {
+    param([string]$CancelledPendingId = "")
     $bootId = Get-WatchBootId
     Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
+        if ($null -ne $state.pending -and $state.pending.id -eq $CancelledPendingId) { $state.pending = $null }
         Cancel-WatchPending $state
         $state.arm = $null; $state.failures = 0; $state.incident = $null
         Save-WatchState $state
@@ -532,6 +560,7 @@ function Request-WatchReboot {
             Invoke-WatchShutdown -Id $id
             $accepted = $true
             $state.pending.phase = "scheduled"
+            $script:WatchAcceptedPending = $state.pending
             Save-WatchState $state
             if ((Test-WatchFastLatch $bootId) -or -not (Test-WatchResetGeneration $state.arm)) {
                 if (Test-WatchFastLatch $bootId) { $state.session_latched = $true }
@@ -539,7 +568,7 @@ function Request-WatchReboot {
                 Cancel-WatchPending $state; Save-WatchState $state
             } else { Write-WatchLog "reboot_scheduled" @{ incident_id = $id; delay_seconds = 30 } }
         } catch {
-            if ($accepted) { Invoke-WatchShutdown -Cancel -Id $id }
+            if ($accepted) { Cancel-WatchAcceptedPending }
             $state.pending = $null
             if (-not $accepted) { $state.recent_reboots = @($state.recent_reboots | Where-Object id -ne $id) }
             Save-WatchState $state
@@ -558,20 +587,23 @@ function Invoke-WatchTick {
         }
         return "waiting"
     }
-    $arm = Invoke-WatchLocked {
+    $observation = Invoke-WatchLocked {
         $state = Get-WatchState -BootId $bootId
+        if ($null -eq $state.pending) { $script:WatchAcceptedPending = $null }
         if (-not (Test-WatchSessionAllowed $state)) {
             Cancel-WatchPending $state; $state.arm = $null; Save-WatchState $state
-            return $null
+            return [pscustomobject]@{ arm = $null; stopped = $true; pending = $false }
         }
         if ($null -ne $state.arm -and -not (Test-WatchResetGeneration $state.arm)) {
             Cancel-WatchPending $state; $state.arm = $null; $state.failures = 0; $state.incident = $null
         }
         Save-WatchState $state
-        return $state.arm
+        return [pscustomobject]@{ arm = $state.arm; stopped = $false; pending = $null -ne $state.pending }
     }
+    if ($observation.stopped) { return "stopped" }
+    if ($observation.pending) { return "pending" }
+    $arm = $observation.arm
     if ($null -eq $arm) {
-        if ((Get-WatchState -BootId $bootId).session_latched) { return "stopped" }
         return "waiting"
     }
     $health = $null
@@ -637,7 +669,9 @@ function Invoke-WatchMain {
             try { $result = Invoke-WatchTick }
             catch {
                 Write-WatchLog "watcher_guard_error"
-                try { Reset-WatchObservation } catch { }
+                $cancelledId = if ($null -ne $script:WatchAcceptedPending) { [string]$script:WatchAcceptedPending.id } else { "" }
+                try { Cancel-WatchAcceptedPending } catch { $cancelledId = "" }
+                try { Reset-WatchObservation -CancelledPendingId $cancelledId } catch { }
                 return
             }
             if ($result -eq "stopped") { return }

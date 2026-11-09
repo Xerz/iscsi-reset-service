@@ -26,7 +26,9 @@
   включая принятые и отменённые. Один пакет уведомлений на непрерывный инцидент, в том числе
   после ожидания лимита. JSONL не содержит токены, headers и тела ошибок API.
 - Inventory будущего пакета обновлён до 7 скриптов / 10 assets; publish workflow по-прежнему
-  копирует общие `.ps1` wildcard. Тег, образ и GitHub Release для этой поставки не создаются.
+  копирует общие `.ps1` wildcard. В описании будущего выпуска перечислены вотчер и Steam;
+  YAML и bash-синтаксис run-блоков проверены без запуска публикации. Тег, образ и GitHub
+  Release для этой поставки не создаются.
 
 ### Автоматические проверки
 
@@ -62,7 +64,21 @@
   реальная state machine вотчера проверяет три тома, три ошибки уведомления, назначение и
   отмену на 2001; HTTP/shutdown/task stop здесь исключительно simulated. Выполнен
   `docker compose -p iscsi-disk-watcher down --volumes`.
-- Windows PowerShell 5.1 CI и окончательный SHA будут записаны после commit/push.
+- Первый полный GitHub Actions run `42658026524`, SHA
+  `4563361a63ef43757162e33fb4951b2b389a74cf`: Python, interaction и Windows PowerShell 5.1 —
+  **success**. Windows Pester 5.7.1: **269 passed, 0 failed, 0 skipped** за 78.8 секунды,
+  включая настоящий Windows ACL unit test. Проверены итог jobs и полный Windows job log.
+- При финальном просмотре добавлены in-memory proof собственного принятого reboot и
+  отмена при нечитаемой защите уже в 30-секундном окне. Stopper сначала сверяет текущий
+  boot; pending от прошлой загрузки не даёт права на `/a`. Если stopper не может прочитать
+  state, он оставляет живому worker возможность отменить своё назначение и завершиться,
+  вместо принудительного убийства до отмены. Пока reboot ожидается, disk queries не
+  задерживают проверку защиты. Mutex одинаков для путей с завершающим разделителем и без.
+  После первых пяти guard cases полный Linux suite — **271 passed, 0 failed, 3 skipped**
+  за 32.67 секунды. Итоговый parser и полный Linux suite с path/mutex case:
+  **272 passed, 0 failed, 3 skipped** из 275 за 32.81 секунды, exit code `0`.
+  Run `42658287935` для `1ab1d091141d86c7419dbdfdf886e8eab62a2c04` (bundle notes/inventory)
+  также завершился success по всем трём jobs. CI финальных guard changes будет записан ниже.
 
 ### Ожидает стенда
 
